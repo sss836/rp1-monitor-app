@@ -1,0 +1,16 @@
+<section class="workspace-heading"><p class="description">按记录编号回看曲线，导出本次运行的观测报告。</p><details class="record-source-details"><summary>存储与数据来源</summary><p id="source-state" class="status" role="status">正在核对存储与机器人来源…</p></details></section>
+  <div class="recording-grid">
+    <aside class="card recording-status" aria-labelledby="recording-heading"><div class="recording-status-copy"><h2 id="recording-heading">现场记录状态</h2><p id="record-state" class="status" role="status" aria-live="polite">正在读取…</p><details class="record-help"><summary>记录操作与报告说明</summary><p class="hint">在原生上位机连接机器人、选择保存指标与频率，填写标签后开始或结束记录。网页只读查看已保存的数据，缺失观测保持未知。</p><p class="hint">报告保留记录编号、查询范围和完整性；不创建正式测试、审批或 MTBF 记录，不判定测试通过或失败。</p><a href="./robots" data-page="overview">查看当前机器人整机概览 →</a></details></div><button type="button" id="print-report" class="secondary" disabled>打印 / 保存观测报告 PDF</button></aside>
+    <section class="card history-card" aria-labelledby="history-heading"><p class="eyebrow">02 / EXPLORE THE FULL TIMELINE</p><h2 id="history-heading">完整记录曲线</h2>
+      <div class="history-controls"><div><label for="history-robot">实际采集机器人 ID</label><select id="history-robot"><option value="">暂无记录</option></select></div><div><label for="session">监控记录</label><select id="session"><option value="">该机器人全部记录</option></select></div><div><label for="period">查看区间</label><select id="period"><option value="all">从首次记录起全部</option><option value="600">最近10分钟</option><option value="3600">最近1小时</option><option value="86400">最近24小时</option><option value="custom">自定义时间</option></select></div></div>
+      <div id="custom-range" class="ports" hidden><div><label for="range-start">开始时间 · 北京时间 UTC+8</label><input type="datetime-local" id="range-start" step="1"></div><div><label for="range-end">结束时间 · 北京时间 UTC+8</label><input type="datetime-local" id="range-end" step="1"></div></div>
+      <p id="record-list-state" class="hint"></p><button id="more-records" type="button" class="secondary" hidden>加载更早记录</button>
+      <fieldset><legend>显示曲线 · 最多12条，按单位分图</legend><div id="view-metrics" class="metric-list view-metrics"></div><p id="metric-empty" class="hint" hidden>该机器人尚无已保存指标。请先在上位机开启监控记录。</p></fieldset>
+      <div class="history-actions"><button id="refresh-curves" type="button">查询曲线</button><label class="auto-refresh"><input id="auto-refresh" type="checkbox" checked>运行记录每5秒刷新</label></div>
+      <details class="record-help"><summary>曲线范围与聚合说明</summary><p class="hint">“全部”查询不受记录列表分页限制。长区间显示分桶均值和最小/最大范围，原始数据不会因显示聚合而删除。选取更短时段可查看细节。</p></details>
+      <p id="curve-state" class="status" role="status" aria-live="polite">选择指标后查询</p>
+      <section id="report-summary" class="report-summary" aria-labelledby="report-title" hidden><p class="eyebrow">OBSERVATION REPORT / READ ONLY</p><h3 id="report-title">RP1 监控观测报告</h3><p id="report-source" class="source-badge"></p><dl id="report-metadata"></dl><p id="report-quality" class="hint"></p></section>
+      <div id="charts"></div>
+      <div class="table-wrap"><table><caption>当前查询范围与数据完整性</caption><thead><tr><th>指标</th><th>单位</th><th>最小值</th><th>最大值</th><th>有效 / 记录点数</th></tr></thead><tbody id="curve-table"></tbody></table></div>
+    </section>
+  </div>

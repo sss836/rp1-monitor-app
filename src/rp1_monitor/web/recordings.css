@@ -1,0 +1,80 @@
+/* Scoped to the legacy record document or the unified robot workspace. */
+:is(.recording-workspace,.recordings-page){--ink:var(--text,#263451);--border:var(--line,#bdcce4);min-width:0}
+main.recording-workspace{display:block;padding-top:32px;max-width:1440px}
+.recording-workspace~footer{margin-top:24px}
+:is(.recording-workspace,.recordings-page) .workspace-heading{margin-bottom:24px}
+:is(.recording-workspace,.recordings-page) .workspace-heading h1{font-size:36px;margin:12px 0}
+:is(.recording-workspace,.recordings-page) .workspace-heading h2{font-size:22px;margin:0 0 8px}
+:is(.recording-workspace,.recordings-page) .workspace-heading .description{max-width:900px}
+:is(.recording-workspace,.recordings-page) .recording-grid{display:grid;grid-template-columns:minmax(220px,280px) minmax(0,1fr);gap:24px;align-items:start}
+:is(.recording-workspace,.recordings-page) .card{min-width:0;padding:24px;background:rgba(255,255,255,.87);border:1px solid var(--border);border-radius:20px;box-shadow:0 12px 36px #4165a00a}
+:is(.recording-workspace,.recordings-page) .card h2{font-size:20px;margin:8px 0 16px}
+:is(.recording-workspace,.recordings-page) .status{font-size:13px;overflow-wrap:anywhere;white-space:pre-line;color:var(--muted);line-height:1.8}
+:is(.recording-workspace,.recordings-page) .description{font-size:13px;color:var(--muted);line-height:1.8}
+:is(.recording-workspace,.recordings-page) .hint{font-size:12px;color:var(--muted);line-height:1.8}
+:is(.recording-workspace,.recordings-page) .recording-status hr{border:0;border-top:1px solid var(--border);margin:20px 0}
+:is(.recording-workspace,.recordings-page) .metric-list{max-height:250px;overflow:auto;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:10px 0}
+:is(.recording-workspace,.recordings-page) .metric-list label{display:flex;align-items:center;gap:10px;font-size:13px;min-height:44px;overflow-wrap:anywhere}
+:is(.recording-workspace,.recordings-page) .metric-list input{margin:0;flex:0 0 18px;width:18px;height:18px}
+:is(.recording-workspace,.recordings-page) .metric-list span{min-width:0}
+:is(.recording-workspace,.recordings-page) select{width:100%;max-width:100%;min-height:44px;border:1px solid var(--border);border-radius:20px;padding:10px;background:#f7f9fd;color:var(--ink);margin-top:7px;font:inherit;font-size:13px}
+:is(.recording-workspace,.recordings-page) label{font-size:13px}
+:is(.recording-workspace,.recordings-page) .history-controls{display:grid;gap:14px;grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+:is(.recording-workspace,.recordings-page) .history-controls>div{min-width:0}
+.recording-workspace .history-controls>div:nth-child(2){grid-column:1/-1;grid-row:2}
+.recordings-page .history-controls>div:nth-child(2){grid-column:1/-1}
+:is(.recording-workspace,.recordings-page) .history-actions{display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+:is(.recording-workspace,.recordings-page) .history-actions button{width:auto}
+:is(.recording-workspace,.recordings-page) .auto-refresh{display:flex;align-items:center;gap:8px;min-height:44px}
+:is(.recording-workspace,.recordings-page) .auto-refresh input{margin:0;width:18px;height:18px}
+:is(.recording-workspace,.recordings-page) #more-records{width:auto;font-size:13px;padding:8px 14px;min-height:44px}
+:is(.recording-workspace,.recordings-page) .table-wrap{max-width:100%;overflow-x:auto}
+:is(.recording-workspace,.recordings-page) table{width:100%;font-size:12px;border-collapse:collapse}
+:is(.recording-workspace,.recordings-page) caption{text-align:left;padding:16px 0;font-size:13px}
+:is(.recording-workspace,.recordings-page) :is(th,td){text-align:left;padding:10px;border-bottom:1px solid var(--border);white-space:nowrap}
+:is(.recording-workspace,.recordings-page) figure{margin:24px 0 0}
+:is(.recording-workspace,.recordings-page) figcaption{font-size:13px;color:var(--ink);margin-bottom:8px}
+:is(.recording-workspace,.recordings-page) .record-chart{display:block;width:100%;height:auto;min-height:210px;max-height:300px;background:#f7f9fd;border:1px solid var(--border);border-radius:20px}
+:is(.recording-workspace,.recordings-page) .legend{display:flex;gap:12px;flex-wrap:wrap;font-size:12px;padding-top:8px}
+:is(.recording-workspace,.recordings-page) .legend span{padding-bottom:3px;overflow-wrap:anywhere}
+:is(.recording-workspace,.recordings-page) .read-access{margin-bottom:24px}
+:is(.recording-workspace,.recordings-page) .read-access h2{margin-top:0}
+:is(.recording-workspace,.recordings-page) .read-access .hint{margin-bottom:16px}
+:is(.recording-workspace,.recordings-page) .read-access input{max-width:580px;margin-bottom:16px}
+:is(.recording-workspace,.recordings-page) .read-access .secondary{margin-top:0}
+:is(.recording-workspace,.recordings-page) .source-warning{color:#92530b!important}
+:is(.recording-workspace,.recordings-page) .report-summary{margin:24px 0 0;padding:20px;border:1px solid var(--border);border-radius:20px;background:#f7f9fd}
+:is(.recording-workspace,.recordings-page) .report-summary h3{font-size:20px;margin:6px 0 12px}
+:is(.recording-workspace,.recordings-page) .report-summary dl{display:grid;grid-template-columns:110px minmax(0,1fr);font-size:13px;gap:8px;margin:16px 0}
+:is(.recording-workspace,.recordings-page) .report-summary dt{color:var(--muted)}
+:is(.recording-workspace,.recordings-page) .report-summary dd{margin:0;overflow-wrap:anywhere;white-space:pre-line}
+:is(.recording-workspace,.recordings-page) .source-badge{font-size:13px;font-weight:600;overflow-wrap:anywhere}
+:is(.recording-workspace,.recordings-page) button{min-height:44px;border-radius:20px}
+:is(.recording-workspace,.recordings-page) button:disabled{cursor:not-allowed}
+:is(.recording-workspace,.recordings-page) fieldset{margin:20px 0;padding:16px;border:1px solid var(--border);border-radius:20px;min-width:0}
+:is(.recording-workspace,.recordings-page) .ports{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding-top:12px}
+:is(.recording-workspace,.recordings-page) input[type=datetime-local]{width:100%;max-width:100%;min-width:0;min-height:44px;margin-top:7px}
+@supports(backdrop-filter:blur(16px)){:is(.recording-workspace,.recordings-page) .card{background:rgba(255,255,255,.72);backdrop-filter:blur(16px)}}
+@media(max-width:1100px){:is(.recording-workspace,.recordings-page) .recording-grid{grid-template-columns:minmax(200px,240px) minmax(0,1fr)}:is(.recording-workspace,.recordings-page) .card{padding:20px}:is(.recording-workspace,.recordings-page) .metric-list{grid-template-columns:1fr}}
+@media(max-width:800px){:is(.recording-workspace,.recordings-page) .recording-grid{grid-template-columns:1fr}:is(.recording-workspace,.recordings-page) .workspace-heading h1{font-size:28px}:is(.recording-workspace,.recordings-page) .history-controls{grid-template-columns:1fr}:is(.recording-workspace,.recordings-page) .history-controls>div:nth-child(2){grid-column:auto;grid-row:auto}:is(.recording-workspace,.recordings-page) .ports{grid-template-columns:1fr}:is(.recording-workspace,.recordings-page) .record-chart{min-height:160px}:is(.recording-workspace,.recordings-page) .report-summary{padding:16px}:is(.recording-workspace,.recordings-page) .report-summary dl{grid-template-columns:1fr;gap:4px}:is(.recording-workspace,.recordings-page) .report-summary dd{margin-bottom:8px}:is(.recording-workspace,.recordings-page) .history-actions button{width:100%}:is(.recording-workspace,.recordings-page) .history-actions{gap:8px}}
+@media print{
+  body:has(.recording-workspace),body:has(.recordings-page:not([hidden])){background:white;color:#17233a}
+  body:has(.recording-workspace)>:is(.topbar,footer),body:has(.recordings-page:not([hidden])) :is(.skip-link,footer,dialog,.header,.workbench-sidebar,.workspace-sidebar,.robot-sidebar,.connection-strip,#auth,#error,#workbench-context,#page-loading,#page-not-found,.workspace-navigation){display:none!important}
+  body:has(.recordings-page:not([hidden])) .workbench-layout{display:block!important}
+  body:has(.recordings-page:not([hidden])) .workspace{display:block!important;max-width:none!important;padding:0!important;margin:0!important}
+  body:has(.recordings-page:not([hidden])) .page-panel:not(.recordings-page){display:none!important}
+  :is(.recording-workspace,.recordings-page) :is(.read-access,.recording-status,.workspace-heading,.history-controls,#custom-range,fieldset,.history-actions,#more-records,#record-list-state),:is(.recording-workspace,.recordings-page) .history-card>:is(h2,.eyebrow,.hint){display:none!important}
+  :is(.recording-workspace,.recordings-page) .recording-grid{display:block}
+  :is(.recording-workspace,.recordings-page) .card{border:0;box-shadow:none;padding:0;background:white;backdrop-filter:none}
+  :is(.recording-workspace,.recordings-page){padding:0!important;max-width:none!important}
+  :is(.recording-workspace,.recordings-page) .report-summary{margin:0 0 20px;border:1px solid #bdcce4;background:white}
+  :is(.recording-workspace,.recordings-page) .report-summary .hint{display:block!important}
+  :is(.recording-workspace,.recordings-page) :is(.record-chart,figure){break-inside:avoid}
+  :is(.recording-workspace,.recordings-page) .record-chart{min-height:0;max-height:none}
+  :is(.recording-workspace,.recordings-page) .table-wrap{overflow:visible}
+  :is(.recording-workspace,.recordings-page) table{font-size:10px}
+  :is(.recording-workspace,.recordings-page) :is(th,td){white-space:normal}
+  :is(.recording-workspace,.recordings-page) .report-summary dl{grid-template-columns:110px minmax(0,1fr)}
+  :is(.recording-workspace,.recordings-page) .report-summary dd{margin:0}
+  :is(.recording-workspace,.recordings-page) .status{font-size:12px}
+}

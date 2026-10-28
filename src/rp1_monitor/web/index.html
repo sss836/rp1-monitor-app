@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="description" content="RP1 整机监控工作后台：按设备独立查看整机状态、关节温度、历史曲线、核心进程和诊断证据。">
+  <title>RP1 整机监控 · ROBO PARTY</title>
+  <link rel="icon" href="./assets/brand/logo.png">
+  <link rel="stylesheet" href="./assets/app.css?v=20261026-robopi-tui1">
+  <link rel="stylesheet" href="./assets/vendor/swiper-bundle.min.css?v=20261026-robopi-tui1">
+  <link rel="stylesheet" href="./assets/showcase.css?v=20261026-robopi-tui1">
+  <link rel="stylesheet" href="./assets/workbench.css?v=20261028-workspace1">
+  <link rel="stylesheet" href="./assets/recordings.css?v=20261028-workspace1">
+  <link rel="stylesheet" href="./assets/workspace-shell.css?v=20261028-workspace1">
+  <script src="./assets/pages.js?v=20261028-workspace1" defer></script>
+  <script src="./assets/app.js?v=20261028-workspace1" defer></script>
+  <script src="./assets/recordings.js?v=20261028-workspace1" defer></script>
+  <script src="./assets/joint-points.js?v=20261026-robopi-tui1" defer></script>
+  <script src="./assets/thermal-imaging.js?v=20261026-robopi-tui1" defer></script>
+  <script src="./assets/operations.js?v=20261026-robopi-tui1" defer></script>
+  <script src="./assets/central.js?v=20261026-robopi-tui1" defer></script>
+  <script src="./assets/thermal.js?v=20261026-robopi-tui1" defer></script>
+  <script src="./assets/presentation.js?v=20261026-robopi-tui1" defer></script>
+  <script src="./assets/components.js?v=20261028-workspace1" defer></script>
+  <script src="./assets/host-cores.js?v=20261026-robopi-tui1" defer></script>
+  <script src="./assets/overview-views.js?v=20261026-robopi-tui1" defer></script>
+  <script type="module" src="./assets/vendor/showcase.bundle.js?v=20261026-robopi-tui1"></script>
+</head>
+<body class="showcase-page workbench-page">
+  <a class="skip-link" href="#monitor-content">跳转到监控数据</a>
+  <header class="header">
+    <a class="brand-heading" href="./robots" data-page="fleet" aria-label="ROBO PARTY RP1 整机监控首页">
+      <img class="brand-logo" src="./assets/brand/logo.png" alt="ROBO PARTY" width="146" height="50">
+      <div class="heading-copy"><span class="eyebrow">ROBOT WORKSPACE</span><span class="brand-title">RP1 机器人工作台</span></div>
+    </a>
+    <div class="header-device"><label for="robot-switch">当前机器人</label><select id="robot-switch"><option value="">等待登记设备</option></select><span id="workspace-device-id" class="header-device-id">尚未选择机器人</span></div>
+    <div class="header-context"><span id="workspace-status" class="workspace-status" role="status">等待数据</span><a id="header-record-link" class="header-record" href="./recordings" data-page="recordings"><span id="header-record-label">当前记录</span><strong id="header-record-number">正在读取记录状态…</strong></a></div>
+    <div class="header-right"><!-- ADMIN_LINK --><button id="nav-toggle" class="nav-toggle" type="button" aria-controls="primary-nav" aria-expanded="false" aria-label="展开导航">菜单 <span aria-hidden="true">☰</span></button><button id="motion-toggle" class="quiet-button" type="button" aria-pressed="false">暂停动效</button><button id="nav-diagnose" type="button" hidden>诊断对话</button></div>
+  </header>
+  <div class="connection-strip"><span class="pill neutral">只读监控</span><span id="refresh-status" role="status">连接中</span><button id="refresh-button" type="button">立即刷新 <span aria-hidden="true">↻</span></button></div>
+<section id="auth" class="auth hidden" aria-label="平台访问认证">
+    <label for="viewer-token">只读访问凭据</label><input id="viewer-token" type="password" autocomplete="off"><button id="auth-button">连接平台</button>
+    <span>已有平台登录会话时由平台授权；独立部署使用只读凭据。</span>
+  </section>
+  <div id="error" class="error hidden" role="alert"></div>
+  <div class="workbench-layout">
+  <aside id="workbench-sidebar" class="workbench-sidebar" aria-label="机器人工作区">
+    <a class="sidebar-back" href="./robots" data-page="fleet"><span aria-hidden="true">←</span> 返回机器人列表</a>
+    <span class="sidebar-caption">当前机器人</span>
+    <nav id="primary-nav" class="primary-nav" aria-label="机器人页面">
+      <a href="./robots" data-page="overview" data-nav="true"><span aria-hidden="true">01</span>整机概览</a>
+      <a href="./robots" data-page="battery" data-nav="true"><span aria-hidden="true">02</span>电池</a>
+      <a href="./robots" data-page="joints" data-nav="true"><span aria-hidden="true">03</span>关节状态</a>
+      <a href="./robots" data-page="host" data-nav="true"><span aria-hidden="true">04</span>主机负载</a>
+      <a href="./recordings" data-page="recordings" data-nav="true"><span aria-hidden="true">05</span>监控记录</a>
+      <a href="./robots" data-page="storage" data-nav="true"><span aria-hidden="true">06</span>告警</a>
+      <a href="./robots" data-page="diagnostics" data-nav="true"><span aria-hidden="true">07</span>诊断助手</a>
+    </nav>
+    <div class="sidebar-footer"><span class="pill neutral">只读工作台</span><p>连接机器人和开启记录<br>请在原生上位机操作</p></div>
+  </aside>
+  <main id="monitor-content" class="workspace" tabindex="-1">
+    <section id="workbench-context" class="workbench-context" aria-label="当前工作页面与机器人">
+      <div class="workbench-heading"><span class="eyebrow">RP1 / MONITOR WORKBENCH</span><h1 id="page-title">机器人列表</h1><div class="workspace-meta"><span id="workspace-source" class="pill neutral">来源待确认</span><span id="workspace-profile">机型待确认</span><span>状态、曲线与记录属于同一机器人</span></div></div>
+    </section>
+    <p id="page-loading" class="page-message" role="status">正在读取设备状态…</p>
+    <section id="page-not-found" class="panel page-not-found" role="status" hidden><h2>未找到此页面或机器人</h2><p>请从已登记的设备中重新选择。</p><a href="./robots" data-page="fleet">返回设备总览 →</a></section>
+<section id="fleet" class="page-panel fleet-showcase" data-page-panel="fleet" aria-labelledby="fleet-title">
+      <div class="section-heading"><div><span class="eyebrow">REGISTERED ROBOTS</span><h2 id="fleet-title">登记设备</h2></div><p>点击设备进入独立的整机工作页面。</p></div>
+      <section class="overview" aria-label="监控总览">
+    <div><span class="label">已登记机器人</span><strong id="robot-count">—</strong><span class="stat-caption">设备总数</span></div>
+    <div><span class="label">采集端在线</span><strong id="online-count">—</strong><span class="stat-caption">独立采集服务</span></div>
+    <div><span class="label">数据新鲜</span><strong id="fresh-count">—</strong><span class="stat-caption">按数据年龄判断</span></div>
+    <div><span class="label">平台刷新</span><strong>1<span class="unit"> Hz</span></strong><span class="stat-caption">每秒更新当前状态</span></div>
+  </section>
+      <div class="fleet-gallery">
+        <div id="fleet-coverflow" class="swiper" aria-label="机器人设备轮播"><div class="swiper-wrapper"></div></div>
+        <p id="fleet-empty" class="fleet-note" role="status">尚未登记机器人。接入采集后显示对应设备，当前没有观测不能代表运行正常。</p>
+        <div class="fleet-gallery-controls"><button id="fleet-prev" type="button" aria-label="上一台机器人" disabled>←</button><span id="fleet-position" role="status">等待设备数据</span><button id="fleet-next" type="button" aria-label="下一台机器人" disabled>→</button></div>
+      </div>
+      <details class="fleet-list-details"><summary>查看完整设备列表</summary><div id="robot-list"></div><p class="fleet-note">采集端在线不代表传感数据正在更新。现场窗口关闭后，上位机与后台转发仍运行时继续上传。</p></details>
+    </section>
+    <section class="page-panel overview-page" data-page-panel="overview" hidden aria-label="整机状态">
+<section class="panel identity">
+        <div class="identity-copy"><span class="eyebrow">WHOLE ROBOT / HEALTH MONITOR</span><h2 id="robot-title">等待机器人数据</h2><p class="identity-description">电池 · 温度 · 故障 · 运行负载</p><div class="identity-meta"><span id="robot-id">—</span><span id="source-kind" class="pill warning">来源待确认</span></div></div>
+      </section>
+<div class="detail-status">
+        <div class="panel"><span class="label">采集连接</span><strong id="connection-state">待确认</strong><small id="received-at">尚未接收</small></div>
+        <div class="panel"><span class="label">传感数据</span><strong id="data-state">待确认</strong><small id="data-age">—</small><small id="cache-loss"></small></div>
+        <div class="panel"><span class="label">时间质量</span><strong id="clock-state">待确认</strong><small id="clock-detail">主机接收时间，非传感器硬件时间</small></div>
+        <div class="panel"><span class="label">本次开机运行时长</span><strong id="robot-uptime">—</strong><small id="robot-uptime-note">等待机器人主机 uptime，非测试累计时长</small></div>
+      </div>
+      <section id="robot-readiness" class="panel robot-readiness" aria-labelledby="robot-readiness-title" hidden><h3 id="robot-readiness-title">真机只读接入</h3><p id="robot-readiness-summary" role="status">等待核对当前机器人各项观测。</p><ul id="robot-readiness-items"></ul></section>
+      <div class="overview-workspace">
+<div class="model-exhibit" aria-label="RP1 整机模型与温度">
+        <div class="overview-view-tabs" role="tablist" aria-label="查看模式"><button id="overview-structure-tab" type="button" role="tab" aria-controls="overview-structure-panel" aria-selected="true" tabindex="0">三维结构</button><button id="overview-thermal-tab" type="button" role="tab" aria-controls="overview-thermal-panel" aria-selected="false" tabindex="-1">整机热像</button></div>
+        <div id="overview-structure-panel" class="overview-view-panel" role="tabpanel" aria-labelledby="overview-structure-tab">
+        <div class="model-exhibit-heading"><span class="eyebrow">RP1.3 / STRUCTURE VIEW</span><span class="model-tag">结构示意</span></div>
+        <div id="model-stage" class="model-stage">
+          <div id="model-canvas-host" class="model-canvas-host"></div>
+          <div id="model-fallback" class="model-fallback"><img src="./assets/brand/robot-wave.webp" alt="RP1 白蓝色机器人静态结构示意，非实时姿态" width="960" height="1707"><span>RP1.3 静态结构示意 · 非实时姿态<br>24 / 28 自由度适配待实机确认</span></div>
+          <div class="model-load-state"><p id="model-status" role="status">正在加载 RP1.3 结构模型…</p><progress id="model-progress" max="100" value="0" aria-label="三维模型加载进度">0%</progress><button id="model-retry" type="button" hidden>重新加载模型</button></div>
+        </div>
+        <div class="model-controls" role="group" aria-label="三维模型查看控制"><button id="model-left" type="button" aria-label="向左旋转模型">↶</button><button id="model-right" type="button" aria-label="向右旋转模型">↷</button><button id="model-zoom-in" type="button" aria-label="放大模型">＋</button><button id="model-zoom-out" type="button" aria-label="缩小模型">−</button><button id="model-reset" type="button">复位视角</button><button id="model-static" type="button" aria-pressed="false">静态示意</button></div>
+        <p class="model-caption">拖动旋转 · 滚轮或双指缩放 · 支持键盘方向键<br>三维结构不表示实时姿态，温度部位以已配置映射为准。</p>
+        </div>
+        <div id="overview-thermal-panel" class="overview-view-panel" role="tabpanel" aria-labelledby="overview-thermal-tab" hidden>
+          <div id="overview-thermal-host"></div>
+          <a class="overview-thermal-link" href="./robots" data-page="temperature">打开完整关节热像 <span aria-hidden="true">→</span></a>
+        </div>
+      </div>
+<section class="panel health-panel" aria-label="整机健康总览">
+        <div class="panel-heading"><div><span class="eyebrow">ROBOT HEALTH</span><h2 id="health-state">等待健康数据</h2></div><span id="health-limit-note" class="pill warning">判据待配置</span></div>
+        <p id="health-detail" class="muted">采集在线不代表机器人健康。</p>
+        <div class="health-grid">
+          <a class="health-card" href="./robots" data-page="battery"><span class="label">电池电量</span><strong id="battery-soc">—</strong><small id="battery-electrical">电压 — · 电流 —</small><small id="battery-power">供电 — · V×A计算功率 —</small><span class="health-card-action">查看电池详情 <span aria-hidden="true">↗</span></span></a>
+          <a class="health-card" href="./robots" data-page="battery"><span class="label">电池温度 / 保护位</span><strong id="battery-temperature">—</strong><small id="battery-protection">保护状态未提供</small><span class="health-card-action">查看电池详情 <span aria-hidden="true">↗</span></span></a>
+          <a class="health-card" href="./robots" data-page="host"><span class="label">主机最高热区温度</span><strong id="host-temperature">—</strong><small id="host-thermal-zones">等待内核热区</small><span class="health-card-action">查看主机详情 <span aria-hidden="true">↗</span></span></a>
+          <a class="health-card" href="./robots" data-page="host"><span class="label">主机运行负载</span><strong id="host-cpu">—</strong><small id="host-memory">内存 —</small><span class="health-card-action">查看主机详情 <span aria-hidden="true">↗</span></span></a>
+          <a class="health-card" href="./robots" data-page="joints"><span class="label">电机最高温度 / MOS</span><strong id="motor-temperature">—</strong><small id="motor-mos">MOS —</small><small id="motor-coverage">健康数据尚未接入</small><span class="health-card-action">查看关节详情 <span aria-hidden="true">↗</span></span></a>
+          <a class="health-card" href="./robots" data-page="joints"><span class="label">故障上报</span><strong id="motor-fault-count">待确认</strong><small id="motor-faults">没有数据不能代表没有故障</small><span class="health-card-action">查看关节详情 <span aria-hidden="true">↗</span></span></a>
+        </div>
+        <details class="health-evidence"><summary>数据来源与接入情况</summary><div id="health-sources"></div></details>
+      </section>
+      </div>
+<div class="hero-current sr-only" aria-label="当前选中机器人">
+          <div class="hero-current-heading"><span class="label">当前观测</span><span id="hero-source" class="pill warning">来源待确认</span></div>
+          <h2 id="hero-robot-name">等待机器人数据</h2><p id="hero-robot-id" class="hero-device-id">—</p>
+          <div class="hero-current-values"><div><span class="label">关节配置</span><strong id="hero-dof">—</strong></div><div><span class="label">电机最高温度</span><strong id="hero-temperature">—</strong></div></div>
+          <p id="hero-note" class="hero-note">尚未接收观测，缺失状态保持未知。</p>
+        </div>
+    </section>
+    <section class="page-panel component-page" data-page-panel="battery" hidden aria-labelledby="battery-page-title">
+      <div class="component-page-heading"><div><h2 id="battery-page-title">电池运行状态</h2><p>电量、温度和电气参数均来自当前设备上报；未提供或过期的观测保持未知。</p></div></div>
+      <div class="component-controls"><div><label for="battery-range">时间范围</label><select id="battery-range"><option value="600">最近 10 分钟</option><option value="3600">最近 1 小时</option></select></div><button id="battery-refresh" type="button">刷新数据</button></div>
+      <p id="battery-status" class="component-page-status" role="status">等待查询当前机器人的观测数据。</p>
+      <div class="component-kpis component-kpis-battery"><article><span class="label">当前电量</span><strong id="battery-page-soc">—</strong><small>来自电池上报，未估算续航</small></article><article><span class="label">当前温度</span><strong id="battery-page-temp">—</strong><small>电池温度，非主机热区</small></article><article><span class="label">当前电压</span><strong id="battery-page-voltage">—</strong><small>保留上报单位与原始数值</small></article><article><span class="label">当前电流</span><strong id="battery-page-current">—</strong><small>正负方向以采集协议为准</small></article><article><span class="label">电流绝对峰值（时段）</span><strong id="battery-page-current-peak">—</strong><small id="battery-current-extrema">带符号电流最低 / 最高值待查询</small></article><article><span class="label">电压最低/最高（时段）</span><strong id="battery-page-voltage-range">—</strong><small>所选时段摘要极值，缺失不补零</small></article></div>
+      <div class="component-chart-grid">
+        <section class="panel component-chart-panel" aria-labelledby="battery-soc-title">
+          <div class="component-chart-heading"><div><h3 id="battery-soc-title">SOC 放电观测曲线</h3><span class="component-chart-subtitle">% · 保留实测 SOC 变化，不强行单调；每秒摘要，非完整高频曲线</span></div></div>
+          <div class="chart-legend"><span class="legend-line">窗口最后值</span><span class="legend-range">窗口极值</span></div>
+          <svg id="battery-soc-chart" class="component-chart" viewBox="0 0 560 250" role="img" aria-label="SOC 放电观测曲线，保留实测变化，不强行单调"></svg>
+          <p id="battery-soc-empty" class="component-chart-empty">尚无所选范围的观测，缺失值保持未知。</p><p id="battery-soc-resolution" class="component-chart-resolution">等待查询</p>
+        </section>
+        <section class="panel component-chart-panel" aria-labelledby="battery-temperature-title">
+          <div class="component-chart-heading"><div><h3 id="battery-temperature-title">电池温度</h3><span class="component-chart-subtitle">°C · 每秒摘要，非完整高频曲线</span></div></div>
+          <div class="chart-legend"><span class="legend-line">窗口最后值</span><span class="legend-range">窗口极值</span></div>
+          <svg id="battery-temperature-chart" class="component-chart" viewBox="0 0 560 250" role="img" aria-label="电池温度历史摘要曲线"></svg>
+          <p id="battery-temperature-empty" class="component-chart-empty">尚无所选范围的观测，缺失值保持未知。</p><p id="battery-temperature-resolution" class="component-chart-resolution">等待查询</p>
+        </section>
+        <section class="panel component-chart-panel" aria-labelledby="battery-voltage-title">
+          <div class="component-chart-heading"><div><h3 id="battery-voltage-title">电池电压</h3><span class="component-chart-subtitle">V · 每秒摘要，非完整高频曲线</span></div></div>
+          <div class="chart-legend"><span class="legend-line">窗口最后值</span><span class="legend-range">窗口极值</span></div>
+          <svg id="battery-voltage-chart" class="component-chart" viewBox="0 0 560 250" role="img" aria-label="电池电压历史摘要曲线"></svg>
+          <p id="battery-voltage-empty" class="component-chart-empty">尚无所选范围的观测，缺失值保持未知。</p><p id="battery-voltage-resolution" class="component-chart-resolution">等待查询</p>
+        </section>
+        <section class="panel component-chart-panel" aria-labelledby="battery-current-title">
+          <div class="component-chart-heading"><div><h3 id="battery-current-title">电池电流</h3><span class="component-chart-subtitle">A · 每秒摘要，非完整高频曲线</span></div></div>
+          <div class="chart-legend"><span class="legend-line">窗口最后值</span><span class="legend-range">窗口极值</span></div>
+          <svg id="battery-current-chart" class="component-chart" viewBox="0 0 560 250" role="img" aria-label="电池电流历史摘要曲线"></svg>
+          <p id="battery-current-empty" class="component-chart-empty">尚无所选范围的观测，缺失值保持未知。</p><p id="battery-current-resolution" class="component-chart-resolution">等待查询</p>
+        </section>
+      </div>
+    </section>
+    <section class="page-panel component-page" data-page-panel="joints" hidden aria-labelledby="joints-page-title">
+      <div class="component-page-heading"><div><h2 id="joints-page-title">逐关节运行状态</h2><p>从完整关节配置选择测点。上报力矩、温度与统计保留来源，不推断缺失的关节状态。</p></div><a class="component-page-link" href="./robots" data-page="temperature">逐关节热成像 <span aria-hidden="true">↗</span></a></div>
+      <div class="component-controls"><div class="component-joint-field"><label for="joints-page-select">当前关节</label><select id="joints-page-select"><option value="">等待关节配置</option></select></div><div><label for="joints-range">时间范围</label><select id="joints-range"><option value="600">最近 10 分钟</option><option value="3600">最近 1 小时</option></select></div><button id="joints-refresh" type="button">刷新数据</button></div>
+      <p id="joints-status" class="component-page-status" role="status">等待查询当前机器人的观测数据。</p>
+      <div class="component-kpis component-kpis-joints"><article><span class="label">当前电机温度</span><strong id="joints-page-temperature">—</strong><small>按当前选择的关节读取</small></article><article><span class="label">当前 MOS 温度</span><strong id="joints-page-mos">—</strong><small>驱动功率器件上报温度</small></article><article><span class="label">当前上报力矩</span><strong id="joints-page-torque">—</strong><small>反馈观测，非策略目标</small></article><article><span class="label">策略目标跟踪 RMS（所选时段）</span><strong id="joints-page-rms">—</strong><small id="joints-rms-note">同批反馈位置与策略目标误差；需有效配对样本，非最终电机目标</small></article><article><span class="label">电机 / MOS 最高温（时段）</span><strong id="joints-page-temperature-max">—</strong><small>所选时段已上报温度摘要的最大值</small></article><article><span class="label">力矩绝对峰值（时段）</span><strong id="joints-page-torque-peak">—</strong><small>所选时段上报力矩的绝对峰值</small></article></div>
+      <div class="component-chart-grid">
+        <section class="panel component-chart-panel" aria-labelledby="joints-temperature-title">
+          <div class="component-chart-heading"><div><h3 id="joints-temperature-title">电机温度</h3><span class="component-chart-subtitle">°C · 每秒摘要，非完整高频曲线</span></div></div>
+          <div class="chart-legend"><span class="legend-line">窗口最后值</span><span class="legend-range">窗口极值</span></div>
+          <svg id="joints-temperature-chart" class="component-chart" viewBox="0 0 560 250" role="img" aria-label="电机温度历史摘要曲线"></svg>
+          <p id="joints-temperature-empty" class="component-chart-empty">尚无所选范围的观测，缺失值保持未知。</p><p id="joints-temperature-resolution" class="component-chart-resolution">等待查询</p>
+        </section>
+        <section class="panel component-chart-panel" aria-labelledby="joints-mos-title">
+          <div class="component-chart-heading"><div><h3 id="joints-mos-title">MOS 温度</h3><span class="component-chart-subtitle">°C · 每秒摘要，非完整高频曲线</span></div></div>
+          <div class="chart-legend"><span class="legend-line">窗口最后值</span><span class="legend-range">窗口极值</span></div>
+          <svg id="joints-mos-chart" class="component-chart" viewBox="0 0 560 250" role="img" aria-label="MOS 温度历史摘要曲线"></svg>
+          <p id="joints-mos-empty" class="component-chart-empty">尚无所选范围的观测，缺失值保持未知。</p><p id="joints-mos-resolution" class="component-chart-resolution">等待查询</p>
+        </section>
+        <section class="panel component-chart-panel" aria-labelledby="joints-torque-title">
+          <div class="component-chart-heading"><div><h3 id="joints-torque-title">上报力矩</h3><span class="component-chart-subtitle">N·m · 每秒摘要，非完整高频曲线</span></div></div>
+          <div class="chart-legend"><span class="legend-line">窗口最后值</span><span class="legend-range">窗口极值</span></div>
+          <svg id="joints-torque-chart" class="component-chart" viewBox="0 0 560 250" role="img" aria-label="上报力矩历史摘要曲线"></svg>
+          <p id="joints-torque-empty" class="component-chart-empty">尚无所选范围的观测，缺失值保持未知。</p><p id="joints-torque-resolution" class="component-chart-resolution">等待查询</p>
+        </section>
+        <section class="panel component-chart-panel" aria-labelledby="joints-rms-title">
+          <div class="component-chart-heading"><div><h3 id="joints-rms-title">策略目标跟踪 RMS（所选时段）</h3><span class="component-chart-subtitle">rad · 同批反馈位置与策略目标误差；需有效配对样本，非最终电机目标</span></div></div>
+          <div class="chart-legend"><span class="legend-line">窗口配对 RMS</span></div>
+          <svg id="joints-rms-chart" class="component-chart" viewBox="0 0 560 250" role="img" aria-label="策略目标跟踪 RMS 历史摘要曲线，单位 rad"></svg>
+          <p id="joints-rms-empty" class="component-chart-empty">尚无所选范围的观测，缺失值保持未知。</p><p id="joints-rms-resolution" class="component-chart-resolution">等待查询</p>
+        </section>
+      </div>
+    </section>
+    <section class="page-panel component-page" data-page-panel="host" hidden aria-labelledby="host-page-title">
+      <div class="component-page-heading"><div><h2 id="host-page-title">机器人主机负载</h2><p>读取机器人内核及主机观测。进程存活不代表功能健康，开机时长独立于正式测试统计。</p></div><a class="component-page-link" href="./robots" data-page="processes">查看核心进程 <span aria-hidden="true">↗</span></a></div>
+      <div class="component-controls"><div><label for="host-range">时间范围</label><select id="host-range"><option value="600">最近 10 分钟</option><option value="3600">最近 1 小时</option></select></div><button id="host-refresh" type="button">刷新数据</button></div>
+      <p id="host-status" class="component-page-status" role="status">等待查询当前机器人的观测数据。</p>
+      <div class="component-kpis component-kpis-host"><article><span class="label">当前 CPU 使用率</span><strong id="host-page-cpu">—</strong><small>主机整体负载观测</small></article><article><span class="label">当前内存使用率</span><strong id="host-page-memory">—</strong><small>机器人主机内存使用率</small></article><article><span class="label">当前最高热区温度</span><strong id="host-page-temperature">—</strong><small>仅来自已上报的内核热区</small></article><article><span class="label">本次开机运行时长</span><strong id="host-page-uptime">—</strong><small id="host-uptime-note">机器人主机内核 uptime，来源待确认</small></article></div>
+      <section class="panel host-core-panel" aria-labelledby="host-core-title">
+        <div class="host-core-panel-heading"><div><span class="eyebrow">CPU / PER CORE</span><h3 id="host-core-title">CPU 核心负载</h3><p>每核 0–100% · 来自 Linux 内核采样，非进程 CPU 占用</p></div><div class="host-core-badges"><span id="host-core-source" class="pill warning">来源待确认</span><span id="host-core-count">核心清单待提供</span></div></div>
+        <p id="host-core-state" class="host-core-state" role="status">等待设备数据</p>
+        <div class="host-core-groups">
+          <section id="host-core-big" class="host-core-group" data-core-group="big" aria-labelledby="host-core-big-title" hidden><h4 id="host-core-big-title">大核</h4><div id="host-core-big-list" class="host-core-list"></div></section>
+          <section id="host-core-little" class="host-core-group" data-core-group="little" aria-labelledby="host-core-little-title" hidden><h4 id="host-core-little-title">小核</h4><div id="host-core-little-list" class="host-core-list"></div></section>
+          <section id="host-core-unknown" class="host-core-group" data-core-group="unknown" aria-labelledby="host-core-unknown-title" hidden><h4 id="host-core-unknown-title">未识别</h4><div id="host-core-unknown-list" class="host-core-list"></div></section>
+        </div>
+        <p id="host-core-empty" class="host-core-empty">等待当前机器人的逐核观测。</p><p id="host-cpu-topology-note" class="host-cpu-topology-note">大小核识别依据待提供。</p>
+      </section>
+      <div class="component-chart-grid">
+        <section class="panel component-chart-panel" aria-labelledby="host-cpu-title">
+          <div class="component-chart-heading"><div><h3 id="host-cpu-title">主机 CPU 负载</h3><span class="component-chart-subtitle">% · 每秒摘要，非完整高频曲线</span></div></div>
+          <div class="chart-legend"><span class="legend-line">窗口最后值</span><span class="legend-range">窗口极值</span></div>
+          <svg id="host-cpu-chart" class="component-chart" viewBox="0 0 560 250" role="img" aria-label="主机 CPU 负载历史摘要曲线"></svg>
+          <p id="host-cpu-empty" class="component-chart-empty">尚无所选范围的观测，缺失值保持未知。</p><p id="host-cpu-resolution" class="component-chart-resolution">等待查询</p>
+        </section>
+        <section class="panel component-chart-panel" aria-labelledby="host-memory-title">
+          <div class="component-chart-heading"><div><h3 id="host-memory-title">主机内存使用率</h3><span class="component-chart-subtitle">% · 每秒摘要，非完整高频曲线</span></div></div>
+          <div class="chart-legend"><span class="legend-line">窗口最后值</span><span class="legend-range">窗口极值</span></div>
+          <svg id="host-memory-chart" class="component-chart" viewBox="0 0 560 250" role="img" aria-label="主机内存使用率历史摘要曲线，单位百分比"></svg>
+          <p id="host-memory-empty" class="component-chart-empty">尚无所选范围的观测，缺失值保持未知。</p><p id="host-memory-resolution" class="component-chart-resolution">等待查询</p>
+        </section>
+        <section class="panel component-chart-panel" aria-labelledby="host-temperature-title">
+          <div class="component-chart-heading"><div><h3 id="host-temperature-title">内核热区温度</h3><span class="component-chart-subtitle">°C · 每秒摘要，非完整高频曲线</span></div><div class="component-thermal-field"><label for="host-thermal-select">热区</label><select id="host-thermal-select"><option value="">等待热区数据</option></select></div></div>
+          <div class="chart-legend"><span class="legend-line">窗口最后值</span><span class="legend-range">窗口极值</span></div>
+          <svg id="host-temperature-chart" class="component-chart" viewBox="0 0 560 250" role="img" aria-label="内核热区温度历史摘要曲线"></svg>
+          <p id="host-temperature-empty" class="component-chart-empty">尚无所选范围的观测，缺失值保持未知。</p><p id="host-temperature-resolution" class="component-chart-resolution">等待查询</p>
+        </section>
+      </div>
+    </section>
+<section id="thermal-overview" class="page-panel thermal-overview" data-page-panel="temperature" hidden aria-labelledby="thermal-section-title">
+      <div class="section-heading"><div><span class="eyebrow">JOINT TEMPERATURE</span><h2 id="thermal-section-title">关节温度</h2></div><p>逐关节独立测温，点击测点追溯曲线与告警。</p></div>
+<section class="panel motor-map-panel" data-thermal-mode="infrared" aria-labelledby="motor-map-title">
+        <div class="panel-heading"><div><span class="eyebrow">MOTOR TEMPERATURE MAP</span><h2 id="motor-map-title">整机温度分布</h2></div><div class="thermal-view-controls"><div class="thermal-mode-switch" role="group" aria-label="温度显示模式"><button id="thermal-mode-infrared" type="button" aria-pressed="true">热成像色谱</button><button id="thermal-mode-red" type="button" aria-pressed="false">红色深浅</button></div><strong id="motor-map-status" class="muted" role="status">等待温度数据</strong></div></div>
+        <p id="motor-map-setup" class="motor-map-setup" role="status" hidden></p>
+        <div class="motor-map-content">
+          <div class="motor-map-figure">
+            <div class="thermal-image-heading"><span class="thermal-image-kind">关节测温示意</span><span id="thermal-image-range" role="status">温度范围待观测</span></div>
+            <svg id="motor-map" data-thermal-mode="infrared" viewBox="0 0 960 1707" role="group" aria-label="机器人温度分布，等待部位映射"><image href="./assets/brand/robot-wave.webp" width="960" height="1707"/><g id="motor-map-regions"></g></svg>
+            <div class="motor-map-legend"><span id="motor-map-low">低温</span><i aria-hidden="true"></i><span id="motor-map-high">高温</span></div>
+            <p class="thermal-image-caption">每个关节独立显示温度 · 灰色为未知<br>同部位多轴为示意布局，实际位置待核对<br>关节测温示意 · 非热像相机</p>
+            <section id="unmapped-joints" class="unmapped-joints" aria-labelledby="unmapped-joints-title" hidden><h3 id="unmapped-joints-title">位置待确认的关节</h3><p>保留逐关节温度，确认部位后再定位到图上</p><div id="unmapped-joint-list" aria-label="尚未定位到机型图的关节"></div></section>
+          </div>
+          <div class="motor-map-readings"><p id="joint-map-coverage" class="joint-map-coverage" role="status">关节总数与定位覆盖待查询</p><p id="motor-map-note" class="muted">部位映射尚未配置</p><p id="motor-map-meaning" class="muted">机型示意，不表示实时姿态。</p><ul id="motor-map-rows" aria-label="逐关节温度与配置限值"></ul></div>
+        </div>
+      </section>
+    </section>
+<section id="telemetry-section" class="page-panel telemetry-section" data-page-panel="history" hidden aria-labelledby="telemetry-title">
+      <div class="section-heading"><div><span class="eyebrow">TELEMETRY HISTORY</span><h2 id="telemetry-title">历史曲线</h2></div><p>保留来源与缺失，让每条曲线都有依据。</p></div>
+<section class="panel chart-panel">
+        <div class="panel-heading"><div><span class="eyebrow">TELEMETRY HISTORY</span><h2>历史曲线</h2><span class="muted">每秒摘要 · 最新值与适用指标极值 · 非完整高频曲线</span></div><div class="chart-controls"><div><label for="curve-tier">曲线存储层</label><select id="curve-tier"><option value="raw">原始摘要</option><option value="key">关键曲线留存</option></select></div><div><label for="metric-select">监测参数</label><select id="metric-select"></select></div><div><label for="range-select">时间范围</label><select id="range-select"><option value="600">最近10分钟</option><option value="3600">最近1小时</option><option value="86400">最近24小时</option></select></div></div></div>
+        <div class="chart-legend"><span class="legend-line">窗口最后值</span><span class="legend-range">极值范围</span><span id="chart-resolution" class="muted">等待数据</span></div>
+        <svg id="chart" viewBox="0 0 1000 270" role="img" aria-label="选中指标的历史摘要曲线"></svg>
+        <p id="chart-empty" class="muted">尚无历史数据，采集上报后自动显示。</p>
+      </section>
+    
+      <details class="inspector-section"><summary>关节实时状态 <span>反馈、策略目标与温度</span></summary>
+<section class="panel joints-panel"><div class="panel-heading"><div><span class="eyebrow">JOINT FEEDBACK</span><h2>关节实时状态</h2></div><span class="muted">规范索引与 ROS 名称 · 物理映射待实机核对</span></div><div class="table-scroll"><table><thead><tr><th>关节索引</th><th>反馈位置 <small>rad</small></th><th>反馈速度 <small>rad/s</small></th><th>上报力矩 <small>N·m</small></th><th>策略目标 <small>rad</small></th><th>电机温度 <small>°C</small></th><th>MOS温度 <small>°C</small></th><th>原始故障码</th></tr></thead><tbody id="joints-body"></tbody></table></div></section>
+      </details>
+    </section>
+    <section class="page-panel" data-page-panel="processes" hidden aria-label="核心进程">
+<section class="panel process-panel" aria-labelledby="process-title">
+        <div class="panel-heading"><div><span class="eyebrow">CORE PROCESSES</span><h2 id="process-title">核心进程</h2></div><span class="pill neutral">只读 · 每 2 秒采样</span></div>
+        <p id="process-summary" class="muted">等待进程观测</p>
+        <div class="table-scroll"><table><thead><tr><th>监测进程 / PID</th><th>观测状态</th><th>CPU <small>单核100%</small></th><th>RSS <small>MiB · 近似</small></th><th>线程</th><th>观察到的重启</th><th>采样年龄</th></tr></thead><tbody id="process-body"></tbody></table></div>
+        <p class="muted process-note">进程存活不代表功能健康。多线程 CPU 可超过 100%；RSS 含共享页；重启数仅覆盖本采集会话观察到的实例变化。</p>
+        <details class="health-evidence"><summary>采集说明与原始观测</summary><div id="process-evidence"></div></details>
+      </section>
+    </section>
+    <section class="page-panel" data-page-panel="storage" hidden aria-label="数据与告警">
+<section class="panel central-panel" aria-labelledby="central-title">
+        <div class="panel-heading"><div><span class="eyebrow">DATA & OBSERVABILITY</span><h2 id="central-title">数据留存与监测告警</h2></div><button id="central-refresh" type="button">刷新记录</button></div>
+        <p id="central-status" class="muted" role="status">等待读取中央服务</p>
+        <div class="storage-grid">
+          <article><span class="label">当前数据库物理占用</span><strong id="storage-physical">—</strong><small id="storage-scope">包含范围待确认</small></article>
+          <article><span class="label">本设备 · 原始 / 关键 JSON</span><strong id="storage-device">—</strong><small id="storage-count">去重接收窗口数 —</small></article>
+          <article><span class="label">30天 · 每秒1窗估算</span><strong id="storage-estimate">—</strong><small>原始 / 关键；仅逻辑JSON，不含索引与备份</small></article>
+        </div>
+        <p id="storage-retention" class="central-note">到期预览待查询</p><p id="storage-disk" class="central-note">中央存储盘剩余量未知</p>
+        <details class="health-evidence"><summary>当前留存策略与容量日账</summary><pre id="storage-policy">待读取</pre></details>
+        <div class="central-alert-heading"><h3>当前监测规则</h3><span id="central-alert-count" class="pill warning">待确认</span></div>
+        <div id="central-alerts" class="central-alerts"></div>
+        <details class="health-evidence"><summary>最近20条触发与恢复记录</summary><div id="central-events"></div></details>
+        <p id="central-limit-note" class="central-note">温度限值默认未配置。规则确认正常才记录恢复；失联、过期或规则移除保留为未知。模拟事件不代表实机故障。</p>
+      </section>
+    </section>
+    <section id="recordings-page" class="page-panel recordings-page" data-page-panel="recordings" hidden aria-label="监控记录与报告"><!-- RECORDINGS_PANEL --></section>
+    <section id="diagnostic-section" class="page-panel diagnostics-page" data-page-panel="diagnostics" hidden aria-label="诊断助手">
+      <button id="ops-open" type="button" hidden>进入诊断对话</button>
+<dialog id="ops-dialog" class="chat-dialog" aria-labelledby="chat-dialog-title">
+    <header class="chat-header">
+      <span class="entry-mark" aria-hidden="true">RP</span>
+      <div><h2 id="chat-dialog-title">诊断对话</h2><p id="ops-header-context">只读诊断 · 等待选择机器人</p></div>
+      <button id="ops-new" class="chat-quiet" type="button">新对话 +</button>
+      <button id="ops-close" class="chat-close" type="button" aria-label="返回整机状态">返回整机</button>
+    </header>
+    <div class="chat-workspace">
+      <section class="chat-main" aria-label="诊断会话">
+        <div id="ops-transcript" class="chat-transcript" role="log" aria-label="诊断对话记录" aria-live="polite" aria-relevant="additions">
+          <div id="ops-welcome" class="chat-welcome">
+            <span class="eyebrow">RP1 / DIAGNOSTIC ASSISTANT</span>
+            <h3>分析当前机器人状态</h3>
+            <p>结合当前设备观测，查看监测缺口、温度证据与接入排查。</p>
+            <div class="chat-suggestions">
+              <button type="button" data-question="为什么这台机器的健康监测不完整？"><span>01</span>看看当前监测还缺什么 <span aria-hidden="true">→</span></button>
+              <button type="button" data-question="当前温度数据有哪些来源与限制？"><span>02</span>帮我核对温度数据来源 <span aria-hidden="true">→</span></button>
+              <button type="button" data-question="请按优先级说明接入自检中需要核对的项目。"><span>03</span>应该从哪里排查接入 <span aria-hidden="true">→</span></button>
+            </div>
+          </div>
+        </div>
+        <form id="ops-compose" class="chat-compose">
+          <div class="chat-input-wrap">
+            <label class="sr-only" for="ops-question">诊断问题</label>
+            <textarea id="ops-question" rows="2" maxlength="2000" placeholder="询问当前机器人的状态、数据来源或接入问题…"></textarea>
+            <div class="chat-compose-actions"><span id="ops-mode">本地规则 · 未调用模型</span><button type="submit" data-ops="ask" aria-label="发送诊断问题">发送 ↑</button></div>
+          </div>
+          <p id="ops-message" role="status">Enter 发送 · Shift + Enter 换行 · 只读诊断</p>
+        </form>
+      </section>
+      <details class="chat-context" open>
+        <summary>当前上下文</summary>
+        <strong id="ops-robot">等待选择机器人</strong>
+        <span id="ops-source" class="chat-source">来源待确认</span>
+        <p id="ops-profile">等待读取设备档案</p>
+        <h3>监测能力</h3><div id="ops-capabilities" class="chat-capabilities"></div>
+        <h3>查询范围</h3>
+        <label class="sr-only" for="ops-metric">历史指标</label><select id="ops-metric"><option value="">仅查询当前状态</option></select>
+        <label class="sr-only" for="ops-minutes">最近查询时间范围</label><select id="ops-minutes"><option value="10">最近 10 分钟</option><option value="60">最近 1 小时</option><option value="1440">最近 24 小时</option></select>
+        <button class="chat-context-action" type="button" data-ops="doctor">接入自检 <span aria-hidden="true">↗</span></button>
+        <button class="chat-context-action" type="button" data-ops="record">导出诊断证据 <span aria-hidden="true">↓</span></button>
+        <h3>RoboPi 板端自检</h3>
+        <p id="ops-board-status" role="status" class="chat-context-note">等待读取历史检查报告</p>
+        <div id="ops-board-results" class="chat-capabilities"></div>
+        <details class="chat-settings"><summary>原始报告与检查版本</summary><pre id="ops-board-detail">暂无报告</pre></details>
+        <button class="chat-context-action" type="button" data-ops="board">刷新板端报告 <span aria-hidden="true">↗</span></button>
+        <p class="chat-context-note">网页只读。请在本机上位机中发起指定被动检查；历史报告不代表当前实时状态。</p>
+        <button id="ops-model-open" type="button" class="chat-context-action">连接与模型设置 <span aria-hidden="true">↗</span></button>
+        <details class="chat-settings"><summary>最近诊断记录</summary><div id="ops-reports"></div></details>
+        <p class="chat-context-note">只读取观测，不执行机器人操作。<br>模拟结果不代表实机验收。</p>
+      </details>
+    </div>
+  </dialog>
+    </section>
+    <footer><span>ROBO PARTY / RP1</span><span>只读观测 · 缺失值保持未知 · 模拟数据不代表实机验收</span></footer>
+  </main>
+  </div>
+<dialog id="thermal-dialog" class="thermal-dialog" aria-labelledby="thermal-title" aria-describedby="thermal-meaning">
+    <header class="thermal-header"><div><span class="eyebrow">JOINT / THERMAL EVIDENCE</span><h2 id="thermal-title">关节温度详情</h2></div><button id="thermal-close" class="chat-close" type="button" aria-label="关闭关节温度详情">×</button></header>
+    <div class="thermal-body">
+      <div class="thermal-context"><strong id="thermal-robot">等待选择机器人</strong><span id="thermal-source" class="pill warning">来源待确认</span><span id="thermal-revision" class="muted">配置版本待查询</span></div>
+      <div class="thermal-controls"><div><label for="thermal-joint">查看关节</label><select id="thermal-joint"></select></div><div><label for="thermal-minutes">历史范围</label><select id="thermal-minutes"><option value="10">最近 10 分钟</option><option value="60">最近 1 小时</option><option value="1440">最近 24 小时</option></select></div><button id="thermal-refresh" type="button">刷新证据</button></div>
+      <p id="thermal-query-status" class="thermal-note" role="status">正在查询温度证据…</p><p id="thermal-error" class="thermal-error hidden" role="alert"></p>
+      <div class="thermal-current-heading"><h3>当前温度快照</h3><span id="thermal-state" class="pill neutral">未知</span></div><p id="thermal-current-detail" class="thermal-note">没有观测不能判定为正常。</p>
+      <div id="thermal-readings" class="thermal-readings"></div>
+      <div id="thermal-charts" class="thermal-charts">
+        <section class="thermal-chart-panel" aria-labelledby="thermal-motor-title"><h3 id="thermal-motor-title">电机温度</h3><div class="chart-legend"><span class="legend-line">窗口最后值</span><span class="legend-range">极值范围</span></div><svg id="thermal-motor-chart" class="thermal-chart" role="img" aria-label="所选关节电机温度历史摘要曲线" viewBox="0 0 500 230"></svg><p id="thermal-motor-empty" class="thermal-chart-empty">尚无历史温度观测。</p><p id="thermal-motor-resolution" class="thermal-chart-resolution">等待查询</p></section>
+        <section class="thermal-chart-panel" aria-labelledby="thermal-mos-title"><h3 id="thermal-mos-title">MOS 温度</h3><div class="chart-legend"><span class="legend-line">窗口最后值</span><span class="legend-range">极值范围</span></div><svg id="thermal-mos-chart" class="thermal-chart" role="img" aria-label="所选关节 MOS 温度历史摘要曲线" viewBox="0 0 500 230"></svg><p id="thermal-mos-empty" class="thermal-chart-empty">尚无历史温度观测。</p><p id="thermal-mos-resolution" class="thermal-chart-resolution">等待查询</p></section>
+      </div>
+      <section class="thermal-alert-section" aria-labelledby="thermal-alert-title"><h3 id="thermal-alert-title">温度告警与时间证据</h3><p class="thermal-note">触发时间是持久告警完成持续条件确认的时间。告警开启历时不等于连续超温时长；观测缺失时不会自动记为恢复。</p><div id="thermal-alert-heads" class="thermal-alert-heads"></div><details class="thermal-events"><summary>最近触发、恢复及观测变化记录</summary><div id="thermal-events"></div></details><p id="thermal-alert-meaning" class="thermal-note"></p></section>
+      <p id="thermal-meaning" class="thermal-note">每秒摘要并非完整高频曲线。缺失数据保留断点，不填零；模拟结果不代表实机验收。</p>
+    </div>
+    <div class="thermal-footer"><p>把当前关节和查询范围带入诊断对话，由你确认后发送。</p><button id="thermal-diagnose" type="button" disabled>带入诊断对话 ↗</button></div>
+  </dialog>
+
+  <dialog id="ops-model-dialog" class="model-dialog" aria-labelledby="model-dialog-title">
+    <div class="model-heading"><div><span class="eyebrow">MODEL CONNECTION</span><h2 id="model-dialog-title">连接你的模型</h2></div><button id="ops-model-close" class="chat-close" type="button" aria-label="关闭模型设置">×</button></div>
+    <p>选择厂商，填入模型 ID 与 API Key。Key 仅保留在本窗口，刷新或关闭页面后不保存。</p>
+    <label for="ops-provider">模型服务商</label><select id="ops-provider"><option value="server">服务端默认</option></select>
+    <label for="ops-model">模型 ID</label><input id="ops-model" type="text" maxlength="128" list="ops-model-options" autocomplete="off" placeholder="填写该平台实际可用的模型 ID"><datalist id="ops-model-options"></datalist>
+    <label for="ops-api-key">API Key</label><div class="model-key-row"><input id="ops-api-key" type="password" autocomplete="off" maxlength="4096" placeholder="留空时读取所选服务的服务端环境变量"><button id="ops-key-clear" type="button">清除</button></div>
+    <span class="model-field-label">请求地址</span><p id="ops-model-endpoint" class="model-endpoint">读取服务端配置以确认实际地址</p>
+    <label class="chat-consent"><input id="ops-use-model" type="checkbox">用于诊断对话（发送问题、最近对话与所选证据）</label>
+    <p id="ops-model-status" role="status">连接测试只验证接口与工具调用，不发送机器人数据。</p>
+    <div class="model-actions"><button id="ops-model-refresh" type="button">刷新服务端配置</button><button id="ops-model-test" type="button">测试连接</button><button id="ops-model-done" type="button">完成</button></div>
+  </dialog>
+</body>
+</html>

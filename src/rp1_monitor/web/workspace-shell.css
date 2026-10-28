@@ -1,0 +1,148 @@
+/* One robot workspace: shared identity, navigation and evidence context. */
+.recordings-page { --border:var(--line); --ink:var(--text); }
+.workbench-page .header {
+  display:grid; grid-template-columns:190px minmax(210px,1fr) minmax(230px,1.1fr) auto;
+  gap:24px; padding:15px 28px; min-height:96px; align-items:center;
+}
+.workbench-page .brand-heading { gap:0; display:block; }
+.workbench-page .brand-logo { width:112px; }
+.workbench-page .heading-copy { display:block; border:0; padding:3px 0 0; }
+.workbench-page .heading-copy .eyebrow { display:none; }
+.workbench-page .brand-title { font-size:11px; color:var(--muted); }
+.header-device { min-width:0; display:grid; grid-template-columns:minmax(0,1fr); }
+.header-device label { font-size:11px; color:var(--muted); line-height:1.3; }
+.workbench-page .header-device select { width:100%; min-width:0; min-height:32px; padding:3px 0; border:0; border-radius:4px; background:transparent; font-size:14px; font-weight:650; text-overflow:ellipsis; }
+.header-device-id { display:none; }
+.header-context { min-width:0; display:grid; gap:6px; font-size:11px; color:var(--muted); }
+.header-context .workspace-status { display:flex; align-items:center; gap:7px; }
+.header-context .workspace-status::before { content:""; width:6px; height:6px; border-radius:50%; background:currentColor; flex:none; }
+.header-record { display:flex; gap:10px; min-width:0; color:var(--muted)!important; text-decoration:none; align-items:baseline; }
+.header-record span { flex:none; font-size:10px; }
+.header-record strong { font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:500; color:var(--blue); }
+.workbench-page .header-right { justify-content:flex-end; }
+.workbench-page #nav-diagnose[hidden] { display:none!important; }
+.workbench-page #nav-toggle { display:none; }
+.workbench-page .connection-strip { max-width:none; margin:0; min-height:34px; padding:4px 28px 4px 242px; border-bottom:1px solid rgba(189,204,228,.5); font-size:11px; }
+.workbench-page .connection-strip .pill { padding:1px 8px; font-size:10px; }
+.workbench-page .connection-strip #refresh-button { min-height:28px; font-size:10px; padding:2px 10px; margin-left:auto; }
+.workbench-layout { display:grid; grid-template-columns:190px minmax(0,1fr); gap:28px; max-width:1480px; padding:0 28px; margin:0 auto; align-items:start; }
+.workbench-sidebar { position:sticky; top:114px; padding:24px 0; min-width:0; }
+.sidebar-back { display:flex; align-items:center; gap:10px; min-height:44px; font-size:12px; text-decoration:none; margin-bottom:20px; }
+.sidebar-caption { display:block; font-size:10px; letter-spacing:.08em; color:var(--muted); margin:0 14px 12px; }
+.workbench-page #primary-nav { display:flex; flex-direction:column; align-items:stretch; gap:6px; margin:0; padding:0; }
+.workbench-page #primary-nav a { display:flex; align-items:center; gap:14px; min-height:48px; padding:11px 14px; font-size:13px; text-decoration:none; border:1px solid transparent; border-radius:14px; color:var(--muted); }
+.workbench-page #primary-nav a span { font:10px/1.5 monospace; opacity:.65; }
+.workbench-page #primary-nav a::after { display:none; }
+.workbench-page #primary-nav a:hover { background:rgba(255,255,255,.6); }
+.workbench-page #primary-nav a[aria-current=page] { background:rgba(255,255,255,.9); color:var(--blue); border-color:rgba(189,204,228,.7); box-shadow:0 6px 22px rgba(61,88,136,.045); font-weight:650; }
+.workbench-page #primary-nav a[aria-disabled=true] { opacity:.5; cursor:not-allowed; }
+.sidebar-footer { margin:30px 14px 0; padding-top:20px; border-top:1px solid var(--line); color:var(--muted); }
+.sidebar-footer .pill { font-size:10px; padding:2px 8px; }
+.sidebar-footer p { font-size:11px; line-height:1.8; margin:10px 0; }
+.sidebar-footer .admin-link { display:inline-flex; font-size:11px; }
+.workbench-page .workspace { width:100%; min-width:0; max-width:1200px; margin:0; padding:0 0 24px; }
+.workbench-page .workbench-context { margin-bottom:22px; padding:24px 0 18px; }
+.workbench-page .workbench-heading > .eyebrow { display:none; }
+.workbench-page h1#page-title { font-family:var(--body); font-size:25px; margin:0 0 10px; letter-spacing:0; }
+.workbench-page .workspace-meta { gap:8px 12px; font-size:11px; }
+.workbench-page .component-page-heading { margin-bottom:18px; }
+.workbench-page .component-page-heading h2 { font-size:17px; }
+.workbench-page .component-page-heading p { font-size:12px; margin:7px 0 0; }
+.workbench-page .component-time-controls { display:flex; align-items:flex-end; flex-wrap:wrap; gap:16px; padding:18px 20px; margin-bottom:14px; background:rgba(255,255,255,.6); border-color:rgba(189,204,228,.7); }
+.component-time-controls > div { min-width:170px; flex:1 1 170px; max-width:340px; }
+.component-time-controls .component-joint-field { min-width:200px; flex-basis:200px; }
+.component-time-controls label { display:block; font-size:11px; color:var(--muted); margin-bottom:6px; }
+.workbench-page .component-time-controls select,.workbench-page .component-time-controls input { width:100%; min-height:44px; margin:0; padding:9px 12px; font-size:13px; border-radius:12px; }
+.workbench-page .component-time-controls button { min-height:44px; font-size:12px; padding:8px 15px; }
+.component-time-controls .component-recording-field { flex-basis:340px; max-width:none; }
+.component-time-controls .component-recording-field select { text-overflow:ellipsis; }
+.component-recording-report { display:inline-flex; align-items:center; min-height:44px; font-size:12px; text-decoration:none; }
+.workbench-page [hidden],.workbench-page .component-time-controls [hidden] { display:none!important; }
+.workbench-page .component-kpis { gap:16px; }
+.workbench-page .component-kpis > article { padding:20px; }
+.workbench-page .component-chart-grid { gap:18px; }
+.workbench-page .component-chart-heading h3 { font-size:15px; }
+.workbench-page .component-status { font-size:11px; }
+.workbench-page .recordings-page .workspace-heading { margin-bottom:20px; }
+.workbench-page .recordings-page .workspace-heading h2 { font-size:17px; margin:0; }
+.workbench-page .recordings-page .description { font-size:12px; }
+.workbench-page .recordings-page .recording-grid { grid-template-columns:minmax(0,1fr); gap:20px; }
+.workbench-page .recordings-page .card { border:1px solid var(--line); border-radius:20px; background:var(--glass); box-shadow:var(--shadow); padding:22px; }
+.workbench-page .recordings-page .card h2 { font-family:var(--body); font-size:16px; margin:4px 0 14px; }
+.workbench-page .recordings-page .recording-status .eyebrow,.workbench-page .recordings-page .history-card > .eyebrow { display:none; }
+.workbench-page .recordings-page .history-controls { grid-template-columns:minmax(0,1fr) minmax(150px,.6fr); }
+.workbench-page .recordings-page .history-controls > div:nth-child(2) { grid-row:auto; grid-column:auto; }
+.workbench-page .recordings-page .ports { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; margin:16px 0; }
+.workbench-page .recordings-page .ports label { display:block; }
+.workbench-page .recordings-page .ports input { width:100%; margin-top:7px; min-width:0; }
+.workbench-page .recordings-page .metric-list { grid-template-columns:repeat(2,minmax(0,1fr)); }
+.workbench-page .recordings-page .status { font-size:12px; }
+.workbench-page .recordings-page .recording-status { position:static; display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:24px; padding-block:18px; }
+.recording-status-copy { min-width:0; }
+.workbench-page .recordings-page .recording-status h2 { margin:0 0 6px; font-size:13px; }
+.workbench-page .recordings-page .recording-status .status { margin:0; }
+.record-help,.record-source-details { font-size:11px; color:var(--muted); margin-top:10px; }
+.record-help summary,.record-source-details summary { cursor:pointer; min-height:24px; }
+.record-help p { max-width:760px; }
+.workbench-page .recordings-page .workspace-heading .description { margin:0 0 8px; }
+.workbench-page .recordings-page .history-actions button { min-height:44px; }
+.workbench-page #ops-dialog { height:min(760px,calc(100dvh - 230px)); }
+.workbench-page .auth,.workbench-page .error { max-width:1200px; margin:12px auto; }
+html[data-workspace-page=fleet] .workbench-layout { grid-template-columns:minmax(0,1fr); max-width:1248px; }
+html[data-workspace-page=fleet] .workbench-sidebar { display:none; }
+@supports(backdrop-filter:blur(12px)) { .workbench-sidebar { backdrop-filter:blur(12px); } }
+@media(min-width:1500px) { .workbench-page .header { padding-inline:max(28px,calc((100vw - 1424px)/2)); } }
+@media(max-width:1100px) {
+  .workbench-page .header { grid-template-columns:158px minmax(200px,1fr) minmax(180px,.9fr) auto; gap:18px; padding:12px 22px; }
+  .workbench-layout { grid-template-columns:158px minmax(0,1fr); gap:22px; padding-inline:22px; }
+  .workbench-page .connection-strip { padding-left:202px; padding-right:22px; }
+  .workbench-page #primary-nav a { gap:10px; padding-inline:12px; }
+  .workbench-page .recordings-page .recording-grid { grid-template-columns:minmax(0,1fr); }
+  .workbench-page .recordings-page .recording-status { position:static; }
+  .workbench-page .recordings-page .metric-list { grid-template-columns:repeat(2,minmax(0,1fr)); }
+}
+@media(max-width:850px) {
+  .workbench-page .header { grid-template-columns:110px minmax(0,1fr) auto; gap:12px 18px; }
+  .workbench-page .header-context { grid-column:1/-1; grid-row:2; grid-template-columns:minmax(0,.8fr) minmax(0,1.2fr); align-items:center; gap:12px; }
+  .workbench-page .header-right { grid-row:1; grid-column:3; }
+  .workbench-page #nav-toggle { display:block; min-height:44px; padding:8px 12px; font-size:12px; margin:0; }
+  .workbench-page #motion-toggle { display:none; }
+  .workbench-page .connection-strip { padding:5px 22px; }
+  .workbench-layout { display:block; padding-inline:22px; }
+  .workbench-sidebar { display:none; position:fixed; z-index:25; top:116px; left:16px; right:16px; padding:16px; max-height:calc(100dvh - 132px); overflow:auto; border:1px solid var(--line); border-radius:20px; background:rgba(247,249,254,.98); box-shadow:0 16px 60px rgba(38,52,81,.18); }
+  .workbench-sidebar:has(#primary-nav[data-open=true]) { display:block; }
+  .workbench-page #primary-nav { display:flex; }
+  .sidebar-back { margin:0 0 10px; }
+  .sidebar-caption,.sidebar-footer { display:none; }
+  .workbench-page .overview-workspace { grid-template-columns:minmax(0,1fr); }
+}
+@media(max-width:500px) {
+  .workbench-page .header { padding:10px 16px; gap:10px; grid-template-columns:88px minmax(0,1fr) 56px; }
+  .workbench-page .brand-logo { width:86px; }
+  .workbench-page .brand-title { font-size:9px; }
+  .header-device label { font-size:10px; }
+  .workbench-page .header-device select { font-size:12px; }
+  .workbench-page #nav-toggle { padding:8px; font-size:11px; }
+  .workbench-page .header-context { grid-template-columns:minmax(0,1fr); gap:3px; font-size:10px; }
+  .workbench-page .connection-strip { padding-inline:16px; gap:8px; }
+  .workbench-page #refresh-status { max-width:160px; font-size:10px; }
+  .workbench-layout { padding-inline:16px; }
+  .workbench-page .workbench-context { padding-top:20px; }
+  .workbench-page h1#page-title { font-size:23px; }
+  .workbench-sidebar { top:132px; max-height:calc(100dvh - 148px); }
+  .workbench-page .component-time-controls { padding:16px; gap:12px; }
+  .component-time-controls > div,.component-time-controls .component-joint-field,.component-time-controls .component-recording-field { min-width:0; flex:1 1 100%; max-width:100%; }
+  .component-time-controls > button,.component-recording-report { width:100%; justify-content:center; }
+  .workbench-page .recordings-page .card { padding:18px; }
+  .workbench-page .recordings-page .recording-status { grid-template-columns:minmax(0,1fr); gap:16px; }
+  .workbench-page .recordings-page #print-report { width:100%; }
+  .workbench-page .recordings-page .history-controls,.workbench-page .recordings-page .metric-list,.workbench-page .recordings-page .ports { grid-template-columns:minmax(0,1fr); }
+}
+@media print {
+  .workbench-page .header,.workbench-sidebar,.connection-strip,.workbench-context { display:none!important; }
+  .workbench-page .workbench-layout { display:block; padding:0; max-width:none; }
+  .workbench-page .workspace { max-width:none; padding:0; }
+  .workbench-page .recordings-page .recording-grid { display:block; }
+  .workbench-page .recordings-page .card { border:0; box-shadow:none; padding:0; }
+  .workbench-page .record-help,.workbench-page .record-source-details { display:none!important; }
+}

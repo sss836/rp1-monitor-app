@@ -1,0 +1,58 @@
+# RP1 电脑上位机与数据网页
+
+这个仓库只部署在电脑，包含 Qt 上位机、SSH 连接、接收与缓存后台、PostgreSQL 接口、中文网页、监控记录与观测报告，以及可选的 AI 诊断助手。
+
+- 电脑端仓库：[sss836/rp1-monitor-app](https://github.com/sss836/rp1-monitor-app)
+- 机器人端仓库：[sss836/rp1-test-monitor](https://github.com/sss836/rp1-test-monitor)
+
+机器人端使用独立的 `rp1_robot` 采集程序。本仓库不包含 ROS/BMS/主机传感器采集器，也没有机器人 `agent` 启动命令；不要把电脑源码、`.venv` 或 `runtime` 上传到机器人。
+
+## 在电脑启动
+
+适用 Ubuntu 图形桌面、Python 3.10+ 和可用的 Python 包源。先准备本项目虚拟环境：
+
+```bash
+git clone https://github.com/sss836/rp1-monitor-app.git
+cd rp1-monitor-app
+./start-monitor.sh setup
+```
+
+`setup` 只安装电脑依赖，不连接机器人、不建库、不执行数据库迁移。**首次真机连接前必须先配置 PostgreSQL。未配置时可以打开界面，但不能连接真实 ROS 2 采集端或开始真机长期记录。**
+
+新电脑请按[启动与连接教程](docs/STARTUP.md)及[PostgreSQL 首次配置](docs/POSTGRES_SETUP.md)操作。已有现场数据库和电脑配置继续复用，不要重新建库、重跑初始化或覆盖运行目录。
+
+配置完成后，日常打开上位机：
+
+```bash
+./start-monitor.sh
+```
+
+在设备设置输入 `ssh robo@192.168.137.250` 和机器人密码，核对首次显示的 SSH 主机指纹后连接。机器人须已经手动启动其独立监听；上位机只建立网线 SSH 端口转发，不远程安装程序、不启动运控。
+
+打开同一套数据的只读网页：
+
+```bash
+./start-monitor.sh web
+```
+
+默认入口为 [http://127.0.0.1:18980/robots](http://127.0.0.1:18980/robots)。`/connect` 兼容入口也会转到机器人列表。网页用于状态、历史曲线及报告；SSH 连接、保存指标、频率和记录启停由原生上位机操作。
+
+## 记录与 AI
+
+上位机“监控记录”可多选温度、力矩、SOC、关节电压、电池电流等指标，填写用例标签、机器人标签、场地与保存频率，生成本次编号。保存频率为电脑取样频率，不改变机器人 CAN 或 ROS 发布频率；来源缺失时保存为空值。PostgreSQL 是唯一长期历史库，电脑 SQLite 仅作待传缓存；历史不自动清理，仍须安排磁盘容量与备份。
+
+诊断助手的“连接与模型设置”中选择厂商、填写实际模型 ID 和 API Key，测试成功后勾选“用于诊断对话”。模型请求由电脑后台执行，机器人不运行 AI。详见[启动教程中的 AI 步骤](docs/STARTUP.md#连接-ai-诊断助手)。
+
+关闭 Qt 或浏览器不停止电脑后台。修改数据库连接后，只重开 Qt 不会生效，需要正常重启电脑后台；首次配置的明确操作见[数据库教程](docs/POSTGRES_SETUP.md#让电脑后台使用该数据库)。
+
+## 代码与验证
+
+源码位于 `src/rp1_monitor/`，网页资源位于其 `web/`。电脑安装包名为 `rp1-monitor-pc`，保留共用数据契约和显示逻辑，不包含机器人采集器。可以在隔离环境运行本仓库的软件验证：
+
+```bash
+.venv/bin/python -m pip install -e '.[desktop,server,station,dev]'
+env -u PYTHONPATH PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 QT_QPA_PLATFORM=offscreen \
+  .venv/bin/python -m pytest -q tests/test_workstation.py
+```
+
+软件和模拟链路通过不等于实机温度、力矩、关节电压或连续运动验收。仓库不携带数据库、真实遥测、设备令牌、SSH 密码或模型 Key；`runtime/`、`.venv/` 和现场配置不提交。发布前端资源时保留随包的第三方许可证。

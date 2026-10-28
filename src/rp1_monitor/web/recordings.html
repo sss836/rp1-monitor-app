@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>监控记录与完整曲线 · RP1</title>
+  <link rel="stylesheet" href="/assets/connect.css"><link rel="stylesheet" href="/assets/recordings.css">
+  <script src="/assets/recordings.js" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/connect"><img src="/assets/brand/logo.png" alt="ROBO PARTY"><span>RP1 数据工作台<small>MONITORING / LONG-TERM RECORDS</small></span></a>
+  <nav aria-label="工作台导航"><a href="/connect">工作台</a><a href="/robots">整机状态</a><a href="/recordings" aria-current="page">记录与报告</a></nav>
+</header>
+<main class="recording-workspace">
+  <section class="workspace-heading"><p class="eyebrow">EVERY MEASUREMENT, TRACEABLE</p><h1>记录每一次运行，回看完整过程。</h1><p class="description">查询长期保存的监控曲线，生成有据可查的观测报告。监控记录独立于正式测试、审批及 MTBF。</p><p id="source-state" class="status" role="status">正在核对存储与机器人来源…</p></section>
+  <section id="read-access" class="card read-access" aria-labelledby="read-access-heading" hidden>
+    <h2 id="read-access-heading">网页只读访问权限</h2><p class="hint">中央网页需要只读访问凭据；本机工作台可使用已有只读会话。此处不接受 SSH 密码或上位机操作凭据，输入仅保留在本页内存。</p>
+    <label for="read-credential">网页只读访问凭据</label><input id="read-credential" type="password" autocomplete="off" spellcheck="false">
+    <div class="history-actions"><button id="apply-read-credential" type="button">验证并读取历史</button><button id="clear-read-credential" type="button" class="secondary">清除本页凭据</button></div>
+  </section>
+  <div class="recording-grid">
+    <aside class="card recording-status" aria-labelledby="recording-heading"><p class="eyebrow">01 / RECORDING STATUS</p><h2 id="recording-heading">上位机记录状态</h2><p id="record-state" class="status" role="status" aria-live="polite">正在读取…</p><p class="description">连接机器人、填写用例编号与场地、选择长期保存指标、设置频率及开始或结束记录，请在原生上位机的“监控记录”中完成。</p><p class="hint">本网页只查询已保存的数据。未接入、过期或链路中断的指标按缺失记录，不能视为 0 或正常。</p><a href="/robots">查看整机状态 →</a><hr><p class="hint">观测报告保留当前记录编号、标签、查询范围及数据完整性，不给出正式测试通过或失败结论。</p><button type="button" id="print-report" class="secondary" disabled>打印 / 保存观测报告 PDF</button></aside>
+    <section class="card history-card" aria-labelledby="history-heading"><p class="eyebrow">02 / EXPLORE THE FULL TIMELINE</p><h2 id="history-heading">完整记录曲线</h2>
+      <div class="history-controls"><div><label for="history-robot">实际采集机器人 ID</label><select id="history-robot"><option value="">暂无记录</option></select></div><div><label for="session">监控记录</label><select id="session"><option value="">该机器人全部记录</option></select></div><div><label for="period">查看区间</label><select id="period"><option value="all">从首次记录起全部</option><option value="600">最近10分钟</option><option value="3600">最近1小时</option><option value="86400">最近24小时</option><option value="custom">自定义时间</option></select></div></div>
+      <div id="custom-range" class="ports" hidden><div><label for="range-start">开始时间 · 北京时间 UTC+8</label><input type="datetime-local" id="range-start" step="1"></div><div><label for="range-end">结束时间 · 北京时间 UTC+8</label><input type="datetime-local" id="range-end" step="1"></div></div>
+      <p id="record-list-state" class="hint"></p><button id="more-records" type="button" class="secondary" hidden>加载更早记录</button>
+      <fieldset><legend>显示曲线 · 最多12条，按单位分图</legend><div id="view-metrics" class="metric-list view-metrics"></div><p id="metric-empty" class="hint" hidden>该机器人尚无已保存指标。请先在上位机开启监控记录。</p></fieldset>
+      <div class="history-actions"><button id="refresh-curves" type="button">查询曲线</button><label class="auto-refresh"><input id="auto-refresh" type="checkbox" checked>运行记录每5秒刷新</label></div>
+      <p class="hint">“全部”查询不受记录列表分页限制。长区间显示分桶均值和最小/最大范围，原始数据不会因显示聚合而删除。选取更短时段可查看细节。</p>
+      <p id="curve-state" class="status" role="status" aria-live="polite">选择指标后查询</p>
+      <section id="report-summary" class="report-summary" aria-labelledby="report-title" hidden><p class="eyebrow">OBSERVATION REPORT / READ ONLY</p><h3 id="report-title">RP1 监控观测报告</h3><p id="report-source" class="source-badge"></p><dl id="report-metadata"></dl><p id="report-quality" class="hint"></p></section>
+      <div id="charts"></div>
+      <div class="table-wrap"><table><caption>当前查询范围与数据完整性</caption><thead><tr><th>指标</th><th>单位</th><th>最小值</th><th>最大值</th><th>有效 / 记录点数</th></tr></thead><tbody id="curve-table"></tbody></table></div>
+    </section>
+  </div>
+</main>
+<footer>RP1 MONITOR <span>网页只读展示 · 北京时间 UTC+8 · 历史不自动清除</span></footer>
+</body></html>

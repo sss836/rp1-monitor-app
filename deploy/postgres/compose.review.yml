@@ -1,0 +1,47 @@
+# Portable deployment template. Current approved instance is under runtime/postgres-central.
+# Requires real private paths supplied after approval; this file contains no credentials.
+services:
+  postgres:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: rp1_monitor
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_admin_password
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=peer
+    secrets:
+      - pg_admin_password
+    ports:
+      - "127.0.0.1:${RP1_PG_PORT:-55433}:5432"
+    volumes:
+      # PostgreSQL 18 official image uses version-specific PGDATA below this parent.
+      - "${RP1_PG_DATA_DIR:?Set a reviewed dedicated empty data directory}:/var/lib/postgresql"
+    command:
+      - postgres
+      - -c
+      - timezone=UTC
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - statement_timeout=30s
+      - -c
+      - idle_in_transaction_session_timeout=30s
+      - -c
+      - lock_timeout=5s
+    healthcheck:
+      test: ["CMD", "gosu", "postgres", "pg_isready", "-U", "postgres", "-d", "rp1_monitor"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks:
+      - monitor_db
+secrets:
+  pg_admin_password:
+    file: "${RP1_PG_ADMIN_PASSWORD_FILE:?Set an approved private password file}"
+networks:
+  monitor_db:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+# Schema/roles SQL is intentionally not mounted into docker-entrypoint-initdb.d.
+# Approval, provisioning and migration are separate explicit steps.
