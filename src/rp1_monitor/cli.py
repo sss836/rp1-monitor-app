@@ -187,6 +187,10 @@ def main(allowed_commands: set[str] | None = None):
     )
     agent.add_argument("--port", type=int, default=8891)
     agent.add_argument(
+        "--motor-temperature-socket", type=Path,
+        help="可选：本机被动CAN温度IPC绝对路径；须配套绑定档案，不自动启动读取器",
+    )
+    agent.add_argument(
         "--profile", type=Path, help="经过核对的设备档案JSON；电机诊断须提供身份映射"
     )
     relay = sub.add_parser("relay", help="上位机后台接收、持久缓存和中央上传；独立于Qt窗口")
@@ -389,6 +393,7 @@ def main(allowed_commands: set[str] | None = None):
             thermal_demo=args.thermal_demo,
             simulated_dof=args.simulated_dof,
             robopi_tui_executor=args.robopi_tui_executor,
+            motor_temperature_socket=args.motor_temperature_socket,
         )
         uvicorn.run(create_agent_app(settings), host="127.0.0.1", port=args.port, access_log=False)
     elif args.command == "relay":

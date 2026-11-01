@@ -217,7 +217,7 @@
         modelCatalog=catalog.items; el('ops-provider').replaceChildren();
         for(const item of modelCatalog) el('ops-provider').add(new Option(item.name,item.id));
         if (modelCatalog.some(item=>item.id===chosen)) el('ops-provider').value=chosen;
-        changeProvider(true);
+        changeProvider(el('ops-provider').value===chosen);
         if (!el('ops-model').value) el('ops-model').value=modelCatalog.find(item=>item.id===el('ops-provider').value)?.models[0]?.id || '';
         el('ops-model-status').textContent='服务配置已刷新。连接测试只验证工具调用，不发送机器人数据。';
       } else {

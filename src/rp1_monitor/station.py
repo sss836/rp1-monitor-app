@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
 
@@ -24,7 +25,7 @@ from sqlalchemy import select
 
 from .backend import BackendSettings, create_app
 from .cli import private_write
-from .models import DeviceRegistration, PreviewFrame
+from .models import DeviceRegistration, PreviewFrame, RobotId
 from .relay import RelaySettings, create_relay_app, read_json
 from .ssh_transport import HostKeyRequired, SshTunnel, parse_ssh_target
 from .storage import robots, token_digest
@@ -64,28 +65,90 @@ class ConnectRequest(BaseModel):
     confirmed_fingerprint: str = Field(default="", max_length=128)
 
 
+class DisconnectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    robot_id: RobotId | None = None
+
+
+@dataclass
+class StationConnection:
+    tunnel: object
+    identity: dict
+    target: str
+    collector: tuple
+    relay_server: object = None
+    relay_thread: object = None
+    relay_url: str = ""
+
+
 class StationManager:
     def __init__(self, directory, central_url, store, tunnel_factory=None):
         self.directory, self.central_url, self.store = directory, central_url, store
         self.tunnel_factory = tunnel_factory or SshTunnel.connect
         self.lock = threading.Lock()
-        self.tunnel = self.relay_server = self.relay_thread = None
-        self.identity = None
-        self.target = ""
-        self.relay_url = ""
+        self.state_lock = threading.Lock()
+        self.connections = {}
+        self.selected_robot_id = None
 
-    def status(self):
-        connected = bool(self.tunnel and self.tunnel.transport.is_active())
-        return {"connected": connected, "robot": self.identity, "target": self.target,
-                "relay_url": self.relay_url, "central_url": self.central_url,
-                "mode": "local_station", "robot_modified": False}
+    def _selected_connection(self):
+        with self.state_lock:
+            return self.connections.get(self.selected_robot_id)
+
+    # Keep the original single-connection attributes as the latest selected projection.
+    @property
+    def tunnel(self):
+        connection = self._selected_connection()
+        return connection.tunnel if connection else None
+
+    @property
+    def relay_server(self):
+        connection = self._selected_connection()
+        return connection.relay_server if connection else None
+
+    @property
+    def relay_thread(self):
+        connection = self._selected_connection()
+        return connection.relay_thread if connection else None
+
+    @property
+    def identity(self):
+        connection = self._selected_connection()
+        return connection.identity if connection else None
+
+    @property
+    def target(self):
+        connection = self._selected_connection()
+        return connection.target if connection else ""
+
+    @property
+    def relay_url(self):
+        connection = self._selected_connection()
+        return connection.relay_url if connection else ""
+
+    def _projection(self, connection):
+        connected = bool(connection and connection.tunnel and connection.tunnel.transport.is_active())
+        return {"connected": connected, "robot": dict(connection.identity) if connection else None,
+                "target": connection.target if connection else "",
+                "ssh_port": connection.collector[1] if connection else None,
+                "relay_url": connection.relay_url if connection else "",
+                "central_url": self.central_url, "mode": "local_station", "robot_modified": False}
+
+    def status(self, robot_id=None):
+        with self.state_lock:
+            connection = self.connections.get(robot_id if robot_id is not None else self.selected_robot_id)
+            return {**self._projection(connection),
+                    "connections": [self._projection(item) for item in self.connections.values()]}
 
     def connect(self, query):
-        parse_ssh_target(query.target)
+        _, host = parse_ssh_target(query.target)
+        collector = (host.lower(), query.ssh_port, query.collector_port)
         if not self.lock.acquire(blocking=False):
             raise ValueError("已有连接任务，请等待完成后再操作")
-        candidate = None
+        candidate = connection = None
         try:
+            with self.state_lock:
+                if any(item.collector == collector for item in self.connections.values()):
+                    raise ValueError("该采集端已有连接，请先断开对应机器人，避免两个接收器争用摘要")
             candidate = self.tunnel_factory(
                 query.target, query.password.get_secret_value(), self.directory / "known_hosts",
                 ssh_port=query.ssh_port, collector_port=query.collector_port,
@@ -100,6 +163,9 @@ class StationManager:
                         raise ValueError("目标端口不是本项目机器人采集端")
             except (httpx.HTTPError, ValueError, KeyError):
                 raise ValueError("SSH已连接，但未读到正确采集端；请确认机器人监听程序已开启及8891端口") from None
+            with self.state_lock:
+                if identity["robot_id"] in self.connections:
+                    raise ValueError("该机器人已有连接，请先断开原连接，避免两个接收器争用摘要")
             if self.store.engine.dialect.name != "postgresql" and identity["source_kind"] == "ros2":
                 raise ValueError("真机数据应统一写入PostgreSQL，请先配置长期历史库；旧SQLite历史保留，不会迁移或删除")
             # Protect the already deployed local receiver from a second ACK consumer.
@@ -117,9 +183,11 @@ class StationManager:
             device = next((d for d in devices if d["robot_id"] == identity["robot_id"]), None)
             if device and device["source_kind"] != identity["source_kind"]:
                 raise ValueError("同一机器人编号的数据来源改变，拒绝混入已有历史")
-            with self.store.engine.connect() as connection:
-                registered = connection.execute(select(robots.c.token_digest, robots.c.source_kind).where(
+            with self.store.engine.connect() as database:
+                registered = database.execute(select(robots.c.token_digest, robots.c.source_kind).where(
                     robots.c.robot_id == identity["robot_id"])).first()
+            if registered and registered.source_kind != identity["source_kind"]:
+                raise ValueError("同一机器人编号的数据来源改变，拒绝混入已有历史")
             if registered and (not device or registered.token_digest != token_digest(device["token"])):
                 raise ValueError("PostgreSQL已有该机器人登记，但本机缺少匹配设备凭据；请复用既有relay或由管理员导入绑定凭据，不会自动覆盖")
             if device is None:
@@ -135,61 +203,139 @@ class StationManager:
                     os.fsync(stream.fileno())
                 Path(stream.name).replace(self.directory / "devices.json")
             self.store.configure([device], authoritative=False)
-            self._stop_connection()
-            self.tunnel, candidate = candidate, None
-            self.identity, self.target = identity, query.target.strip()
-            self._start_relay(device)
-            return {"status": "connected", **self.status()}
-        except Exception:
-            if self.tunnel is not None and self.relay_server is None:
-                self._stop_connection()
-            raise
+            connection = StationConnection(candidate, identity, query.target.strip(), collector)
+            candidate = None
+            try:
+                self._start_relay(connection, device)
+            except Exception:
+                try:
+                    self._stop_connection(connection)
+                except Exception:
+                    # A receiver still exiting remains reserved; never start another ACK consumer.
+                    with self.state_lock:
+                        self.connections[identity["robot_id"]] = connection
+                    raise
+                raise
+            with self.state_lock:
+                self.connections[identity["robot_id"]] = connection
+                self.selected_robot_id = identity["robot_id"]
+            return {"status": "connected", **self.status(identity["robot_id"])}
         finally:
             if candidate:
                 candidate.close()
             self.lock.release()
 
-    def _start_relay(self, device):
+    def _start_relay(self, connection, device):
         import uvicorn
 
+        cache_root = self.directory / "relay"
+        state_dir = cache_root / device["robot_id"]
+        if (cache_root.resolve() != self.directory.resolve() / "relay"
+                or state_dir.resolve().parent != cache_root.resolve()):
+            raise ValueError("relay缓存目录必须位于本机专用目录内")
         sock = socket.socket()
-        sock.bind(("127.0.0.1", 0))
-        sock.listen(128)
-        self.relay_url = f"http://127.0.0.1:{sock.getsockname()[1]}"
-        app = create_relay_app(RelaySettings(
-            robot_id=device["robot_id"], source_kind=device["source_kind"],
-            collector_url=self.tunnel.url, backend_url=self.central_url, token=device["token"],
-            state_dir=self.directory / "relay" / device["robot_id"],
-            cache_bytes=256 * 1024**2, reserve_bytes=512 * 1024**2,
-        ))
-        self.relay_server = uvicorn.Server(uvicorn.Config(app, access_log=False, log_level="warning"))
-        self.relay_thread = threading.Thread(
-            target=self.relay_server.run, kwargs={"sockets": [sock]}, daemon=True,
-        )
-        self.relay_thread.start()
-        deadline = time.monotonic() + 8
-        while not self.relay_server.started:
-            if not self.relay_thread.is_alive() or time.monotonic() > deadline:
-                raise ValueError("电脑relay启动失败，请查看快捷连接日志")
-            time.sleep(0.05)
+        try:
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(128)
+            connection.relay_url = f"http://127.0.0.1:{sock.getsockname()[1]}"
+            app = create_relay_app(RelaySettings(
+                robot_id=device["robot_id"], source_kind=device["source_kind"],
+                collector_url=connection.tunnel.url, backend_url=self.central_url, token=device["token"],
+                state_dir=state_dir,
+                cache_bytes=256 * 1024**2, reserve_bytes=512 * 1024**2,
+            ))
+            connection.relay_server = uvicorn.Server(uvicorn.Config(app, access_log=False, log_level="warning"))
+            connection.relay_thread = threading.Thread(
+                target=connection.relay_server.run, kwargs={"sockets": [sock]}, daemon=True,
+            )
+            connection.relay_thread.start()
+            deadline = time.monotonic() + 8
+            while not connection.relay_server.started:
+                if not connection.relay_thread.is_alive() or time.monotonic() > deadline:
+                    raise ValueError("电脑relay启动失败，请查看快捷连接日志")
+                time.sleep(0.05)
+        except Exception:
+            sock.close()
+            raise
 
-    def _stop_connection(self):
-        if self.relay_server:
-            self.relay_server.should_exit = True
-            if self.relay_thread:
-                self.relay_thread.join(timeout=20)
-                if self.relay_thread.is_alive():
+    def _stop_connection(self, connection=None):
+        connection = connection or self._selected_connection()
+        if connection is None:
+            return
+        if connection.relay_server:
+            connection.relay_server.should_exit = True
+            if connection.relay_thread:
+                connection.relay_thread.join(timeout=20)
+                if connection.relay_thread.is_alive():
                     raise ValueError("旧relay仍在退出，请稍后重试；未启动第二个接收器")
-            self.relay_server = self.relay_thread = None
-        if self.tunnel:
-            self.tunnel.close()
-            self.tunnel = None
-        self.identity = None
-        self.target = self.relay_url = ""
+            connection.relay_server = connection.relay_thread = None
+        if connection.tunnel:
+            connection.tunnel.close()
+            connection.tunnel = None
+        robot_id = connection.identity["robot_id"]
+        with self.state_lock:
+            if self.connections.get(robot_id) is connection:
+                del self.connections[robot_id]
+            if self.selected_robot_id == robot_id:
+                self.selected_robot_id = next(reversed(self.connections), None)
 
-    def disconnect(self):
+    def disconnect(self, robot_id=None):
         with self.lock:
-            self._stop_connection()
+            with self.state_lock:
+                if robot_id is None:
+                    if len(self.connections) > 1:
+                        raise ValueError("存在多个机器人连接，请指定要断开的robot_id")
+                    connection = next(iter(self.connections.values()), None)
+                else:
+                    connection = self.connections.get(robot_id)
+                    if connection is None:
+                        raise ValueError("指定机器人没有本机连接")
+            self._stop_connection(connection)
+
+    def close(self):
+        """Shutdown explicitly closes every managed receiver, even if another cannot exit."""
+        with self.lock:
+            with self.state_lock:
+                connections = list(self.connections.values())
+            errors = []
+            for connection in connections:
+                try:
+                    self._stop_connection(connection)
+                except Exception as exc:
+                    errors.append(exc)
+            if errors:
+                raise errors[0]
+
+    def recording_source(self, robot_id=None):
+        with self.state_lock:
+            managed = bool(self.connections)
+            if robot_id is None:
+                connection = next(iter(self.connections.values())) if len(self.connections) == 1 else None
+            else:
+                connection = self.connections.get(robot_id)
+        if managed and (robot_id is None or connection is not None):
+            if connection is None or connection.relay_server is None:
+                return None
+            try:
+                frame = connection.relay_server.config.app.state.runtime.snapshot().model_dump(mode="json")
+                if (frame.get("robot_id"), frame.get("source_kind"), frame.get("upload", {}).get("stage")) == (
+                    connection.identity["robot_id"], connection.identity["source_kind"], "upper_computer"
+                ):
+                    return frame
+            except (HTTPException, AttributeError, ValueError):
+                pass
+            return None
+        # A specific legacy robot may still use its existing receiver alongside managed peers.
+        from .recordings import relay_frame
+
+        frames = []
+        for receiver_port in (18972, 8892):
+            frame = relay_frame(f"http://127.0.0.1:{receiver_port}")
+            if frame and (robot_id is None or frame.get("robot_id") == robot_id):
+                if robot_id is not None:
+                    return frame
+                frames.append(frame)
+        return frames[0] if len(frames) == 1 else None
 
 
 def create_station_app(directory, port=DEFAULT_PORT, *, tunnel_factory=None):
@@ -212,8 +358,8 @@ def create_station_app(directory, port=DEFAULT_PORT, *, tunnel_factory=None):
         database_url = database_file.read_text().strip().replace("postgresql://", "postgresql+psycopg://", 1)
         if not database_url.startswith(("postgresql://", "postgresql+psycopg://")):
             raise ValueError("长期历史库只接受PostgreSQL连接")
+    from .fleet_recordings import FleetRecorder
     from .recording_api import register_recordings
-    from .recordings import Recorder, relay_frame
 
     app = create_app(BackendSettings(
         database_url=database_url, initialize=not database_file.exists(),
@@ -221,24 +367,17 @@ def create_station_app(directory, port=DEFAULT_PORT, *, tunnel_factory=None):
     ), read_dependency=reader)
     manager = StationManager(directory, central_url, app.state.store, tunnel_factory)
     app.state.station = manager
-    def recording_source():
-        if manager.relay_server is not None:
-            try:
-                return manager.relay_server.config.app.state.runtime.snapshot().model_dump(mode="json")
-            except (HTTPException, AttributeError):
-                return None
-        # Reuse an existing receiver by GET only, never take its transfer queue.
-        for receiver_port in (18972, 8892):
-            frame = relay_frame(f"http://127.0.0.1:{receiver_port}")
-            if frame:
-                return frame
-        return None
+    recording_source = manager.recording_source
 
     def record_control(request: Request):
         if not hmac.compare_digest(request.headers.get("x-rp1-station-token", ""), control):
             raise HTTPException(403, "需要本机监控记录操作凭据")
 
-    recorder = Recorder(app.state.store, directory / "recording-outbox.sqlite", recording_source)
+    def recording_roster():
+        return [{**row["robot"], "connected": row["connected"]}
+                for row in manager.status()["connections"]]
+
+    recorder = FleetRecorder(app.state.store, directory, recording_source, recording_roster)
     app.state.recorder = recorder
     register_recordings(app, recorder, recording_source, reader, record_control)
     original_lifespan = app.router.lifespan_context
@@ -250,8 +389,10 @@ def create_station_app(directory, port=DEFAULT_PORT, *, tunnel_factory=None):
             try:
                 yield
             finally:
-                recorder.close()
-                manager.disconnect()
+                try:
+                    recorder.close()
+                finally:
+                    manager.close()
 
     app.router.lifespan_context = lifespan
 
@@ -291,8 +432,8 @@ def create_station_app(directory, port=DEFAULT_PORT, *, tunnel_factory=None):
         return response
 
     @app.get("/api/v1/station", dependencies=[Depends(reader)])
-    def state():
-        return {**manager.status(), "recording": recorder.state()}
+    def state(robot_id: RobotId | None = None):
+        return {**manager.status(robot_id), "recording": recorder.state(robot_id)}
 
     @app.post("/api/v1/station/connect", dependencies=[Depends(reader)])
     def connect_robot(query: ConnectRequest):
@@ -306,9 +447,13 @@ def create_station_app(directory, port=DEFAULT_PORT, *, tunnel_factory=None):
             raise HTTPException(503, "连接暂不可用，请检查电脑后台状态后重试") from None
 
     @app.post("/api/v1/station/disconnect", dependencies=[Depends(reader)])
-    def disconnect_robot():
-        manager.disconnect()
-        return manager.status()
+    def disconnect_robot(query: DisconnectRequest | None = None):
+        robot_id = query.robot_id if query else None
+        try:
+            manager.disconnect(robot_id)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        return manager.status(robot_id)
 
     return app
 

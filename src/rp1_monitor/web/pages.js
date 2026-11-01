@@ -75,7 +75,7 @@
     else if (!available) number.textContent = '连接中断 · 记录状态未知';
     else if (viewedRecord?.robotId === robot.robot_id && viewedRecord.page === route.page && viewedRecord.recordingId) {
       label.textContent = '查看记录'; number.textContent = viewedRecord.runNumber || '正在读取记录编号…';
-    } else if (!recordingContext || Date.now()-recordingContextAt > 15000) number.textContent = '记录状态待确认';
+    } else if (!recordingContext || recordingContext.context_pending || Date.now()-recordingContextAt > 15000) number.textContent = '记录状态待确认';
     else if (recordingContext.active?.session?.robot_id === robot.robot_id) {
       label.textContent = '正在记录'; number.textContent = recordingContext.active.session.run_number;
     } else if (recordingContext.control_status_unknown) number.textContent = '实时记录状态请在上位机确认';

@@ -40,6 +40,7 @@ from websockets.sync.client import connect
 from .desktop_connection import (
     ConnectionProbe,
     StationConnector,
+    StationDisconnector,
     StationStateProbe,
     local_endpoint,
     ssh_arguments,
@@ -48,6 +49,18 @@ from .health_view import build_health
 from .models import metric_max_age_ms
 
 _PROBES = set()
+_RETIRED_READERS = set()
+
+
+def pending_desktop_workers():
+    """Threads owning only this computer's outstanding preview/HTTP reads."""
+    from . import desktop_operations, desktop_recordings, desktop_thermal
+
+    workers = set(_PROBES) | set(_RETIRED_READERS)
+    for module in (desktop_operations, desktop_recordings, desktop_thermal):
+        workers.update(module._WORKERS)
+    return [worker for worker in workers if isinstance(worker, QThread) and worker.isRunning()]
+
 
 STYLE = """
 QWidget { background:transparent; color:#142441; font-size:14px; }
@@ -116,6 +129,11 @@ class Reader(QThread):
         super().__init__()
         self.url = url
         self.socket = None
+        self.finished.connect(self._finished)
+
+    def _finished(self):
+        _RETIRED_READERS.discard(self)
+        self.deleteLater()
 
     def run(self):
         while not self.isInterruptionRequested():
@@ -135,6 +153,8 @@ class Reader(QThread):
                             continue
                         self.frame_received.emit(json.loads(raw))
             except Exception:
+                if self.isInterruptionRequested():
+                    break
                 self.status.emit("连接中断，正在重连；机器人采集与上位机转发独立运行")
                 for _ in range(10):
                     if self.isInterruptionRequested():
@@ -144,10 +164,17 @@ class Reader(QThread):
                 self.socket = None
 
     def stop(self):
+        # A timed-out wait followed by releasing the last reference can abort Qt.
+        # Keep the thread alive until finished, without blocking the GUI on I/O.
+        if self.isRunning():
+            _RETIRED_READERS.add(self)
         self.requestInterruption()
-        if self.socket:
-            self.socket.close()
-        self.wait(4000)
+        transport = getattr(self.socket, "socket", None)
+        if transport is not None:
+            try:
+                transport.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
 
 class MonitorWindow(QMainWindow):
@@ -160,11 +187,15 @@ class MonitorWindow(QMainWindow):
         self.ssh = None
         self.probe = None
         self._closing = False
+        self._close_connections_stopped = False
         self.connection_generation = 0
         self.active_source_url = ""
         self.station_url = ""
         self.station_token_file = None
         self.station_fingerprint = ""
+        self.station_connections = {}
+        self.station_robot_id = None
+        self.station_request_generation = 0
         self.catalog = []
         self.buffers = defaultdict(lambda: deque(maxlen=600))
         self.curves = {}
@@ -268,6 +299,17 @@ class MonitorWindow(QMainWindow):
         self.connection_mode.setAccessibleName("监控连接方式")
         form.addRow("连接方式", self.connection_mode)
         form.addRow("上位机服务", self.url)
+        self.station_robots = QComboBox()
+        self.station_robots.setAccessibleName("本窗口预览机器人")
+        self.station_robots.currentIndexChanged.connect(self.select_station_robot)
+        form.addRow("后台机器人", self.station_robots)
+        self.station_refresh = QPushButton("只读刷新后台连接")
+        self.station_refresh.clicked.connect(lambda: self.restore_station_connection(False))
+        form.addRow(self.station_refresh)
+        self.station_disconnect = QPushButton("断开所选后台机器人")
+        self.station_disconnect.setEnabled(False)
+        self.station_disconnect.clicked.connect(self.disconnect_station_robot)
+        form.addRow(self.station_disconnect)
         self.ssh_target = QLineEdit()
         self.ssh_target.setMinimumHeight(34)
         self.ssh_target.setPlaceholderText("user@机器人IP，仅临时SSH直读时填写")
@@ -303,7 +345,7 @@ class MonitorWindow(QMainWindow):
         controls = QHBoxLayout()
         self.connect_button = QPushButton("连接监控")
         self.connect_button.clicked.connect(self.connect_source)
-        self.disconnect_button = QPushButton("断开")
+        self.disconnect_button = QPushButton("停止本窗口预览")
         self.disconnect_button.setObjectName("secondary")
         self.disconnect_button.clicked.connect(self.disconnect_source)
         controls.addWidget(self.connect_button)
@@ -403,6 +445,10 @@ class MonitorWindow(QMainWindow):
 
         self.operations_panel = OperationsPanel(lambda: self.active_source_url or self.url.text())
         self.tabs.addTab(self.operations_panel, "设备与诊断")
+        from .desktop_joints import JointInspectionPanel
+
+        self.joint_inspection_panel = JointInspectionPanel(self.calibration_connection)
+        self.tabs.addTab(self.joint_inspection_panel, "角度与标定")
         self.tabs.currentChanged.connect(lambda index: self.curve_controls.setVisible(index == 1))
         self.curve_controls.hide()
         split.addWidget(self.tabs)
@@ -805,6 +851,8 @@ class MonitorWindow(QMainWindow):
                 label.setVisible(visible)
         if hasattr(self, "quick_web_button"):
             self.quick_web_button.setVisible(station)
+        if hasattr(self, "connect_button"):
+            self.connect_button.setText("添加后台机器人" if station else "连接监控")
         if hasattr(self, "connection_summary"):
             self.connection_summary.setText(
                 "密码仅用于本次认证。关闭窗口后电脑后台继续接收；连接数据，不操作机器人。"
@@ -824,13 +872,59 @@ class MonitorWindow(QMainWindow):
         if hasattr(self, "connection_form"):
             self.update_connection_mode()
 
-    def restore_station_connection(self):
-        """Attach the Native reader to a connected independent PC background."""
+    def update_station_connections(self, state, preferred=None):
+        connections = state.get("connections")
+        if connections is None:
+            connections = [state] if state.get("connected") else []
+        self.station_connections = {
+            row["robot"]["robot_id"]: row for row in connections
+            if isinstance(row.get("robot"), dict) and row["robot"].get("robot_id")
+        }
+        selected = preferred or self.station_robots.currentData() or self.station_robot_id
+        self.station_robots.blockSignals(True)
+        self.station_robots.clear()
+        for robot_id, row in self.station_connections.items():
+            source = row["robot"].get("source_kind")
+            note = "模拟数据，非实机" if source == "simulated" else "ROS2，仍待实机验收"
+            self.station_robots.addItem(f"{robot_id} · {note}" + (" · 已断开" if not row.get("connected") else ""), robot_id)
+        index = self.station_robots.findData(selected)
+        if index >= 0:
+            self.station_robots.setCurrentIndex(index)
+        self.station_robots.blockSignals(False)
+        self.station_disconnect.setEnabled(bool(self.station_robots.currentData()))
+
+    def select_station_robot(self):
+        robot_id = self.station_robots.currentData()
+        self.station_disconnect.setEnabled(bool(robot_id))
+        row = self.station_connections.get(robot_id)
+        if row and row.get("connected"):
+            self.attach_station_connection(row)
+        elif row:
+            self.connection_label.setText("所选后台机器人已断开；可通过SSH表单重新添加连接")
+
+    def attach_station_connection(self, state):
+        try:
+            relay_url = local_endpoint(state["relay_url"])
+            token = Path(self.station_token_file).read_text().strip()
+        except (KeyError, OSError, ValueError, TypeError, AttributeError):
+            self.connect_button.setEnabled(True)
+            self.connection_label.setText("电脑后台连接信息无效，可填写SSH地址与密码后重试")
+            return
+        self.operations_panel.server.setText(self.station_url)
+        self.operations_panel.token.setText(token)
+        self.url.setText(relay_url)
+        self.connection_mode.setCurrentIndex(0)
+        self.begin_preview(relay_url, "relay")
+
+    def restore_station_connection(self, attach=True):
+        """Read the background list; refreshing never changes background connections."""
         if self._closing or not self.station_url or not self.station_token_file:
             return
-        self.disconnect_source()
+        self.station_request_generation += 1
+        request_generation = self.station_request_generation
         generation = self.connection_generation
-        self.connect_button.setEnabled(False)
+        if attach:
+            self.connect_button.setEnabled(False)
         self.connection_label.setText("正在只读检查电脑后台已有连接…")
         worker = StationStateProbe(self.station_url, self.station_token_file)
         self.probe = worker
@@ -838,27 +932,23 @@ class MonitorWindow(QMainWindow):
         def current():
             from shiboken6 import isValid
 
-            return isValid(self) and not self._closing and generation == self.connection_generation
+            return (isValid(self) and not self._closing and generation == self.connection_generation
+                    and request_generation == self.station_request_generation)
 
         def complete(state):
             if not current():
                 return
-            if not state["connected"]:
-                self.connect_button.setEnabled(True)
+            self.update_station_connections(state)
+            self.connect_button.setEnabled(True)
+            if not attach:
+                self.connection_label.setText("后台连接列表已只读刷新；本窗口预览保持不变")
+                return
+            row = self.station_connections.get(self.station_robots.currentData(), state)
+            if not row.get("connected"):
                 self.connection_label.setText("电脑后台尚未连接，请填写机器人SSH地址与密码")
                 self.ssh_password.setFocus()
                 return
-            try:
-                relay_url = local_endpoint(state["relay_url"])
-                token = Path(self.station_token_file).read_text().strip()
-            except (KeyError, OSError, ValueError, TypeError, AttributeError):
-                fail("电脑后台连接信息无效，可填写SSH地址与密码后重试")
-                return
-            self.operations_panel.server.setText(self.station_url)
-            self.operations_panel.token.setText(token)
-            self.url.setText(relay_url)
-            self.connection_mode.setCurrentIndex(0)
-            self.connect_source()
+            self.attach_station_connection(row)
 
         def fail(message):
             if current():
@@ -877,6 +967,61 @@ class MonitorWindow(QMainWindow):
         _PROBES.add(worker)
         worker.start()
 
+    def disconnect_station_robot(self):
+        robot_id = self.station_robots.currentData()
+        if not robot_id or not self.station_url or not self.station_token_file:
+            return
+        self.station_request_generation += 1
+        generation = self.station_request_generation
+        self.station_disconnect.setEnabled(False)
+        worker = StationDisconnector(self.station_url, self.station_token_file, robot_id)
+
+        def current():
+            from shiboken6 import isValid
+
+            return isValid(self) and not self._closing and generation == self.station_request_generation
+
+        def complete(state):
+            if not current():
+                return
+            row = self.station_connections.get(robot_id, {})
+            if self.probe and getattr(self.probe, "url", None) == row.get("relay_url"):
+                self.connection_generation += 1
+                self.probe.requestInterruption()
+                self.probe = None
+                self.connect_button.setEnabled(True)
+                if self.station_robot_id and self.station_robot_id != robot_id:
+                    self.station_robots.blockSignals(True)
+                    self.station_robots.setCurrentIndex(self.station_robots.findData(self.station_robot_id))
+                    self.station_robots.blockSignals(False)
+            if self.station_robot_id == robot_id:
+                self.clear_preview()
+            self.update_station_connections(state, self.station_robots.currentData())
+            self.connection_label.setText(f"后台机器人 {robot_id} 已断开；其它后台连接继续运行")
+            if hasattr(self, "recordings_panel"):
+                self.recordings_panel.refresh_context(False)
+
+        def fail(message):
+            if current():
+                self.station_disconnect.setEnabled(True)
+                self.connection_label.setText(message)
+
+        worker.done.connect(complete)
+        worker.failed.connect(fail)
+        worker.finished.connect(lambda: _PROBES.discard(worker))
+        _PROBES.add(worker)
+        worker.start()
+
+    def begin_preview(self, url, mode):
+        # Keep the existing reader usable until the replacement passes its preflight.
+        self.connection_generation += 1
+        if self.probe:
+            self.probe.requestInterruption()
+            self.probe = None
+        self.connect_button.setEnabled(False)
+        self.connection_label.setText("正在只读预检服务身份与机器人来源…")
+        self.preflight_source(url, mode, self.connection_generation)
+
     def connect_station(self):
         if not self.station_url or not self.station_token_file:
             self.connection_label.setText("请用 start-monitor.sh 或 desktop --quick-connect 启动密码连接后台")
@@ -888,8 +1033,10 @@ class MonitorWindow(QMainWindow):
         body = {"target": self.ssh_target.text(), "password": self.ssh_password.text(),
                 "collector_port": self.ssh_port.value(),
                 "confirmed_fingerprint": self.station_fingerprint if self.ssh_trust.isChecked() else ""}
-        self.disconnect_source()
-        self.ssh_password.setText(body["password"])
+        self.connection_generation += 1
+        if self.probe:
+            self.probe.requestInterruption()
+            self.probe = None
         generation = self.connection_generation
         self.connect_button.setEnabled(False)
         self.connection_label.setText("正在建立SSH、核对监听身份并接入电脑relay…")
@@ -912,15 +1059,22 @@ class MonitorWindow(QMainWindow):
                 self.connect_button.setEnabled(True)
                 self.connection_label.setText("请核对主机指纹，勾选确认后再次点击连接；尚未发送密码")
                 return
+            try:
+                relay_url = local_endpoint(result["relay_url"])
+                token = Path(self.station_token_file).read_text().strip()
+            except (KeyError, OSError, ValueError, TypeError, AttributeError):
+                fail("电脑后台连接信息无效，请刷新后台连接后重试")
+                return
             self.ssh_password.clear()
-            self.operations_panel.server.setText(result["central_url"])
-            self.operations_panel.token.setText(Path(self.station_token_file).read_text().strip())
-            self.url.setText(local_endpoint(result["relay_url"]))
-            self.preflight_source(result["relay_url"], "relay", generation)
+            self.update_station_connections(result, result.get("robot", {}).get("robot_id"))
+            self.operations_panel.server.setText(self.station_url)
+            self.operations_panel.token.setText(token)
+            self.url.setText(relay_url)
+            self.preflight_source(relay_url, "relay", generation)
 
         def fail(message):
             if current():
-                self.disconnect_source()
+                self.connect_button.setEnabled(True)
                 self.connection_label.setText(message)
 
         worker.done.connect(complete)
@@ -947,6 +1101,9 @@ class MonitorWindow(QMainWindow):
                 url = f"http://127.0.0.1:{local_port}"
         except (ValueError, OSError) as exc:
             self.connection_label.setText(f"连接设置无效：{exc}")
+            return
+        if not args:
+            self.begin_preview(url, mode)
             return
         self.disconnect_source()
         generation = self.connection_generation
@@ -986,37 +1143,76 @@ class MonitorWindow(QMainWindow):
         def complete(identity):
             if not current():
                 return
+            if self.reader:
+                reader, self.reader = self.reader, None
+                reader.stop()
+            if mode == "relay" and self.ssh:
+                ssh, self.ssh = self.ssh, None
+                ssh.terminate()
+                ssh.waitForFinished(1500)
             self.active_source_url = url
+            self.station_robot_id = identity["robot_id"] if identity["robot_id"] in self.station_connections else None
+            if self.station_robot_id:
+                self.station_robots.blockSignals(True)
+                self.station_robots.setCurrentIndex(self.station_robots.findData(self.station_robot_id))
+                self.station_robots.blockSignals(False)
+            if hasattr(self, "recordings_panel"):
+                self.recordings_panel.set_robot(identity["robot_id"])
             ws_url = (
                 url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
                 + "/api/v1/telemetry"
             )
             self.buffers.clear()
+            if getattr(self, "thermal_dialog", None):
+                self.thermal_dialog.close()
+            self.last_frame = None
+            self.last_received = 0
+            self.health_expired = False
+            self.render_health(None)
+            self.joint_inspection_panel.mark_disconnected()
+            self.operations_panel.mark_disconnected()
+            self.source_label.setText("模拟数据 · 非实机" if identity["source_kind"] == "simulated" else "ROS2来源 · 实机待验收")
+            self.upload_label.setText("中央上报：等待所选机器人实时数据")
+            self.quality_label.setText("所选机器人数据待接入；新鲜度未知")
             self.reader = Reader(ws_url)
+            reader = self.reader
+
+            def reader_current():
+                from shiboken6 import isValid
+
+                return isValid(self) and not self._closing and self.reader is reader
 
             def receive(frame):
-                if current():
+                if reader_current():
                     relay = frame.get("upload", {}).get("stage") == "upper_computer"
                     if (
                         frame.get("robot_id") != identity["robot_id"]
                         or frame.get("source_kind") != identity["source_kind"]
                         or relay != (mode == "relay")
                     ):
-                        fail("实时数据的机器人身份或来源与预检不一致，已断开；请核对地址后重连")
+                        self.disconnect_source()
+                        self.connection_label.setText("实时数据的机器人身份或来源与预检不一致，已断开；请核对地址后重连")
                         return
                     self.on_frame(frame)
 
             self.reader.frame_received.connect(receive)
             self.reader.status.connect(
-                lambda status: self.connection_label.setText(status) if current() else None
+                lambda status: self.connection_label.setText(status) if reader_current() else None
             )
             self.reader.start()
+            self.connect_button.setEnabled(True)
             self.connection_label.setText("服务身份已核对，正在等待只读实时数据…")
 
         def fail(message):
             if not current():
                 return
-            self.disconnect_source()
+            self.connect_button.setEnabled(True)
+            if not self.reader:
+                self.disconnect_source()
+            elif self.station_robot_id:
+                self.station_robots.blockSignals(True)
+                self.station_robots.setCurrentIndex(self.station_robots.findData(self.station_robot_id))
+                self.station_robots.blockSignals(False)
             self.connection_label.setText(message)
 
         def finish():
@@ -1032,17 +1228,23 @@ class MonitorWindow(QMainWindow):
 
     def disconnect_source(self):
         self.connection_generation += 1
+        self.station_request_generation += 1
         if self.probe:
             self.probe.requestInterruption()
             self.probe = None
+        self.clear_preview()
+
+    def clear_preview(self):
+        """Release this window's reader without cancelling a different pending selection."""
         if self.reader:
-            self.reader.stop()
-            self.reader = None
+            reader, self.reader = self.reader, None
+            reader.stop()
         if self.ssh:
             ssh, self.ssh = self.ssh, None
             ssh.terminate()
             ssh.waitForFinished(1500)
         self.active_source_url = ""
+        self.station_robot_id = None
         self.ssh_password.clear()
         self.last_received = 0
         self.last_frame = None
@@ -1054,8 +1256,27 @@ class MonitorWindow(QMainWindow):
         self.upload_label.setStyleSheet("color:#576c88;")
         self.quality_label.setText("尚未连接；机器人数据新鲜度未知")
         self.render_health(None)
+        self.joint_inspection_panel.mark_disconnected()
         if hasattr(self, "operations_panel"):
             self.operations_panel.mark_disconnected()
+
+    def calibration_connection(self):
+        """Use only the selected station's existing binding, never the editable SSH field."""
+        robot_id = (self.last_frame or {}).get("robot_id")
+        row = self.station_connections.get(robot_id, {})
+        if not row or row.get("relay_url", "").rstrip("/") != self.active_source_url.rstrip("/"):
+            return {}
+        if not self.station_token_file:
+            return {}
+        return {
+            "robot_id": robot_id,
+            "connected": row.get("connected") is True,
+            "target": row.get("target", ""),
+            "ssh_port": row.get("ssh_port", 22),
+            "known_hosts": Path(self.station_token_file).with_name("known_hosts"),
+            "relay_url": self.active_source_url,
+            "generation": self.connection_generation,
+        }
 
     def populate_metrics(self):
         self.metric_list.blockSignals(True)
@@ -1103,6 +1324,7 @@ class MonitorWindow(QMainWindow):
         self.redraw()
 
     def on_frame(self, frame):
+        self.joint_inspection_panel.set_frame(frame)
         self.operations_panel.set_frame(frame)
         self.last_received = time.monotonic()
         previous = self.last_frame
@@ -1248,6 +1470,7 @@ class MonitorWindow(QMainWindow):
             self.connection_label.setText("预览已过期 · 当前健康数据不可用")
             if not self.health_expired:
                 self.render_health(None, stale=True)
+                self.joint_inspection_panel.mark_disconnected()
                 self.operations_panel.mark_disconnected()
                 self.health_expired = True
         elif self.reader and self.last_frame and not self.health_expired:
@@ -1258,14 +1481,43 @@ class MonitorWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._closing = True
-        probe = self.probe
-        self.disconnect_source()
-        if probe:
-            probe.wait(2000)
+        motor_control = getattr(self.joint_inspection_panel, "motor_control_dialog", None)
+        if motor_control and not motor_control.shutdown():
+            event.ignore()
+            return
+        postzero = getattr(self.joint_inspection_panel, "postzero_dialog", None)
+        if postzero and not postzero.shutdown():
+            event.ignore()
+            return
+        execution = self.joint_inspection_panel.limit_analysis.execution_panel
+        if not execution.shutdown():
+            event.ignore()
+            return
+        if not self._close_connections_stopped:
+            self.disconnect_source()
+            self.setEnabled(False)
+            for timer in self.findChildren(QTimer):
+                timer.stop()
+            self._close_connections_stopped = True
+        pending = pending_desktop_workers()
+        if pending:
+            for worker in pending:
+                worker.requestInterruption()
+            self.connection_label.setText("正在关闭本窗口预览连接并等待本机后台请求结束，请稍候；机器人采集不受影响")
+            QTimer.singleShot(100, self.close)
+            event.ignore()
+            return
         event.accept()
 
 
 def run(args):
+    from .desktop_diagnostics import desktop_failure_diagnostics
+
+    with desktop_failure_diagnostics(getattr(args, "station_dir", None) or Path("runtime/station")):
+        _run_desktop(args)
+
+
+def _run_desktop(args):
     from .app_shell import AppMonitorWindow
     from .central_policy import load_central_policy
     from .motor_map import MotorMapConfig
@@ -1301,8 +1553,14 @@ def run(args):
     if args.quit_after:
         QTimer.singleShot(int(args.quit_after * 1000), window.close)
     app.exec()
-    for probe in list(_PROBES):
-        probe.requestInterruption()
-        probe.wait(2000)
+    # Normal close has already drained these asynchronously. Keep the safety net
+    # for a direct QApplication.quit(), which bypasses the window's closeEvent.
+    window._closing = True
+    window.disconnect_source()
+    workers = pending_desktop_workers()
+    for worker in workers:
+        worker.requestInterruption()
+    for worker in workers:
+        worker.wait()
     window.deleteLater()
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

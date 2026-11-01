@@ -6,25 +6,25 @@
   <meta name="description" content="RP1 整机监控工作后台：按设备独立查看整机状态、关节温度、历史曲线、核心进程和诊断证据。">
   <title>RP1 整机监控 · ROBO PARTY</title>
   <link rel="icon" href="./assets/brand/logo.png">
-  <link rel="stylesheet" href="./assets/app.css?v=20261026-robopi-tui1">
-  <link rel="stylesheet" href="./assets/vendor/swiper-bundle.min.css?v=20261026-robopi-tui1">
-  <link rel="stylesheet" href="./assets/showcase.css?v=20261026-robopi-tui1">
-  <link rel="stylesheet" href="./assets/workbench.css?v=20261028-workspace1">
-  <link rel="stylesheet" href="./assets/recordings.css?v=20261028-workspace1">
-  <link rel="stylesheet" href="./assets/workspace-shell.css?v=20261028-workspace1">
-  <script src="./assets/pages.js?v=20261028-workspace1" defer></script>
-  <script src="./assets/app.js?v=20261028-workspace1" defer></script>
-  <script src="./assets/recordings.js?v=20261028-workspace1" defer></script>
-  <script src="./assets/joint-points.js?v=20261026-robopi-tui1" defer></script>
-  <script src="./assets/thermal-imaging.js?v=20261026-robopi-tui1" defer></script>
-  <script src="./assets/operations.js?v=20261026-robopi-tui1" defer></script>
-  <script src="./assets/central.js?v=20261026-robopi-tui1" defer></script>
-  <script src="./assets/thermal.js?v=20261026-robopi-tui1" defer></script>
-  <script src="./assets/presentation.js?v=20261026-robopi-tui1" defer></script>
-  <script src="./assets/components.js?v=20261028-workspace1" defer></script>
-  <script src="./assets/host-cores.js?v=20261026-robopi-tui1" defer></script>
-  <script src="./assets/overview-views.js?v=20261026-robopi-tui1" defer></script>
-  <script type="module" src="./assets/vendor/showcase.bundle.js?v=20261026-robopi-tui1"></script>
+  <link rel="stylesheet" href="./assets/app.css?v=20261028-ai-entry1">
+  <link rel="stylesheet" href="./assets/vendor/swiper-bundle.min.css?v=20261028-ai-entry1">
+  <link rel="stylesheet" href="./assets/showcase.css?v=20261028-ai-entry1">
+  <link rel="stylesheet" href="./assets/workbench.css?v=20261028-ai-entry1">
+  <link rel="stylesheet" href="./assets/recordings.css?v=20261028-ai-entry1">
+  <link rel="stylesheet" href="./assets/workspace-shell.css?v=20261028-ai-entry1">
+  <script src="./assets/pages.js?v=20261028-ai-entry1" defer></script>
+  <script src="./assets/app.js?v=20261028-ai-entry1" defer></script>
+  <script src="./assets/recordings.js?v=20261028-ai-entry1" defer></script>
+  <script src="./assets/joint-points.js?v=20261028-ai-entry1" defer></script>
+  <script src="./assets/thermal-imaging.js?v=20261028-ai-entry1" defer></script>
+  <script src="./assets/operations.js?v=20261028-ai-entry1" defer></script>
+  <script src="./assets/central.js?v=20261028-ai-entry1" defer></script>
+  <script src="./assets/thermal.js?v=20261028-ai-entry1" defer></script>
+  <script src="./assets/presentation.js?v=20261028-ai-entry1" defer></script>
+  <script src="./assets/components.js?v=20261028-ai-entry1" defer></script>
+  <script src="./assets/host-cores.js?v=20261028-ai-entry1" defer></script>
+  <script src="./assets/overview-views.js?v=20261028-ai-entry1" defer></script>
+  <script type="module" src="./assets/vendor/showcase.bundle.js?v=20261028-ai-entry1"></script>
 </head>
 <body class="showcase-page workbench-page">
   <a class="skip-link" href="#monitor-content">跳转到监控数据</a>
@@ -292,8 +292,11 @@
     <header class="chat-header">
       <span class="entry-mark" aria-hidden="true">RP</span>
       <div><h2 id="chat-dialog-title">诊断对话</h2><p id="ops-header-context">只读诊断 · 等待选择机器人</p></div>
-      <button id="ops-new" class="chat-quiet" type="button">新对话 +</button>
-      <button id="ops-close" class="chat-close" type="button" aria-label="返回整机状态">返回整机</button>
+      <div class="chat-header-actions">
+        <button id="ops-model-open" type="button" class="chat-model-settings" aria-haspopup="dialog" aria-controls="ops-model-dialog">AI 连接设置</button>
+        <button id="ops-new" class="chat-quiet" type="button">新对话 +</button>
+        <button id="ops-close" class="chat-close" type="button" aria-label="返回整机状态">返回整机</button>
+      </div>
     </header>
     <div class="chat-workspace">
       <section class="chat-main" aria-label="诊断会话">
@@ -335,7 +338,6 @@
         <details class="chat-settings"><summary>原始报告与检查版本</summary><pre id="ops-board-detail">暂无报告</pre></details>
         <button class="chat-context-action" type="button" data-ops="board">刷新板端报告 <span aria-hidden="true">↗</span></button>
         <p class="chat-context-note">网页只读。请在本机上位机中发起指定被动检查；历史报告不代表当前实时状态。</p>
-        <button id="ops-model-open" type="button" class="chat-context-action">连接与模型设置 <span aria-hidden="true">↗</span></button>
         <details class="chat-settings"><summary>最近诊断记录</summary><div id="ops-reports"></div></details>
         <p class="chat-context-note">只读取观测，不执行机器人操作。<br>模拟结果不代表实机验收。</p>
       </details>

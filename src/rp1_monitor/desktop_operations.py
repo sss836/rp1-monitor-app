@@ -126,6 +126,7 @@ class OperationsPanel(QWidget):
         self._catalog = None
         self._context_key = None
         self._temperature_metrics = None
+        self._disconnected = False
         self.setObjectName("operations")
         self.setStyleSheet(CHAT_STYLE)
         root = QHBoxLayout(self)
@@ -150,6 +151,12 @@ class OperationsPanel(QWidget):
         titles.addWidget(text_label("诊断对话", "chatTitle"))
         titles.addWidget(text_label("每一次判断，都有据可查", "chatMuted"))
         top.addLayout(titles, 1)
+        self.model_settings = QPushButton("AI 连接设置")
+        self.model_settings.setObjectName("modelSettings")
+        self.model_settings.setAccessibleName("AI 连接与模型设置")
+        self.model_settings.setToolTip("配置中央服务、模型服务商、模型 ID 和 API Key")
+        self.model_settings.setMinimumHeight(44)
+        top.addWidget(self.model_settings)
         self.clear = QPushButton("新对话  +")
         self.clear.setObjectName("chatQuiet")
         self.clear.clicked.connect(self.new_conversation)
@@ -292,9 +299,6 @@ class OperationsPanel(QWidget):
         self.board_checks.clicked.connect(self.board_checks_requested.emit)
         side.addWidget(self.board_checks)
         side.addWidget(text_label("在独立页面查看 CAN、BMS 和外设检查。", "chatMuted"))
-        settings_toggle = QPushButton("连接与模型设置  ›")
-        settings_toggle.setObjectName("chatQuiet")
-        side.addWidget(settings_toggle)
         self.server = QLineEdit("http://127.0.0.1:8890")
         self.server.setAccessibleName("诊断中央服务地址")
         self.token = QLineEdit()
@@ -308,7 +312,7 @@ class OperationsPanel(QWidget):
                 "模型分析 · 发送所选证据" if enabled else "本地规则 · 未调用模型"
             )
         )
-        settings_toggle.clicked.connect(self.models.open)
+        self.model_settings.clicked.connect(self.models.open)
         self.models.test_requested.connect(lambda: self.start("probe"))
         self.models.catalog_requested.connect(lambda: self.start("models"))
         side.addStretch(1)
@@ -389,6 +393,9 @@ class OperationsPanel(QWidget):
             connected=frame.get("upload", {}).get("collector_connected", True),
         )
         self.frame = frame
+        if self._disconnected:
+            self.status.setText("已收到采集服务更新；已有回答仍为历史查询快照")
+            self._disconnected = False
         raw = frame.get("device_profile") or {"robot_id": frame["robot_id"]}
         profile = RobotProfile.model_validate(raw)
         self.robot.setText(profile.robot_id)
@@ -450,6 +457,7 @@ class OperationsPanel(QWidget):
         if self.frame:
             self._generation += 1
         self.frame = {}
+        self._disconnected = True
         self.source.setText("连接中断 · 观测未知")
         self.profile.setText("能力状态未知，请重新连接采集服务")
         self.status.setText("连接中断；已有消息为历史查询快照")

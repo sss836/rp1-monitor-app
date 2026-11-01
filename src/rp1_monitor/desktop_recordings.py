@@ -133,6 +133,10 @@ class RecordingsPanel(QWidget):
         self._view_key = None
         self._view_selections = {}
         self.catalog = {}
+        self.robot_id = None
+        self._selection_generation = 0
+        self._request_serial = 0
+        self._drafts = {}
         app = QCoreApplication.instance()
         if app is not None and not app.property("rp1_recordings_shutdown"):
             app.aboutToQuit.connect(finish_workers)
@@ -149,9 +153,16 @@ class RecordingsPanel(QWidget):
         database_note.setWordWrap(True)
         left.addWidget(database_note)
         form = QFormLayout()
-        self.case = QLineEdit("PERF-SYS-001")
-        self.robot = QLineEdit("RP1.3-KM-CMF9")
-        self.site = QLineEdit("16F")
+        self.robot_selector = QComboBox()
+        self.robot_selector.setAccessibleName("监控记录机器人")
+        self.robot_selector.currentIndexChanged.connect(self.recording_robot_changed)
+        form.addRow("实际采集机器人", self.robot_selector)
+        self.case = QLineEdit()
+        self.case.setPlaceholderText("例如 PERF-SYS-001（仅标签）")
+        self.robot = QLineEdit()
+        self.robot.setPlaceholderText("例如 RP1.3-KM-CMF9（仅标签）")
+        self.site = QLineEdit()
+        self.site.setPlaceholderText("例如 16F")
         self.frequency = QDoubleSpinBox()
         self.frequency.setDecimals(3)
         self.frequency.setRange(0.001, 10)
@@ -192,7 +203,7 @@ class RecordingsPanel(QWidget):
         self.start.setEnabled(False)
         self.stop.setEnabled(False)
         self.start.clicked.connect(self.start_recording)
-        self.stop.clicked.connect(lambda: self.call("POST", "/stop", self.mutated, {}))
+        self.stop.clicked.connect(self.stop_recording)
         row.addWidget(self.start)
         row.addWidget(self.stop)
         left.addLayout(row)
@@ -262,6 +273,86 @@ class RecordingsPanel(QWidget):
         self.timer.timeout.connect(self.tick)
         self.timer.start()
 
+    def remember_draft(self):
+        if self.robot_id:
+            self._save_selections.update({self.save_metrics.item(i).data(Qt.ItemDataRole.UserRole):
+                                         self.save_metrics.item(i).checkState() == Qt.CheckState.Checked
+                                         for i in range(self.save_metrics.count())})
+            self._drafts[self.robot_id] = dict(case=self.case.text(), robot=self.robot.text(),
+                                             site=self.site.text(), frequency=self.frequency.value(),
+                                             selections=dict(self._save_selections), search=self.search.text())
+
+    def set_robot(self, robot_id, refresh=None):
+        """Select a recording identity without starting or stopping any recording."""
+        if not robot_id or robot_id == self.robot_id:
+            return
+        self.remember_draft()
+        self.robot_id = robot_id
+        self._selection_generation += 1
+        self.busy = False
+        self._callback = None
+        self.context = {}
+        self.records = []
+        self.cursor = None
+        self._has_older_pages = False
+        self._signature = None
+        self.catalog = {}
+        self.save_metrics.clear()
+        self.session.clear()
+        self.view_metrics.clear()
+        while self.graph_layout.count():
+            item = self.graph_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        draft = self._drafts.get(robot_id, {})
+        self._save_selections = dict(draft.get("selections", {}))
+        self.case.setText(draft.get("case", ""))
+        self.robot.setText(draft.get("robot", ""))
+        self.site.setText(draft.get("site", ""))
+        self.frequency.setValue(draft.get("frequency", 1))
+        self.search.setText(draft.get("search", ""))
+        self.robot_selector.blockSignals(True)
+        index = self.robot_selector.findData(robot_id)
+        if index < 0:
+            self.robot_selector.addItem(robot_id, robot_id)
+            index = self.robot_selector.count() - 1
+        self.robot_selector.setCurrentIndex(index)
+        self.robot_selector.blockSignals(False)
+        self.source.setText(f"实际采集身份：{robot_id} · 来源待连接")
+        self.service_status.setText("正在读取所选机器人记录状态…")
+        self.status.setText("已切换记录机器人；请核对本机标签和指标。")
+        self.number_preview()
+        self.update_actions()
+        should_refresh = self.isVisible() if refresh is None else refresh
+        if should_refresh:
+            self.refresh_context()
+
+    def recording_robot_changed(self):
+        self.set_robot(self.robot_selector.currentData())
+
+    def update_robots(self, data):
+        robots = data.get("robots", [])
+        if not robots and data.get("robot_id"):
+            robots = [data]
+        self.robot_selector.blockSignals(True)
+        self.robot_selector.clear()
+        if not self.robot_id:
+            self.robot_selector.addItem("请选择记录机器人", None)
+        for row in robots:
+            identity = row.get("robot", row)
+            robot_id = identity.get("robot_id")
+            if not robot_id:
+                continue
+            kind = identity.get("source_kind")
+            note = "模拟数据，非实机" if kind == "simulated" else "ROS2，仍待实机验收" if kind == "ros2" else "来源待连接"
+            self.robot_selector.addItem(robot_id+" · "+note, robot_id)
+        if self.robot_id and self.robot_selector.findData(self.robot_id) < 0:
+            self.robot_selector.addItem(self.robot_id, self.robot_id)
+        index = self.robot_selector.findData(self.robot_id)
+        if index >= 0:
+            self.robot_selector.setCurrentIndex(index)
+        self.robot_selector.blockSignals(False)
+
     def number_preview(self):
         active = self.context.get("active")
         if active:
@@ -318,7 +409,7 @@ class RecordingsPanel(QWidget):
         self.query.setEnabled(bool(self.records) and not self.busy)
 
     def call(self, method, path, done, body=None):
-        if self.busy:
+        if self.busy or getattr(self.window(), "_closing", False):
             return
         url, token = self.station()
         if not url or not token:
@@ -326,10 +417,18 @@ class RecordingsPanel(QWidget):
             return
         self.busy = True
         self._callback = done
+        self._request_serial += 1
+        request = (self._selection_generation, self._request_serial)
         self.update_actions()
         worker = RecordingWorker(url, token, method, "/api/v1/station/recordings"+path, body)
-        worker.done.connect(self.request_succeeded)
-        worker.failed.connect(self.request_failed)
+        def current():
+            from shiboken6 import isValid
+
+            return (isValid(self) and not getattr(self.window(), "_closing", False)
+                    and request == (self._selection_generation, self._request_serial))
+
+        worker.done.connect(lambda value: self.request_succeeded(value) if current() else None)
+        worker.failed.connect(lambda message: self.request_failed(message) if current() else None)
         worker.finished.connect(lambda: _WORKERS.discard(worker))
         worker.finished.connect(worker.deleteLater)
         _WORKERS.add(worker)
@@ -360,7 +459,12 @@ class RecordingsPanel(QWidget):
 
     def refresh_context(self, refresh_records=True):
         def apply(data):
+            if self.robot_id and data.get("robot_id") != self.robot_id:
+                raise ValueError("记录状态的机器人身份与所选机器人不一致")
+            if self.robot_id is None:
+                self.robot_id = data.get("robot_id")
             self.context = data
+            self.update_robots(data)
             active = data.get("active")
             if active:
                 saved = active["session"]
@@ -402,17 +506,19 @@ class RecordingsPanel(QWidget):
                     item.setCheckState(Qt.CheckState.Checked if item.data(Qt.ItemDataRole.UserRole) in saved_metrics else Qt.CheckState.Unchecked)
             if refresh_records:
                 self.load_records()
-        self.call("GET", "/context", apply)
+        path = "/context" + ("?"+urlencode({"robot_id": self.robot_id}) if self.robot_id else "")
+        self.call("GET", path, apply)
 
     def load_records(self, more=False):
         previous = self.session.currentData()
         def apply(data):
+            items = [r for r in data["items"] if not self.robot_id or r["robot_id"] == self.robot_id]
             if more:
-                self.records += [r for r in data["items"] if r["id"] not in {old["id"] for old in self.records}]
+                self.records += [r for r in items if r["id"] not in {old["id"] for old in self.records}]
                 self._has_older_pages = True
             else:
-                latest = {r["id"]: r for r in data["items"]}
-                self.records = data["items"] + [r for r in self.records if r["id"] not in latest]
+                latest = {r["id"]: r for r in items}
+                self.records = items + [r for r in self.records if r["id"] not in latest]
             if more or not self._has_older_pages:
                 self.cursor = data["next_cursor"]
             self.session.blockSignals(True)
@@ -431,7 +537,10 @@ class RecordingsPanel(QWidget):
             self.update_actions()
             if not self.records:
                 self.status.setText("暂无长期监控记录；连接机器人并选择指标后开始记录。")
-        self.call("GET", "?before="+self.cursor if more and self.cursor else "", apply)
+        params = {"robot_id": self.robot_id} if self.robot_id else {}
+        if more and self.cursor:
+            params["before"] = self.cursor
+        self.call("GET", "?"+urlencode(params) if params else "", apply)
 
     def session_changed(self):
         selected = self.session.currentData()
@@ -483,6 +592,10 @@ class RecordingsPanel(QWidget):
     def mutated(self, result):
         self.status.setText("监控记录已创建："+result["run_number"] if result.get("run_number") else "已结束本次记录；已保存的历史仍可查询。")
         self.refresh_context()
+
+    def stop_recording(self):
+        if self.robot_id and self.context.get("active"):
+            self.call("POST", "/stop", self.mutated, {"robot_id": self.robot_id})
 
     def curves(self):
         selected = self.session.currentData()

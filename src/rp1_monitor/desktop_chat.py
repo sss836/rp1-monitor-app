@@ -25,6 +25,8 @@ QLabel#welcomeCopy { color:#64758f; font-size:13px; }
 QLabel#sourceChip { background:#fff4df; color:#87591b; border:1px solid #eedab7; border-radius:6px; padding:5px 8px; font-size:11px; }
 QPushButton#chatQuiet { background:transparent; color:#61738d; border:0; border-radius:6px; padding:7px 9px; font-size:12px; }
 QPushButton#chatQuiet:hover { background:#edf3fc; color:#2b59e8; }
+QPushButton#modelSettings { background:#f1f5ff; color:#2b59e8; border:1px solid #cbdafa; border-radius:7px; padding:7px 12px; font-size:12px; }
+QPushButton#modelSettings:hover { background:#e7efff; border-color:#9bb7ec; }
 QPushButton#suggestion { background:#f8faff; color:#35537e; border:1px solid #e1e9f6; border-radius:10px; padding:14px; text-align:left; font-size:13px; }
 QPushButton#suggestion:hover { background:#edf3ff; border-color:#b6cafa; }
 QFrame#assistantMessage { background:#f4f7fc; border:1px solid #e6edf6; border-radius:12px; }

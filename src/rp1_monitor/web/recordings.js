@@ -101,26 +101,36 @@
       connected: sameSource && !platformUnavailable && rawContext.connected,
       source_kind: sameSource ? rawContext.source_kind : selectedRobot?.source_kind,
       catalog: sameSource ? rawContext.catalog : [],
-      pending_samples: scopedActive ? rawContext.pending_samples : 0,
+      pending_samples: sameSource ? rawContext.pending_samples : 0,
       error: scopedActive || sameSource ? rawContext.error : ''} : rawContext;
     const active = context.active, storage = context.history_database || (context.storage === 'postgresql' ? 'PostgreSQL 长期历史库' : '尚未配置长期历史库');
     const source = context.source_kind === 'simulated' ? '模拟数据 · 非实机' : context.source_kind === 'ros2' ? 'ROS 2 来源 · 仍待实机验收' : '暂无当前采集来源';
-    el('source-state').textContent = `${storage} · ${source} · ${context.control_status_unknown ? '中央历史查询，实时采集状态请在上位机确认' : context.connected ? '上位机正在接收' : '当前链路未接通，仍可查询历史'}`;
+    el('source-state').textContent = `${storage} · ${source} · ${context.context_pending ? '正在核对当前机器人的记录状态' : context.control_status_unknown ? '中央历史查询，实时采集状态请在上位机确认' : context.connected ? '上位机正在接收' : '当前链路未接通，仍可查询历史'}`;
     el('source-state').classList.toggle('source-warning', !context.enabled || !context.connected || context.source_kind === 'simulated');
-    el('record-state').textContent = (active ? `正在记录：${active.session.run_number}\n实际采集 ID：${active.session.robot_id}\n机器人标签：${active.session.robot_number}\n用例：${active.session.case_number} · 场地：${active.session.site}\n保存频率 ${active.query.frequency_hz} Hz · 累计采样 ${active.sequence} 点` : context.control_status_unknown ? '当前为中央只读服务，采集运行状态请在上位机确认。' : context.schema_ready === false ? '长期历史表尚未准备，请在上位机完成数据库配置。' : '当前机器人没有运行中的记录') + (context.control_status_unknown ? '' : `\n待确认入库 ${context.pending_samples || 0} 点`) + (context.error ? '\n记录异常：' + context.error : '');
+    el('record-state').textContent = (context.context_pending ? '正在读取当前机器人的记录状态…' : active ? `正在记录：${active.session.run_number}\n实际采集 ID：${active.session.robot_id}\n机器人标签：${active.session.robot_number}\n用例：${active.session.case_number} · 场地：${active.session.site}\n保存频率 ${active.query.frequency_hz} Hz · 累计采样 ${active.sequence} 点` : context.control_status_unknown ? '当前为中央只读服务，采集运行状态请在上位机确认。' : context.schema_ready === false ? '长期历史表尚未准备，请在上位机完成数据库配置。' : '当前机器人没有运行中的记录') + (context.control_status_unknown || context.context_pending ? '' : `\n待确认入库 ${context.pending_samples || 0} 点`) + (context.error ? '\n记录异常：' + context.error : '');
     if (embedded) document.dispatchEvent(new CustomEvent('rp1:recording-status', {detail: context}));
   }
   async function state() {
     if (stateBusy) return;
     stateBusy = true;
-    try { rawContext = await request(base + '/context'); renderContext(); }
+    const revision = scopeRevision, robot = embedded ? scopedRobot : el('history-robot').value;
+    const current = () => revision === scopeRevision && robot === (embedded ? scopedRobot : el('history-robot').value);
+    try {
+      const result = await request(base + '/context' + (robot ? '?' + new URLSearchParams({robot_id: robot}) : ''));
+      if (!current()) return;
+      rawContext = result; renderContext();
+    }
     catch (error) {
+      if (!current()) return;
       if (embedded) {
-        rawContext = {...rawContext, active: null, connected: false, error: '记录状态读取失败', control_status_unknown: true};
+        rawContext = {...rawContext, active: null, connected: false, context_pending: false, error: '记录状态读取失败', control_status_unknown: true};
         renderContext();
       }
       throw error;
-    } finally { stateBusy = false; }
+    } finally {
+      stateBusy = false;
+      if (!current()) state().catch(fail);
+    }
   }
   async function applyRequestedRecording() {
     if (!requestedRecording || !activePage) return;
@@ -322,7 +332,9 @@
       records = []; nextCursor = null; visible.clear(); initializedScopes.clear(); catalog = [];
       el('history-robot').replaceChildren(option(next, next || '尚未选择机器人'));
       updateSessions(); invalidate('切换机器人，等待读取其监控记录');
+      rawContext = {robot_id: next, active: null, connected: false, context_pending: true};
       renderContext();
+      state().catch(fail);
       activePage = false;
     }
     activate();

@@ -30,6 +30,8 @@ class Accumulator:
         self._anchor_utc = datetime.now(timezone.utc)
         self._start_ns = self._anchor_ns
         self._latest = {}
+        self._invalidated = set()
+        self._motor_feedback_metadata = {}
         self._buckets = {}
         self._tracking_squares = {}
         self._topics = {}
@@ -76,11 +78,23 @@ class Accumulator:
         with self._lock:
             self._health_sensors = dict(sensors)
 
+    def set_motor_feedback_metadata(self, metadata):
+        """Bounded, per-motor receive provenance, separate from host sensor discovery."""
+        with self._lock:
+            self._motor_feedback_metadata = dict(metadata)
+
     def set_mapping(self, names, alignment, note):
         with self._lock:
             self._joint_names = list(names)
             self._target_alignment = alignment
             self._mapping_note = note
+
+    def invalidate_metrics(self, keys):
+        """Expire live values without deleting already observed history buckets."""
+        with self._lock:
+            for key in keys:
+                if key in self._latest:
+                    self._invalidated.add(key)
 
     def at(self, monotonic_ns: int) -> datetime:
         return self._anchor_utc + timedelta(seconds=(monotonic_ns - self._anchor_ns) / 1e9)
@@ -106,6 +120,7 @@ class Accumulator:
                 if key in self._latest and observed < self._latest[key][1]:
                     continue
                 self._latest[key] = (float(value), observed)
+                self._invalidated.discard(key)
                 bucket = self._buckets.setdefault(
                     key, [0, float(value), float(value), float(value)]
                 )
@@ -164,7 +179,7 @@ class Accumulator:
                 sampled_at=self.at(now),
                 values={
                     key: value
-                    if ages[key] <= metric_max_age_ms(key)
+                    if key not in self._invalidated and ages[key] <= metric_max_age_ms(key)
                     and (not key.startswith("process.") or key in self._process_valid)
                     and not (
                         self.source_kind == "ros2"
@@ -184,7 +199,7 @@ class Accumulator:
                 target_alignment=self._target_alignment,
                 mapping_note=self._mapping_note,
                 health_sources=dict(self._health_sources),
-                health_sensors=dict(self._health_sensors),
+                health_sensors={**self._health_sensors, **self._motor_feedback_metadata},
                 processes=self.process_snapshot(now),
             )
 
@@ -233,12 +248,12 @@ class Accumulator:
                     target_alignment=self._target_alignment,
                     mapping_note=self._mapping_note,
                     health_sources=dict(self._health_sources),
-                    health_sensors=dict(self._health_sensors),
+                    health_sensors={**self._health_sensors, **self._motor_feedback_metadata},
                     processes=self.process_snapshot(now),
                     health_values={
                         key: value
                         for key, (value, _) in self._latest.items()
-                        if metric_max_age_ms(key) > 1000
+                        if key not in self._invalidated and metric_max_age_ms(key) > 1000
                         and (not key.startswith("process.") or key in self._process_valid)
                     },
                     health_ages_ms={

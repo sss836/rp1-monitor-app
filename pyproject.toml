@@ -22,7 +22,7 @@ rp1-monitor = "rp1_monitor.pc_cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-rp1_monitor = ["web/*", "web/brand/*", "web/vendor/*", "web/models/*"]
+rp1_monitor = ["web/*", "web/brand/*", "web/vendor/*", "web/models/*", "data/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

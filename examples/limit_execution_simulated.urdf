@@ -1,0 +1,1 @@
+<robot name="SIMULATED_current_fixture"><joint name="fixture_upper" type="revolute"><limit lower="-1" upper="1"/></joint><joint name="fixture_lower" type="revolute"><limit lower="-1" upper="1"/></joint></robot>

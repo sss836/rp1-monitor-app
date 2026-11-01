@@ -102,6 +102,16 @@ def panel(title):
     return widget, layout
 
 
+def _set_text(widget, text):
+    if widget.text() != text:
+        widget.setText(text)
+
+
+def _set_style(widget, style):
+    if widget.styleSheet() != style:
+        widget.setStyleSheet(style)
+
+
 class RobotOverview(QWidget):
     region_clicked = Signal(str)
 
@@ -113,8 +123,13 @@ class RobotOverview(QWidget):
         self.setAccessibleName("RP1机型示意，非实时姿态，物理部位映射待确认")
         self.regions = []
         self.markers = []
+        self._scaled_image = None
+        self._scaled_image_size = None
 
     def set_heat_map(self, view):
+        description = view["mapping_note"] + " · " + view["summary"]
+        if self.regions == view["regions"] and self.accessibleDescription() == description:
+            return
         old_keys = [region["key"] for region in self.regions]
         self.regions = view["regions"]
         if old_keys != [region["key"] for region in self.regions]:
@@ -129,13 +144,13 @@ class RobotOverview(QWidget):
                 )
                 marker.show()
         for region, marker in zip(self.regions, self.markers):
-            marker.setText("—" if region["value"] is None else f"{region['value']:.0f}°")
+            _set_text(marker, "—" if region["value"] is None else f"{region['value']:.0f}°")
             marker.setToolTip(region["label"] + "\n" + region["detail"])
             marker.setAccessibleName(region["label"] + " · " + region["detail"])
-            marker.setStyleSheet(
+            _set_style(marker,
                 f"background:{region['color']}; color:{region['text_color']}; border:2px solid {'#ae283a' if region['state'] == 'hot' else '#65758c'}; border-radius:9px; padding:1px; font-size:11px;"
             )
-        self.setAccessibleDescription(view["mapping_note"] + " · " + view["summary"])
+        self.setAccessibleDescription(description)
         self.update()
 
     def paintEvent(self, event):
@@ -144,12 +159,14 @@ class RobotOverview(QWidget):
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor("#f1f6ff"))
         painter.drawEllipse(5, 25, max(1, self.width() - 10), max(1, self.height() - 45))
-        image = self.pixmap.scaled(
-            max(1, self.width() - 30),
-            max(1, self.height() - 18),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+        image_size = (max(1, self.width() - 30), max(1, self.height() - 18), self.pixmap.cacheKey())
+        if self._scaled_image_size != image_size:
+            self._scaled_image = self.pixmap.scaled(
+                image_size[0], image_size[1], Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self._scaled_image_size = image_size
+        image = self._scaled_image
         left, top = max(0, (self.width() - image.width()) // 2), 8
         painter.drawPixmap(left, top, image)
         for region, marker in zip(self.regions, self.markers):
@@ -180,6 +197,8 @@ class AppMonitorWindow(MonitorWindow):
         old_root = self.takeCentralWidget()
         trend_page = self.tabs.widget(1)
         self.tabs.removeTab(1)
+        self.tabs.removeTab(self.tabs.indexOf(self.joint_inspection_panel))
+        self.joint_inspection_panel.setParent(None)
         self.session_events = deque(maxlen=100)
         self.last_event = None
         root = GridBackground()
@@ -207,9 +226,9 @@ class AppMonitorWindow(MonitorWindow):
         side.addSpacing(26)
         self.nav = QButtonGroup(self)
         self.nav.setExclusive(True)
-        titles = ("整机健康", "部件监测", "趋势分析", "告警记录", "设备设置", "诊断助手", "硬件自检", "监控记录")
+        titles = ("整机健康", "部件监测", "趋势分析", "告警记录", "设备设置", "诊断助手", "硬件自检", "监控记录", "角度与标定")
         for index, (title, glyph) in enumerate(
-            zip(titles, ("home", "parts", "trend", "bell", "settings", "chat", "checks", "trend"))
+            zip(titles, ("home", "parts", "trend", "bell", "settings", "chat", "checks", "trend", "settings"))
         ):
             button = QPushButton(title)
             button.setObjectName("nav")
@@ -262,6 +281,7 @@ class AppMonitorWindow(MonitorWindow):
 
         self.recordings_panel = RecordingsPanel(lambda: (self.station_url, self.station_token_file))
         self.pages.addWidget(self.recordings_panel)
+        self.pages.addWidget(self.joint_inspection_panel)
         self.operations_panel.board_checks_requested.connect(lambda: self.navigate(6))
         body.addWidget(self.pages, 1)
         footer = QHBoxLayout()
@@ -270,6 +290,7 @@ class AppMonitorWindow(MonitorWindow):
         body.addLayout(footer)
         layout.addLayout(body, 1)
         self.nav.idClicked.connect(self.navigate)
+        self.pages.currentChanged.connect(lambda index: self.render_temperature_curves() if index == 0 else None)
         self.nav.button(0).setChecked(True)
         self.setCentralWidget(root)
         # All state-bound controls above now belong to the new shell.
@@ -390,6 +411,7 @@ class AppMonitorWindow(MonitorWindow):
             for name, color in (("主机最高热区", "#2b59e8"), ("最高电机温度", "#ac5a00"))
         ]
         self.temp_buffers = [deque(maxlen=600), deque(maxlen=600)]
+        self._temperature_curves_dirty = False
         trend_layout.addWidget(self.health_plot)
         right.addWidget(trend)
         grid.addLayout(right, 7)
@@ -457,6 +479,9 @@ class AppMonitorWindow(MonitorWindow):
         for title, widget in (
             ("连接方式", self.connection_mode),
             ("上位机服务", self.url),
+            ("后台机器人 / 本窗口预览", self.station_robots),
+            ("只读刷新", self.station_refresh),
+            ("后台连接操作", self.station_disconnect),
             ("SSH目标", self.ssh_target),
             ("SSH密码", self.ssh_password),
             ("主机指纹", self.ssh_fingerprint),
@@ -501,6 +526,23 @@ class AppMonitorWindow(MonitorWindow):
         self.pages.setCurrentIndex(index)
         self.nav.button(index).setChecked(True)
         self.app_title.setText("RP1 " + self.nav.button(index).text())
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self.shell_ready:
+            self.render_temperature_curves()
+
+    def render_temperature_curves(self):
+        if not self._temperature_curves_dirty or not self.health_plot.isVisible():
+            return
+        for buffer, curve in zip(self.temp_buffers, self.temp_curves):
+            if buffer:
+                data = np.asarray(buffer)
+                curve.setData(data[:, 0] - buffer[-1][0], data[:, 1], connect="finite")
+            else:
+                curve.clear()
+        self.health_plot.setXRange(-60, 0, padding=0)
+        self._temperature_curves_dirty = False
 
     def open_settings(self):
         self.navigate(4)
@@ -569,7 +611,7 @@ class AppMonitorWindow(MonitorWindow):
             ]
             if items:
                 core_lines.append(f"{name}：" + " · ".join(items))
-        self.host_core_summary.setText(
+        _set_text(self.host_core_summary,
             "\n".join(core_lines) if core_lines else "每核使用率 · 采集端尚未提供"
         )
 
@@ -602,16 +644,19 @@ class AppMonitorWindow(MonitorWindow):
         )
         items = processes["items"]
         running = sum(item["state"] == "running" for item in items)
-        self.process_summary.setText(
+        _set_text(self.process_summary,
             f"核心进程 · 存活 {running}/{len(items)}" if items else "核心进程 · 未配置名单"
         )
-        self.process_note.setText(
+        _set_text(self.process_note,
             "CPU单核100%；RSS为近似值含共享页；重启数仅覆盖本采集会话。"
             if items
             else "未配置进程名单；请在机器人档案 processes 中声明实际 comm。"
         )
-        self.process_table.setRowCount(len(items))
-        self.process_table.setFixedHeight(min(170, max(110, 42 + len(items) * 31)))
+        if self.process_table.rowCount() != len(items):
+            self.process_table.setRowCount(len(items))
+        height = min(170, max(110, 42 + len(items) * 31))
+        if self.process_table.height() != height:
+            self.process_table.setFixedHeight(height)
         for row, item in enumerate(items):
             texts = [
                 item["label"],
@@ -624,27 +669,30 @@ class AppMonitorWindow(MonitorWindow):
                 number(item["age_ms"] / 1000 if item.get("age_ms") is not None else None),
             ]
             for column, text in enumerate(texts):
-                cell = QTableWidgetItem(text)
-                cell.setToolTip(
-                    f"{item['detail']}\ncomm={item['comm']} · PID={item.get('pid') or '—'}\n观测时间 {item.get('observed_at') or '未知'}"
-                )
+                cell = self.process_table.item(row, column)
+                if cell is None:
+                    cell = QTableWidgetItem()
+                    self.process_table.setItem(row, column, cell)
+                _set_text(cell, text)
+                tooltip = f"{item['detail']}\ncomm={item['comm']} · PID={item.get('pid') or '—'}\n观测时间 {item.get('observed_at') or '未知'}"
+                if cell.toolTip() != tooltip:
+                    cell.setToolTip(tooltip)
                 if column == 1:
-                    cell.setForeground(
-                        QColor("#14735b" if item["state"] == "running" else "#925709")
-                    )
-                self.process_table.setItem(row, column, cell)
-        self.hero_id.setText(payload.get("robot_id", "RP1"))
-        self.device_id.setText(payload.get("robot_id", "尚未连接机器人"))
+                    color = QColor("#14735b" if item["state"] == "running" else "#925709")
+                    if cell.foreground().color() != color:
+                        cell.setForeground(color)
+        _set_text(self.hero_id, payload.get("robot_id", "RP1"))
+        _set_text(self.device_id, payload.get("robot_id", "尚未连接机器人"))
         self.battery_bar.setVisible(battery["soc"] is not None)
         self.battery_bar.setValue(round((battery["soc"] or 0) * 10))
-        self.battery_summary.setText(
+        _set_text(self.battery_summary,
             f"{number(battery['voltage'], ' V')}   ·   {number(battery['current'], ' A')}\n电池温度  {number(battery['temperature'], '°C')}"
         )
-        self.temperature_value.setText(number(motors["max_temperature"], "°C"))
-        self.host_summary.setText(
+        _set_text(self.temperature_value, number(motors["max_temperature"], "°C"))
+        _set_text(self.host_summary,
             f"CPU {number(host['cpu_usage'], '%')}   ·   内存 {number(host['memory_usage'], '%')}"
         )
-        self.motor_summary.setText(
+        _set_text(self.motor_summary,
             f"非零故障上报 {len(motors['faults'])} 项"
             if motors["faults"]
             else "已接入反馈未报故障"
@@ -694,14 +742,14 @@ class AppMonitorWindow(MonitorWindow):
             "预览已过期 · 健康状态未知" if stale else health["overall"]["label"]
         )
         if thermal_map["hot_count"]:
-            self.health_overall.setStyleSheet("color:#ae283a;")
+            _set_style(self.health_overall, "color:#ae283a;")
             self.health_status["motors"].setText(motors["label"])
-            self.health_status["motors"].setStyleSheet("color:#ae283a;")
+            _set_style(self.health_status["motors"], "color:#ae283a;")
         elif thermal_map["dof"] and motors["state"] == "incomplete":
             self.health_status["motors"].setText(motors["label"])
-            self.health_status["motors"].setStyleSheet("color:#7d5206;")
+            _set_style(self.health_status["motors"], "color:#7d5206;")
         self.robot_overview.set_heat_map(thermal_map)
-        self.motor_map_status.setText(
+        _set_text(self.motor_map_status,
             thermal_map["summary"]
             + "\n"
             + thermal_map["mapping_note"]
@@ -718,11 +766,11 @@ class AppMonitorWindow(MonitorWindow):
                 else ""
             )
         )
-        self.motor_map_status.setStyleSheet(
+        _set_style(self.motor_map_status,
             "color:#ae283a;" if thermal_map["hot_count"] else "color:#576c88;"
         )
         self.motor_map_status.setToolTip(thermal_map["meaning"])
-        self.motor_map_legend.setText(
+        _set_text(self.motor_map_legend,
             f"浅色 {thermal_map['scale_min_c']:g} → 深红 {thermal_map['scale_max_c']:g} °C\n灰色：未知 · 描边及文字提示超温"
             if thermal_map["scale_min_c"] is not None
             else "色阶及部位映射尚未配置 · 灰色：未知"
@@ -762,7 +810,7 @@ class AppMonitorWindow(MonitorWindow):
         fault_lines = [
             f"{item['joint']} · 原始故障码 {int(item['code'])}" for item in motors["faults"]
         ]
-        self.current_alerts.setText("\n".join([summary, detail, *fault_lines]))
+        _set_text(self.current_alerts, "\n".join([summary, detail, *fault_lines]))
         signature = (
             payload.get("robot_id"),
             payload.get("stream_id"),
@@ -789,13 +837,11 @@ class AppMonitorWindow(MonitorWindow):
             self.last_event = signature
         if not frame:
             self.temp_buffers = [deque(maxlen=600), deque(maxlen=600)]
-            for curve in self.temp_curves:
-                curve.clear()
+            self._temperature_curves_dirty = True
         elif payload.get("sampled_at"):
             timestamp = datetime.fromisoformat(payload["sampled_at"]).timestamp()
-            for buffer, curve, value in zip(
+            for buffer, value in zip(
                 self.temp_buffers,
-                self.temp_curves,
                 (host["max_temperature"], motors["max_temperature"]),
             ):
                 if buffer and timestamp <= buffer[-1][0]:
@@ -803,6 +849,5 @@ class AppMonitorWindow(MonitorWindow):
                 if buffer and timestamp - buffer[-1][0] > 0.3:
                     buffer.append((buffer[-1][0] + 0.001, np.nan))
                 buffer.append((timestamp, np.nan if value is None else value))
-                data = np.asarray(buffer)
-                curve.setData(data[:, 0] - timestamp, data[:, 1], connect="finite")
-            self.health_plot.setXRange(-60, 0, padding=0)
+            self._temperature_curves_dirty = True
+        self.render_temperature_curves()

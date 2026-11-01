@@ -22,6 +22,11 @@ class CurveRequest(BaseModel):
     max_points: Annotated[int, Query(ge=50, le=2000)] = 800
 
 
+class StopRecordingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    robot_id: RobotId | None = None
+
+
 def read_router(store, read_auth, prefix="/api/v1/monitor-recordings"):
     history = RecordingStore(store)
     router = APIRouter(prefix=prefix, tags=["monitor-recordings"], dependencies=[read_auth])
@@ -31,13 +36,20 @@ def read_router(store, read_auth, prefix="/api/v1/monitor-recordings"):
         return all(inspector.has_table(t.name) for t in (sessions, samples))
 
     @router.get("/context")
-    def context() -> dict:
+    def context(robot_id: RobotId | None = None) -> dict:
         recorder = getattr(store, "recorder", None)
         if recorder:
+            if hasattr(recorder, "context"):
+                return recorder.context(robot_id)
             frame = recorder.source()
+            if robot_id and frame and frame.get("robot_id") != robot_id:
+                frame = None
+            state = recorder.state()
+            if robot_id and (state.get("active") or {}).get("session", {}).get("robot_id") != robot_id:
+                state = {**state, "active": None, "pending_samples": 0, "error": ""}
             return dict(
-                **recorder.state(),
-                robot_id=frame.get("robot_id") if frame else None,
+                **state,
+                robot_id=robot_id or (frame.get("robot_id") if frame else None),
                 source_kind=frame.get("source_kind") if frame else None,
                 connected=bool(frame and frame.get("upload", {}).get("collector_connected")),
                 catalog=recording_catalog(frame),
@@ -109,10 +121,18 @@ def register_recordings(app, recorder, source, reader, control):
             ) from None
 
     @router.post("/stop")
-    def stop() -> dict:
+    def stop(query: StopRecordingRequest | None = None) -> dict:
         try:
-            recorder.stop()
-            return {"status": "stopped", **recorder.state()}
+            robot_id = query.robot_id if query else None
+            if hasattr(recorder, "context"):
+                recorder.stop(robot_id)
+                state = recorder.state(robot_id)
+            else:
+                if robot_id and (recorder.state().get("active") or {}).get("session", {}).get("robot_id") != robot_id:
+                    raise ValueError("所选机器人没有正在运行的监控记录")
+                recorder.stop()
+                state = recorder.state()
+            return {"status": "stopped", **state}
         except ValueError as e:
             raise HTTPException(409, str(e)) from None
 

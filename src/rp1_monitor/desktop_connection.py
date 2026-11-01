@@ -154,6 +154,11 @@ class StationStateProbe(QThread):
                 raise ValueError("电脑后台连接状态格式无效，请使用SSH表单连接")
             if state["connected"]:
                 state["relay_url"] = local_endpoint(state.get("relay_url", ""))
+            for connection in state.get("connections", []):
+                if not isinstance(connection, dict) or type(connection.get("connected")) is not bool:
+                    raise ValueError("电脑后台连接列表格式无效")
+                if connection["connected"]:
+                    connection["relay_url"] = local_endpoint(connection.get("relay_url", ""))
             if not self.isInterruptionRequested():
                 self.done.emit(state)
         except (OSError, ValueError, TypeError, AttributeError, httpx.HTTPError):
@@ -190,3 +195,31 @@ class StationConnector(QThread):
             self.failed.emit("无法连接电脑快捷后台，请使用 start-monitor.sh 启动后重试")
         finally:
             self.body.clear()
+
+
+class StationDisconnector(QThread):
+    """Disconnect only the robot explicitly chosen in this native window."""
+
+    done = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, url, token_file, robot_id):
+        super().__init__()
+        self.url, self.token_file, self.robot_id = url, token_file, robot_id
+
+    def run(self):
+        try:
+            url = local_endpoint(self.url)
+            token = Path(self.token_file).read_text().strip()
+            with httpx.Client(timeout=15, trust_env=False, follow_redirects=False,
+                              headers={"Authorization": f"Bearer {token}"}) as client:
+                response = client.post(
+                    url + "/api/v1/station/disconnect", json={"robot_id": self.robot_id},
+                    headers={"X-RP1-Station-Token": station_control_token(self.token_file)},
+                )
+                response.raise_for_status()
+                if not self.isInterruptionRequested():
+                    self.done.emit(response.json())
+        except (OSError, ValueError, httpx.HTTPError):
+            if not self.isInterruptionRequested():
+                self.failed.emit("未能断开所选后台机器人，请刷新连接状态后重试")
