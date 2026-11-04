@@ -7,6 +7,12 @@
 
 机器人端使用独立的 `rp1_robot` 采集程序。本仓库不包含 ROS/BMS/主机传感器采集器，也没有机器人 `agent` 启动命令；不要把电脑源码、`.venv` 或 `runtime` 上传到机器人。
 
+## Ubuntu 安装包与整机工厂测试
+
+GitHub Releases 提供 Ubuntu 24.04 amd64 的 `.deb`，内置电脑端 Python 依赖。安装后从应用菜单打开“RP1 工厂测试”，或执行 `rp1-monitor-app factory`。安装、数据目录和从源码构建安装包见[deb 安装说明](docs/PC_DEB.md)。
+
+整机“测试结果与报告”会自动带入规则及已有结果，支持导出前编辑。每条只保存当前最终版，不建编辑修订记录；点击“一键保存并导出 CSV”导出用户确认的 17 列格式。使用说明见[结果汇总](docs/FACTORY_RESULT_SUMMARY.md)，三台上位机统一模板见[CSV规范](docs/TEST_RESULTS_CSV_FORMAT.md)。
+
 ## 在电脑启动
 
 适用 Ubuntu 图形桌面、Python 3.10+ 和可用的 Python 包源。先准备本项目虚拟环境：

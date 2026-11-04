@@ -607,9 +607,11 @@ class CalibrationCheck:
         self.retreat_start = None
         self.search_trace = []
         self.trace_problem = None
+        self.trace_problem_detail = None
         self.retreat_verified = False
         self.retreat_actual_deg = None
         self.retreat_joint_distances = []
+        self.retreat_path_diagnostics = None
         self.retreats = []
         self.abort_reason = None
         self.events = []
@@ -639,7 +641,15 @@ class CalibrationCheck:
         self.candidates = set(candidates)
         self.missing = missing
         self.frozen = positions[:]
-        self.targets = positions[:]
+        if self.options["require_pose_settling"]:
+            self.targets = positions[:]
+        else:
+            # Unload this group's search once. Unrelated axes keep the command
+            # that was already supporting their load; feedback is not a new
+            # position target on every receive cycle.
+            self.targets = self.targets[:]
+            for index in self.selected:
+                self.targets[index] = positions[index]
         self.phase, self.phase_started, self.stop_since = "confirm_stop", now, None
         self.history = [[] for _ in range(self.dof)]
         for i in candidates:
@@ -701,6 +711,18 @@ class CalibrationCheck:
             achieved = min(self.directions[i] * (positions[i] - pose[i]) for i in axes)
             if achieved >= limit - 1e-10:
                 break
+        self.retreat_path_diagnostics = {
+            "group": self.group, "history_pose_count": len(self.search_trace),
+            "planned_pose_count": len(points), "trace_problem": self.trace_problem,
+            "trace_problem_detail": copy.deepcopy(self.trace_problem_detail),
+            "required_net_deg": self.options["retreat_deg"],
+            "planned_min_net_deg": math.degrees(achieved),
+            "joint_distances": [
+                {"joint": self.plan["joint_names"][i],
+                 "planned_net_deg": math.degrees(self.directions[i] * (positions[i] - points[-1][i]))}
+                for i in sorted(axes)
+            ],
+        }
         early_abort = self.early and self.options["require_pose_settling"]
         if early_abort or self.trace_problem or achieved < limit - math.radians(0.05):
             self.phase = "aborted"
@@ -742,15 +764,28 @@ class CalibrationCheck:
             previous_time, previous = self.search_trace[-1]
             if timestamp <= previous_time:
                 return
+            problem, problem_index = None, None
             if timestamp - previous_time > 0.25:
-                self.trace_problem = "实测退路反馈时间不连续，须现场核对路线"
+                problem = "实测退路反馈时间不连续，须现场核对路线"
             if self._distance(previous, positions) > math.radians(0.2):
-                self.trace_problem = "实测退路角度不连续，须现场核对路线"
+                problem = "实测退路角度不连续，须现场核对路线"
+                problem_index = max(range(self.dof), key=lambda i: abs(positions[i] - previous[i]))
             # Allow two native position-code steps of quantization noise, not
             # a meaningful reversed motion while approaching the endpoint.
             if self.options["require_pose_settling"] and any(self.directions[i] * (positions[i] - previous[i]) < -math.radians(0.045)
                    for i in self.selected):
-                self.trace_problem = "搜索期间反馈出现反向运动，须现场核对路线"
+                problem = "搜索期间反馈出现反向运动，须现场核对路线"
+                problem_index = next(i for i in self.selected if
+                                     self.directions[i] * (positions[i] - previous[i]) < -math.radians(0.045))
+            if problem is not None:
+                self.trace_problem = problem
+                self.trace_problem_detail = {
+                    "group": self.group, "previous_time_s": previous_time, "time_s": timestamp,
+                    "dt_s": timestamp - previous_time,
+                    "joint": None if problem_index is None else self.plan["joint_names"][problem_index],
+                    "delta_deg": (None if problem_index is None else
+                                  math.degrees(positions[problem_index] - previous[problem_index])),
+                }
         self.search_trace.append((timestamp, positions[:]))
         while len(self.search_trace) > 2:
             # Retain two degrees of genuine signed primary-axis progress. A
@@ -762,6 +797,10 @@ class CalibrationCheck:
         trace_limit = 2000 if self.options["require_pose_settling"] else math.ceil(self.options["search_timeout_s"] * 100) + 500
         if len(self.search_trace) > trace_limit:
             self.trace_problem = "实测退路记录超限，须现场核对路线"
+            self.trace_problem_detail = {
+                "group": self.group, "time_s": timestamp,
+                "recorded_pose_count": len(self.search_trace), "pose_limit": trace_limit,
+            }
             self.search_trace = self.search_trace[-trace_limit:]
 
     def _sample_retreat(self, elapsed):
@@ -849,6 +888,7 @@ class CalibrationCheck:
             "retreat_actual_deg": self.retreat_actual_deg,
             "retreat_verified": self.retreat_verified,
             "retreat_joint_distances": copy.deepcopy(self.retreat_joint_distances),
+            "retreat_path_diagnostics": copy.deepcopy(self.retreat_path_diagnostics),
             "retreats": copy.deepcopy(self.retreats), "abort_reason": self.abort_reason,
             "contact_detection": {"window_s": self.options["hold_s"],
                                   "max_actual_span_deg": self.contact_span_deg,
@@ -907,6 +947,7 @@ class CalibrationCheck:
                 self.history = [[] for _ in range(self.dof)]
                 self.search_trace = [(min(times), positions[:])]
                 self.trace_problem = None
+                self.trace_problem_detail = None
                 self.events.append({"type": "search_started", "group": self.group})
         elif self.phase == "search":
             # Shared path progress preserves the video pairing and avoidance axes.
@@ -939,11 +980,6 @@ class CalibrationCheck:
                   or (not self.options["require_pose_settling"] and now - self.phase_started >= self.options["search_timeout_s"])):
                 self._freeze(now, positions, [], missing=True)
         elif self.phase == "confirm_stop":
-            if not self.options["require_pose_settling"]:
-                # Keep unloading the advancing spring during the post-contact
-                # receive dwell. A drifting actual pose must not become a
-                # discontinuous first retreat target.
-                self.targets = positions[:]
             if now - self.phase_started > self.options["stop_timeout_s"]:
                 raise ValueError("未在时限内取得停稳反馈，须中止并失能")
             if all(fresh) and self._post_contact_dwell_ready():
@@ -969,8 +1005,14 @@ class CalibrationCheck:
                     row["verified"] = row["actual_deg"] >= row["requested_deg"] - 0.05
                 self.retreat_actual_deg = min(row["actual_deg"] for row in self.retreat_joint_distances)
                 self.retreat_verified = all(row["verified"] for row in self.retreat_joint_distances)
+                abort_reasons = []
+                if self.missing:
+                    abort_reasons.append("本组搜索结束仍未检出候选端点，已中止检查")
+                if self.early and self.options["require_pose_settling"]:
+                    abort_reasons.append("候选阻挡早于参考容差，已中止检查")
                 if not self.retreat_verified:
-                    self.abort_reason = "缓退反馈有候选轴净退不足1°（量化容差0.05°），须现场复核"
+                    abort_reasons.append("缓退反馈有候选轴净退不足1°（量化容差0.05°），须现场复核")
+                self.abort_reason = "；".join(abort_reasons) or None
                 self.retreats.append({"group": self.group, "requested_deg": self.options["retreat_deg"],
                                      "actual_deg": self.retreat_actual_deg,
                                      "verified": self.retreat_verified, "reason": self.abort_reason,
@@ -1001,6 +1043,7 @@ class CalibrationCheck:
                     self.candidates = set()
                     self.retreat_verified, self.retreat_actual_deg = False, None
                     self.retreat_joint_distances = []
+                    self.retreat_path_diagnostics = None
                     self._set_approach()
         elif self.phase == "return":
             elapsed = now - self.phase_started

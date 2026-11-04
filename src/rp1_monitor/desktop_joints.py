@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, Qt, QTimer
+from PySide6.QtCore import QProcess, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -29,8 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from .calibration_context import extract_calibration_context
-from .desktop_limits import LimitAnalysisPanel
-from .desktop_motor_control import MotorControlDialog
+from .desktop_manual_check import ManualCalibrationDialog
 from .desktop_postzero import PostzeroDialog
 from .joint_inspection import (
     MAX_REFERENCE_BYTES,
@@ -99,6 +99,7 @@ def _label(text="", name="subtitle"):
 
 
 class JointInspectionPanel(QWidget):
+    manual_dialog_created = Signal(object)
     def __init__(self, connection_context=lambda: {}):
         super().__init__()
         self.connection_context = connection_context
@@ -119,10 +120,43 @@ class JointInspectionPanel(QWidget):
         layout = QVBoxLayout(content)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
-        layout.addWidget(_label("关节角度检查", "sectionTitle"))
         self.identity = _label("尚未连接机器人", "sectionTitle")
         layout.addWidget(self.identity)
-        layout.addWidget(_label("角度表用于观测和参考比较；硬件标零不要求先完成角度检查。"))
+
+        tasks = QHBoxLayout()
+        self.calibrate = QPushButton("标定")
+        self.calibrate.clicked.connect(self.open_calibration)
+        self.calibrate.setToolTip("使用机器人已有标零流程")
+        self.motor_control = QPushButton("标定检查")
+        self.motor_control.clicked.connect(self.open_motor_control)
+        self.motor_control.setToolTip("按URDF动画手动摆动，自动检查所选限位")
+        self.postzero = QPushButton("角度监控")
+        self.postzero.clicked.connect(self.show_angle_monitor)
+        self.postzero.setToolTip("在当前页查看角度并保存数据")
+        for button in (self.calibrate, self.motor_control, self.postzero):
+            button.setMinimumHeight(46)
+            tasks.addWidget(button, 1)
+        layout.addLayout(tasks)
+        self.calibration_note = _label("标定写入硬件零位；标定检查按动画手动摆动；角度监控只读取数据。")
+        layout.addWidget(self.calibration_note)
+        self.feedback = _label()
+        layout.addWidget(self.feedback)
+
+        monitor_header = QHBoxLayout()
+        monitor_header.addWidget(_label("角度监控", "sectionTitle"))
+        monitor_header.addStretch()
+        self.monitor_source = QComboBox()
+        self.monitor_source.addItem("采集端关节角度 · 实时", "reported")
+        self.monitor_source.addItem("电机原始角度 · 采样", "motor")
+        self.monitor_source.setAccessibleName("角度监控数据来源")
+        monitor_header.addWidget(self.monitor_source)
+        layout.addLayout(monitor_header)
+        self.monitor_stack = QStackedWidget()
+        reported = QWidget()
+        reported_layout = QVBoxLayout(reported)
+        reported_layout.setContentsMargins(0, 0, 0, 0)
+        self.monitor_stack.addWidget(reported)
+        layout.addWidget(self.monitor_stack, 1)
         toolbar = QHBoxLayout()
         toolbar.addWidget(_label("显示单位"))
         self.unit = QComboBox()
@@ -140,11 +174,11 @@ class JointInspectionPanel(QWidget):
         self.dof.currentIndexChanged.connect(self.render)
         toolbar.addWidget(self.dof)
         toolbar.addStretch()
-        layout.addLayout(toolbar)
+        reported_layout.addLayout(toolbar)
         self.summary = _label("等待位置数据")
-        layout.addWidget(self.summary)
+        reported_layout.addWidget(self.summary)
         self.data_status = _label()
-        layout.addWidget(self.data_status)
+        reported_layout.addWidget(self.data_status)
         self.table = QTableWidget(0, 6)
         self.table.setMinimumHeight(300)
         self.table.setAccessibleName("关节当前位置、参考位置、有符号偏差与接收新鲜度")
@@ -153,7 +187,7 @@ class JointInspectionPanel(QWidget):
         self.table.verticalHeader().hide()
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
-        layout.addWidget(self.table, 1)
+        reported_layout.addWidget(self.table, 1)
         actions = QHBoxLayout()
         self.save = QPushButton("保存当前为参考…")
         self.save.clicked.connect(self.save_current)
@@ -166,62 +200,11 @@ class JointInspectionPanel(QWidget):
             button.setObjectName("secondary")
             actions.addWidget(button)
         actions.addStretch()
-        layout.addLayout(actions)
+        reported_layout.addLayout(actions)
         self.reference_label = _label("未加载参考。参考姿态只保存在电脑，不写入电机。")
-        layout.addWidget(self.reference_label)
-        self.feedback = _label()
-        layout.addWidget(self.feedback)
-        motor_control = QFrame()
-        motor_control.setObjectName("healthBanner")
-        motor_layout = QHBoxLayout(motor_control)
-        motor_text = QVBoxLayout()
-        motor_text.addWidget(_label("电机使能与轨迹 · 独立真机控制", "sectionTitle"))
-        motor_text.addWidget(_label(
-            "连接后核对24/28台物理电机配置，现场确认后单独使能、运行HMI轨迹。"
-            "支持实时角度与力矩、停止并失能；不会自动搜索限位。"
-        ))
-        motor_layout.addLayout(motor_text, 1)
-        self.motor_control = QPushButton("打开电机控制…")
-        self.motor_control.setMinimumHeight(44)
-        self.motor_control.clicked.connect(self.open_motor_control)
-        motor_layout.addWidget(self.motor_control)
-        layout.addWidget(motor_control)
-        calibration = QFrame()
-        calibration.setMinimumHeight(88)
-        calibration.setObjectName("healthBanner")
-        calibration_layout = QHBoxLayout(calibration)
-        calibration_text = QVBoxLayout()
-        calibration_text.addWidget(_label("整机硬件标零 · 独立交互操作", "sectionTitle"))
-        self.calibration_note = _label()
-        calibration_text.addWidget(self.calibration_note)
-        calibration_layout.addLayout(calibration_text, 1)
-        self.calibrate = QPushButton("查看标定流程…")
-        self.calibrate.setMinimumHeight(44)
-        self.calibrate.clicked.connect(self.open_calibration)
-        calibration_layout.addWidget(self.calibrate)
-        layout.addWidget(calibration)
-        postzero = QFrame()
-        postzero.setObjectName("healthBanner")
-        postzero_layout = QHBoxLayout(postzero)
-        postzero_text = QVBoxLayout()
-        postzero_text.addWidget(_label("电机反馈观测 · 标零后角度复查", "sectionTitle"))
-        postzero_text.addWidget(_label(
-            "已有运控使能后，默认只监听24/28台电机返回帧；另可选择独立位置查询进行静态复查。"
-            "记录保存在电脑，不会自动使能或运动到限位。无需先保存ROS参考姿态。"
-        ))
-        postzero_layout.addLayout(postzero_text, 1)
-        self.postzero = QPushButton("打开角度复查…")
-        self.postzero.setMinimumHeight(44)
-        self.postzero.clicked.connect(self.open_postzero)
-        postzero_layout.addWidget(self.postzero)
-        layout.addWidget(postzero)
-        self.limit_analysis = LimitAnalysisPanel(self)
-        layout.addWidget(self.limit_analysis)
-        layout.addWidget(_label(
-            "位置来自已有 /joint_states；只切换显示、保存或比较不会发送控制指令。"
-            "接收新鲜不代表电机硬件反馈已验证；逻辑关节角度不等于电机轴原始角度。"
-            "偏差 = 当前 − 参考，不折返角度，不是跟踪 RMS，也不自动判定标定通过。"
-        ))
+        reported_layout.addWidget(self.reference_label)
+        reported_layout.addWidget(_label("逻辑关节角度来自 /joint_states；缺失或过期显示未知。参考文件保存在电脑，不修改零位。"))
+        self.monitor_source.currentIndexChanged.connect(self.select_monitor_source)
         scroll.setWidget(content)
         outer.addWidget(scroll)
         self.timer = QTimer(self)
@@ -274,21 +257,38 @@ class JointInspectionPanel(QWidget):
                 self.feedback.setText("上一次电机控制会话仍在断开，请稍后重试。")
                 return
             self.motor_control_dialog.deleteLater()
-        self.motor_control_dialog = MotorControlDialog(self.calibration_context, self.connection_context, self)
+        self.motor_control_dialog = ManualCalibrationDialog(self.calibration_context, self.connection_context, self)
+        self.manual_dialog_created.emit(self.motor_control_dialog)
+        self.feedback.clear()
         self.motor_control_dialog.show()
 
+    def show_angle_monitor(self):
+        self.monitor_source.setFocus()
+
+    def select_monitor_source(self):
+        if self.monitor_source.currentData() == "motor":
+            self.open_postzero()
+        else:
+            if self.postzero_dialog and self.postzero_dialog.worker and self.postzero_dialog.worker.isRunning():
+                self.postzero_dialog.stop_capture()
+            self.monitor_stack.setCurrentIndex(0)
+
     def open_postzero(self):
-        if self.postzero_dialog and self.postzero_dialog.isVisible():
-            self.postzero_dialog.raise_()
-            self.postzero_dialog.activateWindow()
+        # Both angle sources share this page; opening a source never starts capture.
+        if self.monitor_source.currentData() != "motor":
+            self.monitor_source.setCurrentIndex(self.monitor_source.findData("motor"))
             return
-        if self.postzero_dialog:
-            if not self.postzero_dialog.shutdown():
-                self.feedback.setText("上一次复查仍在关闭连接，请稍后重试。")
-                return
-            self.postzero_dialog.deleteLater()
-        self.postzero_dialog = PostzeroDialog(self.calibration_context, self.connection_context, self)
-        self.postzero_dialog.mode.currentIndexChanged.connect(self.warn_active_query)
+        if self.postzero_dialog is None:
+            self.postzero_dialog = PostzeroDialog(self.calibration_context, self.connection_context, self, embedded=True)
+            self.postzero_dialog.mode.currentIndexChanged.connect(self.warn_active_query)
+            self.monitor_stack.addWidget(self.postzero_dialog)
+        elif not (self.postzero_dialog.worker and self.postzero_dialog.worker.isRunning()):
+            try:
+                self.postzero_dialog.launch_context()
+            except ValueError as error:
+                self.postzero_dialog.invalidate(str(error))
+        self.monitor_stack.setCurrentWidget(self.postzero_dialog)
+        self.postzero_dialog.timer.start(250)
         self.postzero_dialog.show()
 
     def warn_active_query(self):
@@ -341,7 +341,13 @@ class JointInspectionPanel(QWidget):
             f"接收新鲜位置 {fresh} / {pose['joint_count']} · 原始接收时间 {pose['sampled_at'] or '未知'}"
             + (f" · 最大姿态偏差 {format_angle(max(deviations), unit)} {symbol}" if deviations else "")
         )
-        self.data_status.setText("；".join(pose["issues"]) if pose["issues"] else "位置完整，接收年龄在1秒内；可保存为观察参考。")
+        issues = "；".join(pose["issues"])
+        self.data_status.setText(
+            "请先在设备设置连接机器人。" if not pose["robot_id"] else
+            "部分角度缺失或已过期，详见表格；完整有效时可保存参考。" if issues else
+            "位置完整，可保存为观察参考。"
+        )
+        self.data_status.setToolTip(issues)
         self.table.setHorizontalHeaderLabels([
             "索引 / 上报名称", f"当前 / {symbol}", f"参考 / {symbol}",
             f"当前 − 参考 / {symbol}", "接收年龄 / ms", "数据状态",
@@ -376,10 +382,6 @@ class JointInspectionPanel(QWidget):
             )
         else:
             self.reference_label.setText("未加载参考。参考姿态只保存在电脑，不写入电机。")
-        self.calibration_note.setText(
-            "不要求先取得角度或保存参考；在独立流程核对24/28关节机型和机器人配置。"
-            "确认后会使能电机、发送阻尼指令并写硬件零位，须现场核对接线、支撑和机械摆位。"
-        )
 
     def save_current(self):
         pose = self.pose()

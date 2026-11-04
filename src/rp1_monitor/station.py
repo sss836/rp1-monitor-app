@@ -1,4 +1,4 @@
-"""PC SSH/relay and recording controls with PostgreSQL history; no robot control."""
+"""PC SSH/relay, recordings, and native motor parameter maintenance."""
 
 import fcntl
 import hmac
@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated
 
@@ -70,6 +70,14 @@ class DisconnectRequest(BaseModel):
     robot_id: RobotId | None = None
 
 
+class MotorParameterRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    robot_id: RobotId
+    relay_url: str = Field(min_length=10, max_length=256)
+    request: dict = Field(max_length=12)
+    sudo_password: SecretStr = Field(min_length=1, max_length=4096)
+
+
 @dataclass
 class StationConnection:
     tunnel: object
@@ -79,6 +87,7 @@ class StationConnection:
     relay_server: object = None
     relay_thread: object = None
     relay_url: str = ""
+    deploy_lock: object = field(default_factory=threading.Lock)
 
 
 class StationManager:
@@ -262,6 +271,14 @@ class StationManager:
         connection = connection or self._selected_connection()
         if connection is None:
             return
+        if not connection.deploy_lock.acquire(blocking=False):
+            raise ValueError("电机维护尚未结束，不能中断其SSH连接；请等待操作回执")
+        try:
+            self._close_connection(connection)
+        finally:
+            connection.deploy_lock.release()
+
+    def _close_connection(self, connection):
         if connection.relay_server:
             connection.relay_server.should_exit = True
             if connection.relay_thread:
@@ -278,6 +295,47 @@ class StationManager:
                 del self.connections[robot_id]
             if self.selected_robot_id == robot_id:
                 self.selected_robot_id = next(reversed(self.connections), None)
+
+    def _deploy_connection(self, robot_id, relay_url):
+        connection = self.connections.get(robot_id)
+        if (not connection or connection.relay_url != relay_url or connection.identity.get("source_kind") != "ros2"
+                or not connection.tunnel or not connection.tunnel.transport.is_active()
+                or parse_ssh_target(connection.target)[0] != "robo"):
+            raise ValueError("所选机器人没有对应的已认证SSH连接，未发送启动命令")
+        return connection
+
+    def deploy_connection(self, robot_id, relay_url):
+        from .factory_client import FactoryClient
+
+        with self.state_lock:
+            connection = self._deploy_connection(robot_id, relay_url)
+            tunnel, target = connection.tunnel, connection.target
+        identity = FactoryClient(tunnel.url).probe()
+        if identity.get("robot_id") != robot_id or identity.get("source_kind") != "ros2":
+            raise ValueError("已有SSH连接的采集身份已变化，未发送启动命令")
+        channel = tunnel.transport.open_session(timeout=5)
+        try:
+            channel.get_pty(term="xterm", width=120, height=32)
+        finally:
+            channel.close()
+        return dict(robot_id=robot_id, source_kind="ros2", target=target, ssh_reused=True)
+
+    def motor_parameters(self, query):
+        from .motor_parameters import perform
+        from .motor_parameters_remote import validate_request
+
+        request = validate_request(query.request)
+        if request["robot_id"] != query.robot_id:
+            raise ValueError("参数请求机器人身份不匹配")
+        with self.state_lock:
+            connection = self._deploy_connection(query.robot_id, query.relay_url)
+            if not connection.deploy_lock.acquire(blocking=False):
+                raise ValueError("已有电机维护任务进行中，请等待结果")
+        try:
+            context = dict(robot_id=query.robot_id, target=connection.target, tunnel=connection.tunnel)
+            return perform(context, query.sudo_password.get_secret_value(), request)
+        finally:
+            connection.deploy_lock.release()
 
     def disconnect(self, robot_id=None):
         with self.lock:
@@ -454,6 +512,26 @@ def create_station_app(directory, port=DEFAULT_PORT, *, tunnel_factory=None):
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
         return manager.status(robot_id)
+
+    @app.get("/api/v1/station/deploy-connection", dependencies=[Depends(reader)])
+    def deploy_connection(robot_id: RobotId, relay_url: str):
+        try:
+            return manager.deploy_connection(robot_id, relay_url)
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from None
+
+    @app.post("/api/v1/station/motor-parameters", dependencies=[Depends(reader)])
+    def motor_parameters(query: MotorParameterRequest):
+        try:
+            return manager.motor_parameters(query)
+        except (ValueError, OSError) as error:
+            raise HTTPException(409, str(error)) from None
+        except Exception:
+            raise HTTPException(503, "参数操作回执未确认，请重新读取实际值；不会自动重复写入") from None
+
+    @app.post("/api/v1/station/deploy-launches", dependencies=[Depends(reader)])
+    def deploy_launch_disabled():
+        raise HTTPException(410, "上位机策略启动已移除，请到机器人端手动启动deploy；本页仅记录和读取测试数据")
 
     return app
 

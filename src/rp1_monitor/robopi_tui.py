@@ -35,6 +35,10 @@ PASSIVE_PLUGINS = {
     "RP029": "串口设备清单",
     "RP034": "板卡序列号",
 }
+# Audited plugin versions, separate from the TUI package/report version.
+# TUI 1.1.2 adds USB serial evidence in RP013 1.1; its schema remains 3.
+PLUGIN_VERSIONS = {identity: ("1.0",) for identity in PASSIVE_PLUGINS}
+PLUGIN_VERSIONS["RP013"] = ("1.0", "1.1")
 PLUGIN_GROUPS = {
     **dict.fromkeys(("RP001", "RP002", "RP005", "RP034"), "主机与版本"),
     **dict.fromkeys(("RP003", "RP007", "RP008"), "通信与 IMU"),
@@ -50,7 +54,7 @@ PLUGIN_NOTES = {
     "RP008": "检查 HiPNUC 的设备命名规则，不发送 IMU 寄存器查询，不证明数据有效。",
     "RP011": "读取已枚举的 USB 设备和速率，不复位设备。",
     "RP012": "仅适用于配有 USB 3.0 扩展坞的配置；不适用时保留原插件结果。",
-    "RP013": "检查 GSUSB 驱动绑定及 CAN 接口，前置 RP012；不验证 CAN 通信。",
+    "RP013": "检查 GSUSB 驱动绑定及 CAN 接口；新版同时显示 USB 序列号，不验证 CAN 通信。",
     "RP020": "核对 BMS 类型、端口配置和设备是否存在，不主动测试通信。",
     "RP021": "读取已有 BMS 服务及近期日志，前置 RP020，不重启服务。",
     "RP022": "按需读取并保留版本，前置 RP021、RP020；每个子进程受 192 MiB 地址空间上限约束，失败不自动重试。",
@@ -72,7 +76,7 @@ def check_metadata(item):
         item.get("id") not in PASSIVE_PLUGINS
         or item.get("safety") != "passive"
         or item.get("kind", "test") != "test"
-        or item.get("version") != "1.0"
+        or item.get("version") not in PLUGIN_VERSIONS.get(item.get("id"), ())
         or item.get("lifecycle") not in {"testing", "official"}
         or "csharp" not in item.get("clients", [])
     ):

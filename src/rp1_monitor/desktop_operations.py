@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
+from uuid import uuid4
 
 import httpx
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
@@ -28,9 +29,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .board_check_view import board_check_view
 from .capabilities import evaluate_capabilities
 from .desktop_chat import CHAT_STYLE, ChatInput, ChatMessage, message_row, text_label
 from .desktop_models import ModelDialog
+from .factory_board_profile import BoardTestProfile, default_board_profile, factory_board_view
 from .health_view import build_health
 from .operations_client import validate_url
 from .profiles import RobotProfile
@@ -651,21 +654,26 @@ class OperationsPanel(QWidget):
 
 
 class BoardDiagnosticsPanel(QWidget):
-    """Robot-scoped, explicit TUI checks; refreshing never starts a plugin."""
+    """Robot-scoped basic checks; refreshing never starts a test or service."""
+
+    run_requested = Signal(object)
+    report_ready = Signal(object)
 
     def __init__(self, source_url):
         super().__init__()
-        from .robopi_tui import PASSIVE_PLUGINS, PLUGIN_GROUPS, PLUGIN_NOTES
+        from .factory_basic_checks import BASIC_CHECKS, BASIC_GROUPS, BASIC_NOTES
+        from .robopi_tui import PASSIVE_PLUGINS
 
         self.source_url = source_url
         self.plugins = {
             identity: title
-            for group in dict.fromkeys(PLUGIN_GROUPS.values())
-            for identity, title in PASSIVE_PLUGINS.items()
-            if PLUGIN_GROUPS[identity] == group
+            for group in dict.fromkeys(BASIC_GROUPS.values())
+            for identity, title in BASIC_CHECKS.items()
+            if BASIC_GROUPS[identity] == group
         }
-        self.groups = PLUGIN_GROUPS
-        self.notes = PLUGIN_NOTES
+        self.groups = BASIC_GROUPS
+        self.notes = BASIC_NOTES
+        self.supported_checks = set(PASSIVE_PLUGINS)
         self.robot_id = None
         self.source_kind = None
         self.connected = False
@@ -674,7 +682,17 @@ class BoardDiagnosticsPanel(QWidget):
         self.enabled = False
         self.running = False
         self.reports = {}
+        self._pending_run = None
         self._cooldown_until = 0.0
+        self.factory_profile = default_board_profile().model_dump(mode="json")
+        self.profile_saver = None
+        self.profile_dialog = None
+        self.batch_queue = []
+        self.batch_active = False
+        self.batch_current = None
+        self.batch_context = None
+        self.round_reports = None
+        self.round_previous_ids = {}
         self.setObjectName("boardPanel")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(
@@ -699,13 +717,34 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
         layout.addWidget(text_label("硬件自检", "boardTitle"))
         layout.addWidget(
             text_label(
-                "直接调用机器人已安装的 RoboPi TUI 被动插件。只在点击运行后执行单项检查；读取报告不会自动运行。",
+                "按内置主控标准显示逐项结果；异常项给出原因和处理建议，原始证据可按需展开。",
                 "welcomeCopy",
             )
         )
         self.summary = text_label("未检查 · 结果未知", "boardSummary")
         self.summary.setAccessibleName("各项硬件自检结果汇总")
         layout.addWidget(self.summary)
+        standards = QHBoxLayout()
+        self.profile_note = text_label(self.factory_profile["name"], "chatMuted")
+        standards.addWidget(self.profile_note, 1)
+        self.profile_button = QPushButton("设置主控测试标准")
+        self.profile_button.setMinimumHeight(40)
+        self.profile_button.clicked.connect(self.edit_board_profile)
+        standards.addWidget(self.profile_button)
+        layout.addLayout(standards)
+        archive = QHBoxLayout()
+        self.factory_sn = QLineEdit()
+        self.factory_sn.setPlaceholderText("输入整机SN，关联已经完成的自检")
+        self.factory_sn.setAccessibleName("硬件自检归档SN")
+        archive.addWidget(self.factory_sn, 1)
+        self.factory_sync = QPushButton("将当前自检结果保存到此SN")
+        archive.addWidget(self.factory_sync)
+        layout.addLayout(archive)
+        self.factory_save_note = text_label(
+            "未关联工厂SN。已有结果可直接保存，无需重测；会保留各项原来的时间和结论。",
+            "chatMuted",
+        )
+        layout.addWidget(self.factory_save_note)
         actions = QHBoxLayout()
         actions.setSpacing(10)
         self.select = QComboBox()
@@ -713,9 +752,9 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
         self.select.setMinimumContentsLength(12)
-        self.select.setAccessibleName("选择单项 RoboPi TUI 被动检查")
+        self.select.setAccessibleName("选择单项基础自检")
         for identity, title in self.plugins.items():
-            self.select.addItem(f"{identity} · {title}", identity)
+            self.select.addItem(f"{identity} · {title}" if identity.startswith("RP") else title, identity)
         actions.addWidget(self.select, 1)
         self.refresh = QPushButton("读取状态 / 历史报告")
         self.run = QPushButton("运行所选单项")
@@ -724,7 +763,19 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
             button.setMinimumHeight(40)
             button.clicked.connect(lambda checked=False, a=action: self.request(a))
             actions.addWidget(button)
+        self.run_all = QPushButton("一键执行17项基础自检")
+        self.run_all.setObjectName("contextAction")
+        self.run_all.setMinimumHeight(40)
+        self.run_all.clicked.connect(self.start_batch)
+        actions.addWidget(self.run_all)
         layout.addLayout(actions)
+        batch = QHBoxLayout()
+        self.batch_status = text_label("17项＝原14项＋IMU连续数据、固件版本＋BMS重启恢复；IMU版本发送读取请求，BMS项会重启服务，结果保存到当前SN。", "chatMuted")
+        batch.addWidget(self.batch_status, 1)
+        self.stop_batch_button = QPushButton("停止后续检查")
+        self.stop_batch_button.clicked.connect(lambda: self.stop_batch("已停止后续检查；已发起的单项完成后仍会保存结果。"))
+        batch.addWidget(self.stop_batch_button)
+        layout.addLayout(batch)
         self.selection_note = text_label("", "chatMuted")
         self.selection_note.setAccessibleName("所选检查说明与限制")
         layout.addWidget(self.selection_note)
@@ -735,8 +786,8 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
         content.setSpacing(16)
         self.table = QTableWidget(0, 5)
         self.table.setObjectName("boardChecks")
-        self.table.setAccessibleName("按组展示的十四项硬件检查及最近结果")
-        self.table.setHorizontalHeaderLabels(["分组", "检查项目", "最近结论", "完成时间", "来源"])
+        self.table.setAccessibleName("按组展示的基础自检及最近结果")
+        self.table.setHorizontalHeaderLabels(["分组", "检查项目", "测试结果", "结果说明", "完成时间"])
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -745,8 +796,10 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
         self.table.verticalHeader().hide()
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
-        for column, width in ((0, 82), (1, 220), (2, 120), (3, 140), (4, 116)):
+        for column, width in ((0, 82), (1, 205), (2, 85), (3, 280), (4, 130)):
             self.table.setColumnWidth(column, width)
+        self.table.horizontalHeader().setStretchLastSection(False)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.table.setMinimumWidth(0)
         self.table.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         content.addWidget(self.table, 4)
@@ -756,10 +809,22 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
         self.details = QPlainTextEdit()
         self.details.setObjectName("boardDetails")
         self.details.setReadOnly(True)
-        self.details.setAccessibleName("所选检查的来源、完成时间及原始证据")
+        self.details.setAccessibleName("所选检查的中文结果、实际读数及处理建议")
         self.details.setMinimumWidth(0)
         self.details.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         detail.addWidget(self.details, 1)
+        self.raw_toggle = QPushButton("展开原始证据（排查用）")
+        self.raw_toggle.setCheckable(True)
+        self.raw_toggle.setMinimumHeight(40)
+        self.raw_toggle.toggled.connect(self._toggle_raw_evidence)
+        detail.addWidget(self.raw_toggle)
+        self.raw_details = QPlainTextEdit()
+        self.raw_details.setReadOnly(True)
+        self.raw_details.setAccessibleName("原始TUI报告，仅在展开后显示")
+        self.raw_details.setMaximumHeight(190)
+        self.raw_details.hide()
+        self._raw_identity = None
+        detail.addWidget(self.raw_details)
         content.addLayout(detail, 2)
         layout.addLayout(content, 1)
         layout.addWidget(
@@ -786,6 +851,8 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
         self.cooldown.setInterval(250)
         self.cooldown.timeout.connect(self._update_controls)
         self.select.currentIndexChanged.connect(self._selection_changed)
+        self.select.currentIndexChanged.connect(self._update_controls)
+        self.factory_sn.textChanged.connect(self._update_controls)
         self.table.currentCellChanged.connect(self._table_selected)
         self._render_table()
         self._selection_changed()
@@ -800,14 +867,27 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
         ):
             return
         self.generation += 1
+        if self.batch_active:
+            self.stop_batch("连接或机器人身份已变化，本轮停止；重连不会自动重新执行。")
+        identity_changed = bool(robot_id) and (robot_id != self.robot_id or source_kind not in (None, self.source_kind))
+        if identity_changed:
+            self._pending_run = None
+            self.factory_save_note.setText("已切换机器人。新检查按上方SN归档；请核对SN，现有历史快照需手动关联。")
+        elif not connected and self._pending_run:
+            if self._pending_run.get("job_id"):
+                self.factory_save_note.setText(self.factory_save_note.text() + "\n连接中断；本次归属保留，重连后读取状态，匹配任务后自动保存。")
+            else:
+                self._pending_run = None
+                self.factory_save_note.setText("检查请求的响应未确认，未宣称已保存；重连后读取报告，再用上方SN保存已有结果，无需自动重测。")
         self.connected = connected
         self.enabled = False
         self.running = False
         self.poll.stop()
-        if robot_id and (robot_id != self.robot_id or source_kind not in (None, self.source_kind)):
+        if identity_changed:
             self.robot_id = robot_id
             self.source_kind = source_kind
             self.reports.clear()
+            self.round_reports = None
             self.output.clear()
             self._cooldown_until = 0.0
             self._render_table()
@@ -818,6 +898,7 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
             else "连接中断；已有结果为历史快照，当前状态未知，不能运行检查"
         )
         self._update_controls()
+
 
     @staticmethod
     def _time(value):
@@ -881,6 +962,8 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
             validated.append((identity, report))
         for identity, report in validated:
             self.reports[identity] = report
+            if self.round_reports is not None and report.get("report_id") and report["report_id"] != self.round_previous_ids.get(identity):
+                self.round_reports[identity] = report
         if latest:
             source = (
                 "模拟数据 · 软件验证"
@@ -912,58 +995,84 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
             raise ValueError("板端来源与当前机器人不一致")
         self._merge_reports(result)
         self.enabled = bool(result.get("enabled")) and self.connected
+        from .factory_basic_checks import BASIC_CHECKS
+        from .robopi_tui import PASSIVE_PLUGINS
+
+        version = result.get("factory_basic_version")
+        self.supported_checks = set(PASSIVE_PLUGINS)
+        if type(version) is int and version >= 1:
+            self.supported_checks.update(("IMU_CONTINUOUS", "BMS_RECOVERY"))
+        if type(version) is int and version >= 2:
+            self.supported_checks.add("IMU_FIRMWARE")
         job = result.get("job") or {}
         self.running = job.get("state") == "running"
         wait = max(0, float(result.get("cooldown_remaining_seconds", 0)))
         self._cooldown_until = max(self._cooldown_until, time.monotonic() + wait)
         self.status.setText(
-            "正在执行指定被动检查；采集继续，完成后只读取报告"
+            "正在执行基础自检；完成后读取并保存结果"
             if self.running
             else job.get("error") or result.get("detail", "板端状态未知")
         )
         if result.get("upload_error"):
             self.status.setText(self.status.text() + "\n" + result["upload_error"])
+        missing = [self.plugins[key] for key in self.plugins if key not in self.supported_checks]
+        if self.enabled and missing:
+            self.status.setText(self.status.text() + f"\n当前采集端支持{len(self.supported_checks)}/{len(BASIC_CHECKS)}项；需更新机器人observer才能执行：" + "、".join(missing) + "。")
         self._render_table()
         self._selection_changed()
         if self.running:
             self.poll.start()
         self._update_controls()
 
-    def _render_table(self):
-        from .robopi_tui import RESULT_LABELS
+        pending = self._pending_run
+        if pending and pending.get("job_id") and job.get("state") == "completed" and job.get("job_id") == pending["job_id"]:
+            identity = pending["plugin_id"]
+            report = self.reports.get(identity)
+            if report and job.get("report_id") == report.get("report_id"):
+                self._pending_run = None
+                self.report_ready.emit({
+                    "token": pending["token"], "robot_id": self.robot_id,
+                    "source_kind": report["source_kind"],
+                    "reports": {key: dict(value) for key, value in self.reports.items()
+                                if value.get("report_id") == job["report_id"]},
+                })
+                if self.batch_active and self.batch_current == identity:
+                    self.batch_current = None
+        elif pending and job.get("job_id") == pending.get("job_id") and job.get("state") == "error":
+            self._pending_run = None
+            if self.batch_active:
+                self.stop_batch("执行器未完成当前检查，本轮停止：" + str(job.get("error", "请核对采集端")))
 
+    def shown_reports(self):
+        return self.reports if self.round_reports is None else self.round_reports
+
+    def _render_table(self):
         self.table.blockSignals(True)
         self.table.setRowCount(len(self.plugins))
+        shown = self.shown_reports()
         for row, (identity, title) in enumerate(self.plugins.items()):
-            report = self.reports.get(identity)
-            result = report["result"] if report else None
-            source = (
-                "模拟数据 · 示例"
-                if report and report["source_kind"] == "simulated"
-                else "ROS 2 · 待验收"
-                if report
-                else "未知"
-            )
+            report = shown.get(identity)
+            view = factory_board_view(identity, report, self.factory_profile, shown)
             values = (
                 self.groups.get(identity, "其他"),
-                f"{identity} · {title}",
-                RESULT_LABELS.get(result, "未检查 · 未知"),
+                f"{identity} · {title}" if identity.startswith("RP") else title,
+                view.label,
+                view.summary,
                 self._time(report["created_at"]).astimezone().strftime("%m-%d %H:%M:%S")
                 if report
                 else "—",
-                source,
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setData(Qt.ItemDataRole.UserRole, identity)
-                item.setToolTip(str(value) if column != 3 or not report else report["created_at"])
+                item.setToolTip(view.text() if column in (2, 3) else str(value))
                 if column == 2:
                     item.setForeground(
                         QColor(
                             "#287568"
-                            if result == "pass"
+                            if view.label == "通过"
                             else "#a4334b"
-                            if result in {"fail", "error"}
+                            if view.label == "不通过"
                             else "#8c601f"
                             if report
                             else "#61738e"
@@ -972,16 +1081,19 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
                 self.table.setItem(row, column, item)
             self.table.setRowHeight(row, 37)
         self.table.blockSignals(False)
-        counts = {
-            key: sum(r["result"] == key for r in self.reports.values())
-            for key in ("pass", "fail", "error", "needs_review", "skip")
-        }
-        unknown = len(self.plugins) - len(self.reports)
-        simulated = any(r["source_kind"] == "simulated" for r in self.reports.values())
+        views = [factory_board_view(key, shown.get(key), self.factory_profile, shown) for key in self.plugins]
+        counts = {label: sum(view.label == label for view in views) for label in ("通过", "不通过", "未完成", "未检查")}
+        simulated = self.source_kind == "simulated" or any(r["source_kind"] == "simulated" for r in shown.values())
         self.summary.setText(
-            ("模拟数据 · 软件验证 ｜ " if simulated else "检查快照 ｜ ")
-            + f"通过 {counts['pass']}    不符合 {counts['fail']}    错误 {counts['error']}    待复核 {counts['needs_review']}    跳过 {counts['skip']}    未检查 {unknown}"
+            ("模拟数据 · 非实机 ｜ " if simulated else "本轮检查 ｜ " if self.round_reports is not None else "机器人检查快照 ｜ ")
+            + f"通过 {counts['通过']}    不通过 {counts['不通过']}    未完成 {counts['未完成']}    未检查 {counts['未检查']}"
         )
+        unchecked = [title for key, title in self.plugins.items() if not shown.get(key)]
+        if 0 < len(unchecked) <= 3:
+            self.summary.setText(self.summary.text() + "\n未检查项目：" + "、".join(unchecked))
+        if self.enabled and len(self.supported_checks) < len(self.plugins):
+            missing = [self.plugins[key] for key in self.plugins if key not in self.supported_checks]
+            self.summary.setText(self.summary.text() + f"\n当前机器人采集端仅支持{len(self.supported_checks)}项；" + "、".join(missing) + "需更新observer后执行，TUI无需修改。")
 
     def _table_selected(self, row, column, *_):
         if row >= 0:
@@ -997,28 +1109,121 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
             self.table.setCurrentCell(row, 1)
         note = self.notes.get(identity, "仅按需运行所选被动检查，不自动重试。")
         self.selection_note.setText(note)
-        self.detail_title.setText(f"{identity} · {self.plugins[identity]}")
-        report = self.reports.get(identity)
+        self.detail_title.setText(f"{identity} · {self.plugins[identity]}" if identity.startswith("RP") else self.plugins[identity])
+        shown = self.shown_reports()
+        report = shown.get(identity)
+        if identity != self._raw_identity:
+            self.raw_toggle.setChecked(False)
+            self._raw_identity = identity
+        self.raw_toggle.setVisible(bool(report))
+        self.raw_details.setPlainText("")
         if not report:
-            self.details.setPlainText(
-                "未检查 · 结果未知\n\n连接采集端并读取状态后，可手动运行所选单项。缺失结果不代表检查通过。"
-            )
+            self.raw_toggle.setChecked(False)
+            self.raw_details.hide()
+            if self.enabled and identity not in self.supported_checks:
+                self.details.setPlainText("测试结果：未检查\n当前机器人采集端不支持本项执行。\n\n处理方式：更新机器人observer后运行本项，TUI无需修改；已有结果保留。")
+            else:
+                self.details.setPlainText(
+                    board_check_view(identity).text() + "\n\n当前结果未知，缺失不代表通过。"
+                )
             return
         source = (
             "模拟数据 · 软件验证"
             if report["source_kind"] == "simulated"
-            else "ROS 2 板端观测 · 待实机验收"
+            else "机器人采集端（ROS 2 来源）"
         )
+        view = factory_board_view(identity, report, self.factory_profile, shown)
         self.details.setPlainText(
-            f"{RESULT_LABELS[report['result']]}\n{source}\n完成时间：{report['created_at']}\nTUI 版本：{report.get('tui_version', '未知')}\n\n"
-            + report["message"]
-            + "\n\n原始证据：\n"
+            view.text()
+            + f"\n\n来源：{source}\n完成时间：{report['created_at']}"
+            + "\n本项结果不代替其他功能或整机出厂结论。"
+        )
+        executor = f"工厂执行器：{report['executor_version']}" if report.get("report_kind") == "factory_check" else f"TUI 版本：{report.get('tui_version', '未知')}"
+        raw_label = "读取成功，合格需对照标准" if identity == "IMU_FIRMWARE" and report["result"] == "pass" else RESULT_LABELS[report["result"]]
+        self.raw_details.setPlainText(
+            f"原始结论：{raw_label}\n{executor}\n"
+            + report["message"] + "\n\n"
             + json.dumps(report.get("details", {}), ensure_ascii=False, indent=2)
         )
+
+    def _toggle_raw_evidence(self, checked):
+        self.raw_details.setVisible(checked)
+        self.raw_toggle.setText("收起原始证据" if checked else "展开原始证据（排查用）")
+
+    def set_board_profile(self, profile):
+        self.factory_profile = BoardTestProfile.model_validate(profile).model_dump(mode="json")
+        self.profile_note.setText(self.factory_profile["name"])
+        self._render_table()
+        self._selection_changed()
+
+    def edit_board_profile(self):
+        from .desktop_board_profile import BoardProfileDialog
+
+        if self.profile_dialog:
+            self.profile_dialog.raise_()
+            return
+        def save(values):
+            if self.profile_saver is None:
+                raise ValueError("本地工厂目录不可用，无法持久保存标准")
+            self.set_board_profile(self.profile_saver(values))
+        dialog = BoardProfileDialog(self.factory_profile, save, self)
+        self.profile_dialog = dialog
+        dialog.finished.connect(lambda: setattr(self, "profile_dialog", None))
+        dialog.open()
+
+    def start_batch(self):
+        from .factory_basic_checks import BASIC_CHECKS
+        from .factory_store import FactoryStore
+
+        if not self.run_all.isEnabled():
+            return
+        try:
+            FactoryStore.validate_sn(self.factory_sn.text().strip())
+        except ValueError as exc:
+            self.status.setText(f"SN无效，未开始检查：{exc}")
+            return
+        self.batch_context = (self.robot_id, self.source_kind, self.factory_sn.text().strip())
+        self.round_previous_ids = {key: value.get("report_id") for key, value in self.reports.items()}
+        self.round_reports = {}
+        self.batch_queue = [identity for identity in BASIC_CHECKS if identity in self.supported_checks]
+        self.batch_current = None
+        self.batch_active = True
+        self._render_table()
+        self._update_controls()
+
+    def stop_batch(self, message):
+        self.batch_active = False
+        self.batch_queue.clear()
+        self.batch_status.setText(message)
+        self._update_controls()
+
+    def _advance_batch(self):
+        if not self.batch_active or self.batch_current or self.busy or self.running or self.poll.isActive() or time.monotonic() < self._cooldown_until:
+            return
+        if (self.robot_id, self.source_kind, self.factory_sn.text().strip()) != self.batch_context:
+            self.stop_batch("SN或机器人身份已变化，本轮停止；已有结果保留原归属。")
+            return
+        if not self.batch_queue:
+            missing_names = [self.plugins[key] for key in self.plugins if key not in self.supported_checks]
+            missing = "当前机器人采集端版本较旧，未执行：" + "、".join(missing_names) + "；需更新采集端。" if missing_names else ""
+            self.stop_batch("基础自检已执行结束；各项结果及缺项见下表。" + missing + "灯板及电机测试另行完成。")
+            return
+        self.batch_current = self.batch_queue.pop(0)
+        self.select.setCurrentIndex(self.select.findData(self.batch_current))
+        self.batch_status.setText(f"本轮已取得 {len(self.round_reports)}/{len(self.plugins)} 项新结果 · 正在检查 {self.plugins[self.batch_current]} · SN：{self.batch_context[2]}")
+        self.request("board_run", batch=True)
 
     def _update_controls(self):
         remaining = max(0, self._cooldown_until - time.monotonic())
         self.refresh.setEnabled(self.connected and not self.busy)
+        self.profile_button.setEnabled(not self.busy and not self.running and not self.batch_active)
+        self.factory_sn.setEnabled(not self.batch_active)
+        self.select.setEnabled(not self.batch_active)
+        self.stop_batch_button.setEnabled(self.batch_active)
+        ready = self.connected and self.enabled and not self.busy and not self.running and not self.poll.isActive() and remaining <= 0
+        self.run_all.setEnabled(ready and not self.batch_active and bool(self.factory_sn.text().strip()))
+        missing_count = len(self.plugins) - len(self.supported_checks)
+        self.run_all.setText(f"一键执行{len(self.supported_checks)}项（另{missing_count}项未支持）" if self.enabled and missing_count else f"一键执行{len(self.plugins)}项基础自检")
         self.run.setEnabled(
             self.connected
             and self.enabled
@@ -1026,24 +1231,36 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
             and not self.running
             and not self.poll.isActive()
             and remaining <= 0
+            and not self.batch_active
+            and self.select.currentData() in self.supported_checks
         )
         self.run.setText(f"冷却 {int(remaining) + 1} 秒" if remaining > 0 else "运行所选单项")
         if remaining > 0 and not self.cooldown.isActive():
             self.cooldown.start()
         elif remaining <= 0:
             self.cooldown.stop()
+        self._advance_batch()
 
-    def request(self, action):
+    def request(self, action, *, batch=False):
         if self.busy or not self.robot_id or not self.connected:
             return
-        if action == "board_run" and not self.run.isEnabled():
+        if action == "board_run" and not self.run.isEnabled() and not (batch and self.batch_active):
             return
+        if action == "board_run" and not batch:
+            self.round_reports = None
+            self._render_table()
+            self._selection_changed()
         body = (
             {"robot_id": self.robot_id, "plugin_id": self.select.currentData()}
             if action == "board_run"
             else None
         )
         worker = OperationWorker(self.source_url(), action, body=body)
+        if body:
+            self._pending_run = {"token": str(uuid4()), "plugin_id": body["plugin_id"]}
+            self.run_requested.emit({
+                **self._pending_run, "robot_id": self.robot_id, "source_kind": self.source_kind,
+            })
         generation = self.generation
         self.busy = True
         self._update_controls()
@@ -1058,9 +1275,14 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
             if not current():
                 return
             if action == "board_run":
+                if batch and not result.get("job_id"):
+                    failed("开始响应缺少任务编号，执行状态未确认；请先读取现有任务状态。")
+                    return
+                if self._pending_run:
+                    self._pending_run["job_id"] = result.get("job_id")
                 self.running = True
                 self._cooldown_until = time.monotonic() + 10
-                self.status.setText("已请求指定被动检查，正在等待报告；不会自动重试执行")
+                self.status.setText("已请求基础自检，正在等待报告；不会自动重试执行")
                 self.poll.start()
             else:
                 try:
@@ -1073,8 +1295,15 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
 
         def failed(message):
             if current():
+                # Losing a GET response does not erase an already acknowledged
+                # job's original SN ownership. A lost POST response is unknown.
+                if action == "board_run" or not (self._pending_run or {}).get("job_id"):
+                    self._pending_run = None
                 self.enabled = False
                 self.running = False
+                self.poll.stop()
+                if self.batch_active:
+                    self.stop_batch("连接或执行请求未确认，本轮停止；重连后先读取状态，已有结果保留。")
                 self.status.setText(
                     message + "\n已有历史结果保留；可读取状态重试，不会自动重新执行检查。"
                 )

@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RP1 URDF 加载中</title>
+<style>
+:root{font-family:Inter,"Noto Sans SC","Microsoft YaHei",sans-serif;color:#253c55;background:#e7edf5;color-scheme:light}*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden}button{font:inherit;color:#334d6c;background:#ffffffdb;border:1px solid #bfcddd;border-radius:7px;padding:7px 11px;cursor:pointer}button:hover{background:#fff;border-color:#527caf}button:focus-visible{outline:2px solid #3976bf;outline-offset:2px}button:disabled{opacity:.5;cursor:default}#stage{position:relative;width:100%;height:100%;min-height:240px;background:radial-gradient(ellipse at 50% 35%,#fbfcfe,#e5edf7 75%)}#canvas{position:absolute;inset:0}canvas{display:block;touch-action:none}#canvas canvas{width:100%;height:100%}#canvas{z-index:0}#top,#bottom{z-index:2}#loading{z-index:3}#fallback{z-index:1}#top{position:absolute;top:12px;left:12px;right:12px;pointer-events:none}.eyebrow{font-size:10px;font-weight:700;letter-spacing:.12em;color:#5a7190;text-transform:uppercase}h1{font-size:15px;line-height:1.3;margin:5px 0;color:#233e60}#side{font-size:11px;color:#5b708d;margin:0}#bottom{position:absolute;left:10px;right:10px;bottom:10px;display:flex;align-items:end;justify-content:space-between;gap:8px}#status{font-size:11px;line-height:1.4;max-width:55%;padding:5px 6px;border-radius:5px;background:#f3f7fbbf}#toolbar{display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end}#toolbar button{font-size:11px;padding:6px 8px}#fallback{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}#fallback img{width:100%;height:100%;object-fit:contain}#fallback[hidden]{display:none}#loading{position:absolute;inset:40% 20px auto;text-align:center;font-size:12px;color:#536b89;pointer-events:none}.badge{display:inline-block;background:#e1ebf8e8;border:1px solid #c4d6ed;color:#345b89;border-radius:4px;padding:3px 5px;font-size:10px;margin-top:6px}@media(max-width:370px){#status{max-width:45%}#toolbar{max-width:52%}}
+</style>
+</head>
+<body>
+<section id="stage" aria-label="RP1 URDF 模型模拟动作，非实测">
+<div id="canvas"></div>
+<div id="fallback" hidden><img src="/models/rp1-urdf-guide.png" alt="RP1 真实 URDF 静态模型；不演示当前关节动作"></div>
+<div id="top"><div class="eyebrow">RP1 / URDF JOINT GUIDE</div><h1 id="joint">选择检查关节</h1><p id="side">银灰为固定结构 · 蓝色为当前关节子链</p><span class="badge">SIMULATED · 非实测姿态</span></div>
+<div id="loading">正在离线加载 RP1 真实模型…</div>
+<div id="bottom"><div id="status" role="status" aria-live="polite">模型动画不参与检查判定</div><nav id="toolbar" aria-label="仅控制模拟模型视图"><button id="pause" disabled>暂停动画</button><button id="reset" disabled>复位视角</button><button id="zoom-in" aria-label="放大模型" disabled>＋</button><button id="zoom-out" aria-label="缩小模型" disabled>−</button></nav></div>
+</section>
+<script type="module" src="/vendor/manual-urdf.bundle.js"></script>
+</body></html>

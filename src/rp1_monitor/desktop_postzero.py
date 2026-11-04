@@ -73,8 +73,11 @@ class PostzeroWorker(QThread):
 
 
 class PostzeroDialog(QDialog):
-    def __init__(self, calibration_context, connection_context, parent=None):
+    def __init__(self, calibration_context, connection_context, parent=None, *, embedded=False):
         super().__init__(parent)
+        self.embedded = embedded
+        if embedded:
+            self.setWindowFlags(Qt.WindowType.Widget)
         self.current_context, self.connection_context = calibration_context, connection_context
         initial = calibration_context()
         self.initial_identity = tuple(initial.get(k) for k in ("robot_id", "source_kind", "stream_id"))
@@ -113,7 +116,13 @@ class PostzeroDialog(QDialog):
         layout.addWidget(self.heading)
         self.identity = _label(f"{initial.get('robot_id') or '尚未连接'} · {connection_context().get('target') or '尚未绑定SSH'}")
         layout.addWidget(self.identity)
+        if embedded:
+            self.heading.hide()
+            self.identity.hide()
+            layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(_label(
+            "读取物理电机原始角度，踝部两台电机分别显示；本次采样保留为快照。"
+            if embedded else
             "本窗口只观测角度，不会使能电机或自动运动到限位。"
             "已有运控使能后，可只监听24/28个物理电机的返回帧，无需 /joint_states。"
             "踝部按两台物理电机分别显示，不换算为URDF关节角度。"
@@ -128,14 +137,14 @@ class PostzeroDialog(QDialog):
         self.mode.setAccessibleName("电机角度读取方式")
         form.addRow("读取方式", self.mode)
         self.dof = QComboBox()
-        for text, value in (("请选择复查机型", None), ("RP1 · 24关节", 24), ("RP1 · 28关节", 28)):
+        for text, value in (("请选择机型" if embedded else "请选择复查机型", None), ("RP1 · 24关节", 24), ("RP1 · 28关节", 28)):
             self.dof.addItem(text, value)
         configured = initial.get("configured_dof")
         if configured in (24, 28):
             self.dof.setCurrentIndex(self.dof.findData(configured))
             self.dof.setEnabled(False)
         self.dof.setAccessibleName("独立角度复查机型")
-        form.addRow("复查机型", self.dof)
+        form.addRow("机型" if embedded else "复查机型", self.dof)
         self.password = QLineEdit()
         self.password.setEchoMode(QLineEdit.EchoMode.Password)
         self.password.setAccessibleName("本次SSH和sudo密码")
@@ -181,7 +190,12 @@ class PostzeroDialog(QDialog):
         self.close_button.clicked.connect(self.reject)
         for button in (self.start, self.stop, self.save, self.close_button):
             actions.addWidget(button)
-        layout.addLayout(actions)
+        if embedded:
+            self.close_button.hide()
+            self.save.setText("保存角度数据…")
+            layout.insertLayout(layout.indexOf(self.table), actions)
+        else:
+            layout.addLayout(actions)
         self.dof.currentIndexChanged.connect(self.model_changed)
         self.mode.currentIndexChanged.connect(self.capture_mode_changed)
         self.password.textChanged.connect(self.refresh)
@@ -191,12 +205,12 @@ class PostzeroDialog(QDialog):
         self.timer.start(250)
         self.refresh()
 
-    def launch_context(self, *, running=False):
+    def launch_context(self, *, running=False, new_capture=False):
         status, connection = self.current_context(), self.connection_context()
         identity = tuple(status.get(k) for k in ("robot_id", "source_kind", "stream_id"))
-        if identity != self.initial_identity or _binding(connection) != self.initial_binding:
+        if not new_capture and (identity != self.initial_identity or _binding(connection) != self.initial_binding):
             raise ValueError("机器人、采集会话或SSH绑定已改变，请重新打开复查。")
-        if status.get("configuration_binding") != self.initial_configuration:
+        if not new_capture and status.get("configuration_binding") != self.initial_configuration:
             raise ValueError("机型配置已改变，请重新核对后打开复查。")
         # Launch needs a fresh preview; a running bounded query tolerates a short relay jitter.
         issues = status.get("issues", [])
@@ -234,25 +248,27 @@ class PostzeroDialog(QDialog):
     def refresh(self):
         running = self.worker is not None and self.worker.isRunning()
         passive = self.mode.currentData() == "passive"
+        new_capture = self.embedded and self._invalidated and not running
         self.heading.setText("电机反馈观测" if passive else "标零后角度复查")
         self.setWindowTitle(self.heading.text())
         try:
-            self.launch_context(running=running)
-            ready, problem = not self._invalidated, ""
+            self.launch_context(running=running, new_capture=new_capture)
+            ready, problem = not self._invalidated or new_capture, ""
         except ValueError as error:
             ready, problem = False, str(error)
         if not ready and running:
             self.invalidate(problem)
         if problem and self.session is None:
-            self.status.setText(problem)
+            self.status.setText("请先在设备设置连接机器人。" if self.embedded and not self.current_context().get("robot_id") else problem)
+            self.status.setToolTip(problem)
         self.start.setText("开始监听已使能反馈" if passive else "读取并复查" if self.reference.isChecked() else "只读取角度")
         self.start.setEnabled(ready and not running and bool(self.password.text()))
         self.stop.setEnabled(running and not self.worker.cancel_event.is_set())
         self.password.setEnabled(not running)
-        self.dof.setEnabled(not running and self.current_context().get("configured_dof") is None)
+        self.dof.setEnabled(not running and (new_capture or self.current_context().get("configured_dof") is None))
         self.mode.setEnabled(not running)
         self.reference.setEnabled(not running and not passive)
-        self.reference.setVisible(not passive)
+        self.reference.setVisible(not passive and not self.embedded)
         self.table.setColumnHidden(2, passive)
         self.table.setColumnHidden(3, passive)
         self.impact.setText(
@@ -270,6 +286,12 @@ class PostzeroDialog(QDialog):
             "机械参考0° · 容差±3° · 每台3次反馈且波动不超过0.5°。"
             "未确认机械姿态时只显示读数。此项复查不代表机械限位或整机标定验收通过。"
         )
+        if self.embedded:
+            self.impact.setText(
+                "只监听已有电机反馈，不发送查询、使能或运动指令。请按原有流程使能电机。" if passive else
+                "每台发送3次低频位置查询，不使能或运动；请先退出其他电机写入工具。"
+            )
+            self.criteria.setText("每台采样3次，缺失显示未知；采样结束后显示快照，不是实时读数。")
         self.save.setEnabled(self.session is not None and not running)
         if self._dirty:
             self._dirty = False
@@ -279,6 +301,13 @@ class PostzeroDialog(QDialog):
         self.refresh()
         if not self.start.isEnabled():
             return
+        if self.embedded and self._invalidated:
+            # Rebinding is explicit at the next read, never on reconnect or source switch.
+            initial = self.current_context()
+            self.initial_identity = tuple(initial.get(k) for k in ("robot_id", "source_kind", "stream_id"))
+            self.initial_configuration = initial.get("configuration_binding")
+            self.initial_binding = _binding(self.connection_context())
+            self._invalidated = False
         connection = self.launch_context()
         dof, session_id = self.dof.currentData(), str(uuid4())
         self.session = PostzeroSession(
@@ -429,8 +458,9 @@ class PostzeroDialog(QDialog):
     def reject(self):
         self.password.clear()
         if self.shutdown():
-            self.timer.stop()
-            super().reject()
+            if not self.embedded:
+                self.timer.stop()
+                super().reject()
 
     def closeEvent(self, event):
         if self.shutdown():

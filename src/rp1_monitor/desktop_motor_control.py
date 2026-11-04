@@ -121,6 +121,8 @@ class MotorControlDialog(QDialog):
         self._close_requested = False
         self._completed = False
         self._failure_reason = ""
+        self._check_stop_reason = ""
+        self._disabled_summary = ""
         self._completion_summary = ""
         self.setObjectName("motorControlDialog")
         self.setWindowTitle("电机使能与标定检查")
@@ -155,6 +157,10 @@ class MotorControlDialog(QDialog):
         connection = connection_context()
         self.identity = _label(f"{connection.get('robot_id') or '尚未绑定机器人'} · {connection.get('target') or '尚未绑定SSH'}")
         outer.addWidget(self.identity)
+        self.check_stop_banner = _label()
+        self.check_stop_banner.setStyleSheet("color:#982e35; background:#fff0f0; border:1px solid #dfb5b9; border-radius:8px; padding:8px;")
+        self.check_stop_banner.hide()
+        outer.addWidget(self.check_stop_banner)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -663,6 +669,8 @@ class MotorControlDialog(QDialog):
         closing = active and self.worker.cancel_event.is_set()
         ready = active and valid and self.metadata is not None and not self._pending and not closing
         confirmed = self.site_ready.isChecked()
+        self.connect_button.setText("重新连接控制会话" if self._failure_reason and not active else "连接控制会话")
+        self.connect_button.setToolTip("在上方SSH / sudo密码框输入本次密码后连接；仅核对配置，不自动使能或恢复运动。")
         self.connect_button.setEnabled(valid and not active and bool(self.password.text()))
         self.enable_button.setEnabled(ready and confirmed and self.state in ("ready", "disabled"))
         self.load_button.setEnabled(not active or (ready and self.state in ("ready", "disabled", "enabled")))
@@ -702,7 +710,9 @@ class MotorControlDialog(QDialog):
                 prepare_message = "本次控制已中止：" + self._failure_reason
                 if self._completion_summary:
                     prepare_message += "\n" + self._completion_summary
-                prepare_message += "\n处理原因后，重新输入密码并连接控制会话；不会自动重连或恢复运动。"
+                prepare_message += "\n处理原因后，在顶部“SSH / sudo密码”输入本次密码，点击“重新连接控制会话”；不会自动使能或恢复运动。"
+            elif self._check_stop_reason:
+                prepare_message = "本次检查已中止：" + self._check_stop_reason + "\n候选记录保留；先保存并核对本次原因，不会自动继续下一组。\n" + prepare_message
             elif not active and self._completion_summary:
                 prepare_message = self._completion_summary + "\n" + prepare_message
             self.prepare_check_hint.setText(prepare_message)
@@ -715,7 +725,9 @@ class MotorControlDialog(QDialog):
             elif self.metadata:
                 self.check_readiness_label.setText("控制端标定检查环境已就绪；仍需现场核对映射、机械参考与本次参数。")
             else:
-                self.check_readiness_label.setText("控制会话未就绪：连接后重新核对机器人映射环境；当前不能执行复位或检查。")
+                recovery = ("处理本次报错后，在顶部“SSH / sudo密码”输入本次密码，再点击“重新连接控制会话”。"
+                            if self._failure_reason else "请在顶部填写SSH / sudo密码并点击“连接控制会话”。")
+                self.check_readiness_label.setText("控制会话未就绪：" + recovery + "连接后核对映射环境，尚未连接时不能执行复位或检查。")
         else:
             self.run_button.setEnabled(ready and confirmed and self.state == "enabled" and self.trajectory is not None and fresh)
         self.continue_check_button.setEnabled(active and valid and confirmed and fresh and not closing
@@ -733,12 +745,22 @@ class MotorControlDialog(QDialog):
         for widget in [*self.parameter_widgets, self.prepare_speed, self.prepare_timeout, self.prepare_tolerance]:
             widget.setEnabled(editable)
         if self._failure_reason:
-            self.status.setText(self._failure_reason + ("\n" + self._completion_summary if self._completion_summary else ""))
+            recovery = ("会话正在结束，请等待重新连接入口可用。" if active else
+                        "恢复：在顶部“SSH / sudo密码”输入本次密码，点击“重新连接控制会话”。连接仅核对配置，不自动使能或恢复运动。")
+            self.status.setText(self._failure_reason + ("\n" + self._completion_summary if self._completion_summary else "")
+                                + "\n" + recovery)
+        elif self._check_stop_reason:
+            suffix = ("控制会话保留。" + self._disabled_summary) if self.state == "disabled" else self._completion_summary
+            self.status.setText("本次检查已中止：" + self._check_stop_reason + ("\n" + suffix if suffix else ""))
+        reason = self._failure_reason or self._check_stop_reason
+        self.check_stop_banner.setText(("本次控制已中止：" if self._failure_reason else "本次检查已中止：") + reason if reason else "")
+        self.check_stop_banner.setVisible(bool(reason))
 
     def model_changed(self):
         self.trajectory = None
         self.trajectory_label.setText("未载入轨迹 · 请按所选机型载入物理电机轨迹")
         self.check_result = None
+        self._check_stop_reason = ""
         self.check_samples = []
         self.check_samples_omitted = 0
         self.check_waiting_review = False
@@ -764,6 +786,8 @@ class MotorControlDialog(QDialog):
         self._check_start_tolerance_deg = None
         self.state, self._pending, self._completed = "connecting", True, False
         self._failure_reason, self._completion_summary = "", ""
+        self._check_stop_reason = ""
+        self._disabled_summary = ""
         password = self.password.text()
         self.password.clear()
         self.worker = MotorControlWorker(connection, password, self.dof.currentData(), self.session_id, self)
@@ -1016,6 +1040,7 @@ class MotorControlDialog(QDialog):
         self.check_samples = []
         self.check_samples_omitted = 0
         self.check_waiting_review = False
+        self._check_stop_reason = ""
         self.check_results_table.setRowCount(0)
         self.worker.commands.put({"command": "check", "plan": plan, "options": options,
                                   "reference_confirmed": True, "mapping_confirmed": True,
@@ -1207,11 +1232,13 @@ class MotorControlDialog(QDialog):
                 "preparing": "正在准备复位或检查交接；可随时停止并失能。",
                 "prepared": "复位目标已发送并保持，未验证实际到位。请现场核对后另行点击开始检查；切换模式前先失能。",
                 "running": "正在运行轨迹。可随时停止并失能。",
-                "disabled": "控制程序已向SDK提交失能指令；物理停止状态请现场确认。",
+                "disabled": "控制端报告失能处理结束；物理停止状态请现场确认。",
                 "stopping": "正在停止轨迹并请求失能，请现场确认。",
                 "fault": "控制程序报告故障，已请求失能；请现场核对电机状态。",
             }
             self.status.setText(messages[state] + (" " + event["message"] if event.get("message") else ""))
+            if state == "disabled":
+                self._disabled_summary = event.get("message") or messages[state]
             if state == "fault" and not self._failure_reason:
                 self._failure_reason = event.get("message") or messages[state]
             if state in ("disabled", "fault", "stopping"):
@@ -1219,7 +1246,7 @@ class MotorControlDialog(QDialog):
         elif kind == "enable_diagnostics":
             motors = event.get("motors")
             statuses = {"fresh": "反馈正常", "missing": "未收到", "stale": "反馈过期",
-                        "disabled": "未返回使能位", "fault": "故障"}
+                        "disabled": "已收到反馈，使能位=0", "fault": "故障"}
             expected = self.metadata.get("motors", []) if self.metadata else []
             if (not isinstance(motors, list) or len(motors) != len(expected) or not expected
                     or any(not isinstance(item, dict) or item.get("index") != row
@@ -1236,8 +1263,27 @@ class MotorControlDialog(QDialog):
                 self._set_cell(self.table, row, 1, "—")
                 self._set_cell(self.table, row, 2, "—")
                 self._set_cell(self.table, row, 3, label)
+                age = motor.get("age_ms")
+                age_text = f"{age:.1f}ms" if type(age) in (int, float) else "未知"
+                details = f"{motor['interface']}/{motor['motor_id']}：{label}；反馈年龄{age_text}"
+                if type(motor.get("raw_byte0")) is int and isinstance(motor.get("raw_hex"), str):
+                    details += f"；Type1 Byte0=0x{motor['raw_byte0']:02x}；原始数据={motor['raw_hex']}"
+                if "enabled_seen" in motor:
+                    details += "；本次发送后曾收到使能位1" if motor["enabled_seen"] else "；本次发送后尚未看到使能位1"
+                for key, title in (("enable_ack", "使能ACK"), ("setting_failure_ack", "通用设置失败ACK（归属未确认）")):
+                    ack = motor.get(key)
+                    if isinstance(ack, dict):
+                        details += f"；{title}={ack['raw_hex']}（{ack['age_ms']:.1f}ms前）"
+                if motor["status"] == "disabled" and "enable_ack" in motor:
+                    label += " · 收到使能ACK" if motor["enable_ack"] else " · 未看到使能ACK"
+                    self._set_cell(self.table, row, 3, label)
+                self.table.item(row, 3).setToolTip(details)
             message = event.get("message")
-            summary = f"使能反馈：{event.get('received_count', 0)} / {event.get('expected_count', len(expected))}台收到新鲜反馈。"
+            fresh_count = sum(motor["status"] not in ("missing", "stale") for motor in motors)
+            enabled_count = sum(motor["status"] == "fresh" for motor in motors)
+            total = event.get("expected_count", len(expected))
+            summary = (f"已收到反馈{event.get('received_count', 0)} / {total}台（含历史缓存）；"
+                       f"250ms内新鲜反馈{fresh_count} / {total}台；有效使能反馈{enabled_count} / {total}台。")
             self.status.setText(summary + (" " + message if isinstance(message, str) else ""))
         elif kind == "feedback":
             positions, torques = event.get("positions_rad"), event.get("torques_nm")
@@ -1327,6 +1373,8 @@ class MotorControlDialog(QDialog):
                 self.on_error("控制端返回了未知标定检查阶段。")
                 return
             self.check_waiting_review = phase == "waiting_review" and event.get("waiting_review") is True
+            if phase == "aborted":
+                self._check_stop_reason = event.get("message") or "控制端未提供具体中止原因，请保存本次检查结果核对。"
             self.state, self._pending = "running", True
             names = {"approach": "接近本组参考姿态", "search": "低速搜索与角度/力矩检测", "confirm_stop": "整组目标已冻结，未验证物理停稳",
                      "retreat": "本组缓退", "confirm_retreat_stop": "回退目标已发送，未验证物理停稳", "confirm_return_stop": "返回目标已发送，未验证物理停稳",
@@ -1372,6 +1420,9 @@ class MotorControlDialog(QDialog):
                     self.check_results_table.setItem(row, column, QTableWidgetItem(str(value)))
             if result.get("phase") in ("complete", "aborted"):
                 self.check_waiting_review = False
+            if result.get("phase") == "aborted":
+                reason = result.get("abort_reason") or result.get("reason")
+                self._check_stop_reason = reason if isinstance(reason, str) and reason else "控制端未提供具体中止原因，请保存本次检查结果核对。"
             if self.check_waiting_review:
                 self.status.setText("本组候选端点记录已返回，等待现场核对后继续下一组；可保存当前记录，不自动判定整机标定通过。")
             else:

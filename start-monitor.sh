@@ -4,7 +4,7 @@ set -euo pipefail
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$project_root"
 mode=${1:-desktop}
-case "$mode" in desktop|web|setup) ;; *) echo '用法：./start-monitor.sh [desktop|web|setup]' >&2; exit 2;; esac
+case "$mode" in desktop|factory|web|setup) ;; *) echo '用法：./start-monitor.sh [desktop|factory|web|setup]' >&2; exit 2;; esac
 if [[ ! -x .venv/bin/python ]]; then
   python3 -m venv --without-pip .venv
 fi
@@ -26,6 +26,8 @@ if [[ "$mode" == setup ]]; then
 elif [[ "$mode" == web ]]; then
   echo '打开只读数据网页；SSH连接与记录配置请在上位机操作。'
   exec .venv/bin/python -m rp1_monitor station --state-dir "$project_root/runtime/station" --port 18980 --background --open-browser
+elif [[ "$mode" == factory ]]; then
+  exec .venv/bin/python -m rp1_monitor desktop --factory --factory-dir "$project_root/runtime/factory" --station-dir "$project_root/runtime/station"
 else
-  exec .venv/bin/python -m rp1_monitor desktop --quick-connect --station-dir "$project_root/runtime/station"
+  exec .venv/bin/python -m rp1_monitor desktop --quick-connect --factory-dir "$project_root/runtime/factory" --station-dir "$project_root/runtime/station"
 fi

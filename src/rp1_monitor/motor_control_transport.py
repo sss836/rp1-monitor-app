@@ -14,11 +14,13 @@ import zlib
 from pathlib import Path
 from uuid import UUID
 
+from .manual_calibration_check import validate_report as validate_manual_report
 from .postzero_reader import CONFIGURATIONS
 from .ssh_transport import parse_ssh_target
 
 PASSWORD_PROMPT = b"RP1_MOTOR_CONTROL_SUDO_PASSWORD:"
-MAX_LINE_BYTES = 64 * 1024
+# Reports retain attempt history (engine bound 8MiB) plus receive evidence.
+MAX_LINE_BYTES = 9 * 1024 * 1024
 MAX_COMMAND_BYTES = 8 * 1024 * 1024
 STOP_TIMEOUT_S = 8.0
 
@@ -31,7 +33,8 @@ def helper_source():
     root = Path(__file__).parent
     sources = []
     for name in ("calibration_runtime", "postzero_reader", "gentle_motion", "torque_estimation",
-                 "motor_trajectory", "calibration_mapping", "preparation_gains", "preparation_control", "calibration_check"):
+                 "motor_trajectory", "calibration_mapping", "preparation_gains", "preparation_control", "calibration_check",
+                 "manual_check_plan", "manual_calibration_check"):
         source = (root / (name + ".py")).read_text(encoding="utf-8")
         sources.append(
             f"module = types.ModuleType({name!r})\n"
@@ -77,7 +80,7 @@ def _numbers(values, dof):
 
 def validate_event(raw, session_id, dof):
     if len(raw) > MAX_LINE_BYTES:
-        raise MotorControlError("控制反馈单行超过64KiB")
+        raise MotorControlError("控制反馈单行超过9MiB")
     try:
         event = json.loads(raw, parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
     except (ValueError, UnicodeError, RecursionError):
@@ -115,6 +118,32 @@ def validate_event(raw, session_id, dof):
     elif kind == "state":
         if event.get("state") not in {"ready", "enabled", "preparing", "prepared", "running", "disabled", "stopping", "fault"}:
             raise MotorControlError("未知电机控制状态")
+    elif kind == "manual_state":
+        try:
+            if str(UUID(event.get("run_id"))) != event.get("run_id"):
+                raise ValueError("run_id")
+            validate_manual_report(event.get("report"), dof)
+            if (type(event.get("damping_kd")) not in (int, float)
+                    or not math.isfinite(event["damping_kd"]) or not 0 <= event["damping_kd"] <= 0.5
+                    or event.get("torque_basis") != "estimated_from_motor_iq"
+                    or event.get("timestamp_basis") != "kernel_so_timestampns"
+                    or type(event.get("sampling_hz")) is not int or event["sampling_hz"] != 50):
+                raise ValueError("source")
+            evidence = event.get("feedback_evidence", [])
+            if not isinstance(evidence, list) or len(evidence) > dof:
+                raise ValueError("evidence")
+            seen = set()
+            for item in evidence:
+                if (not isinstance(item, dict) or type(item.get("index")) is not int
+                        or not 0 <= item["index"] < dof or item["index"] in seen
+                        or type(item.get("kernel_received_ns")) is not int or item["kernel_received_ns"] <= 0
+                        or not isinstance(item.get("raw_hex"), str) or len(item["raw_hex"]) not in (16, 24)
+                        or any(char not in "0123456789abcdef" for char in item["raw_hex"])
+                        or int(item["raw_hex"][:2], 16) >> 5 != 1):
+                    raise ValueError("evidence")
+                seen.add(item["index"])
+        except (ValueError, TypeError, AttributeError, KeyError, OverflowError):
+            raise MotorControlError("人工标定检查结果的来源、参数或逐关节证据无效") from None
     elif kind == "complete":
         if type(event.get("disable_sent")) is not bool or event.get("hardware_stop_verified") is not False:
             raise MotorControlError("控制结束记录无效，不能推断物理停稳")
@@ -143,6 +172,31 @@ def validate_event(raw, session_id, dof):
             if identity in identities:
                 raise MotorControlError("使能反馈诊断电机重复")
             identities.add(identity)
+            if "raw_byte0" in motor or "raw_hex" in motor:
+                byte0, raw_hex = motor.get("raw_byte0"), motor.get("raw_hex")
+                if (type(byte0) is not int or not 0 <= byte0 <= 255
+                        or not isinstance(raw_hex, str) or len(raw_hex) not in (16, 24)
+                        or any(char not in "0123456789abcdef" for char in raw_hex)
+                        or int(raw_hex[:2], 16) != byte0 or byte0 >> 5 != 1
+                        or motor.get("enabled") is not bool(byte0 & 0x10)
+                        or motor.get("fault") != byte0 & 0x07):
+                    raise MotorControlError("逐电机原始使能反馈诊断无效")
+            if "enabled_seen" in motor and type(motor["enabled_seen"]) is not bool:
+                raise MotorControlError("逐电机使能状态历史无效")
+            for key, suffix in (("enable_ack", "0106"), ("setting_failure_ack", "0100")):
+                ack = motor.get(key)
+                if ack is not None and (
+                        not isinstance(ack, dict)
+                        or ack.get("raw_hex") != f"{motor['motor_id']:04x}" + suffix
+                        or type(ack.get("age_ms")) not in (int, float)
+                        or not math.isfinite(ack["age_ms"]) or ack["age_ms"] < 0):
+                    raise MotorControlError("逐电机使能应答诊断无效")
+        for key, expected in (
+            ("fresh_count", sum(row["status"] not in {"missing", "stale"} for row in motors)),
+            ("enabled_count", sum(row["status"] == "fresh" for row in motors)),
+        ):
+            if key in event and (type(event[key]) is not int or event[key] != expected):
+                raise MotorControlError("使能反馈诊断计数与逐电机状态不一致")
     elif kind == "command_rejected":
         rows, tolerance = event.get("rows"), event.get("tolerance_deg")
         if ((event.get("command"), event.get("code")) not in {
@@ -323,7 +377,7 @@ def run_motor_session(connection, password, dof, session_id, on_event, commands,
                     if event["type"] == "complete":
                         result = event
                 if len(buffer) > MAX_LINE_BYTES:
-                    raise MotorControlError("控制反馈单行超过64KiB")
+                    raise MotorControlError("控制反馈单行超过9MiB")
             if result:
                 return result
             if metadata and not cancel_event.is_set() and stopped_at is None:
@@ -334,7 +388,8 @@ def run_motor_session(connection, password, dof, session_id, on_event, commands,
                     value = None
                 if value:
                     if value.get("command") not in {"enable", "disable", "run", "stop",
-                                                     "prepare_check", "check", "continue_check"}:
+                                                     "prepare_check", "check", "continue_check", "manual_check",
+                                                     "manual_pause", "manual_retest", "manual_skip", "manual_confirm_pin"}:
                         raise MotorControlError("桌面控制命令无效")
                     send(value)
                     if value["command"] == "stop":

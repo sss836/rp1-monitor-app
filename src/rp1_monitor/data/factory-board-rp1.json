@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "name": "RP1 主控标准（24/28DOF通用）",
+  "ethernet_interfaces": ["enP4p65s0"],
+  "can_interfaces": {"can0": 72, "can1": 72, "can2": 72, "can3": 72},
+  "can_bitrates": {},
+  "usb_devices": [
+    {"label": "USB-CAN", "vendor_id": "1209", "product_id": "2323", "count": 1, "min_speed_mbps": 480},
+    {"label": "主控USB2 Hub", "vendor_id": "1a40", "product_id": "0101", "count": 1, "min_speed_mbps": 480},
+    {"label": "扩展USB2 Hub", "vendor_id": "05e3", "product_id": "0610", "count": 1, "min_speed_mbps": 480},
+    {"label": "扩展USB3 Hub", "vendor_id": "05e3", "product_id": "0620", "count": 1, "min_speed_mbps": 5000}
+  ],
+  "serial_ports": [],
+  "follow_bms_serial": true,
+  "bms_firmware_versions": [],
+  "imu_firmware_versions": [],
+  "motor_firmware_versions": []
+}

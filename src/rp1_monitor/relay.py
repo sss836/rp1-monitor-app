@@ -558,4 +558,9 @@ class RelayRuntime:
 
 
 def create_relay_app(settings: RelaySettings):
-    return create_preview_app(RelayRuntime(settings), "RP1 Upper-computer Relay")
+    from .factory_proxy import register_factory_proxy_routes
+
+    runtime = RelayRuntime(settings)
+    app = create_preview_app(runtime, "RP1 Upper-computer Relay")
+    register_factory_proxy_routes(app, runtime)
+    return app

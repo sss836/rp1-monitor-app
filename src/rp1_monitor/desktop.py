@@ -54,10 +54,10 @@ _RETIRED_READERS = set()
 
 def pending_desktop_workers():
     """Threads owning only this computer's outstanding preview/HTTP reads."""
-    from . import desktop_operations, desktop_recordings, desktop_thermal
+    from . import desktop_factory, desktop_operations, desktop_recordings, desktop_thermal
 
     workers = set(_PROBES) | set(_RETIRED_READERS)
-    for module in (desktop_operations, desktop_recordings, desktop_thermal):
+    for module in (desktop_factory, desktop_operations, desktop_recordings, desktop_thermal):
         workers.update(module._WORKERS)
     return [worker for worker in workers if isinstance(worker, QThread) and worker.isRunning()]
 
@@ -198,6 +198,8 @@ class MonitorWindow(QMainWindow):
         self.station_request_generation = 0
         self.catalog = []
         self.buffers = defaultdict(lambda: deque(maxlen=600))
+        self.buffer_robot_id = None
+        self._buffer_resume = False
         self.curves = {}
         self.last_received = 0.0
         self.last_frame = None
@@ -1162,7 +1164,10 @@ class MonitorWindow(QMainWindow):
                 url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
                 + "/api/v1/telemetry"
             )
-            self.buffers.clear()
+            if self.buffer_robot_id != identity["robot_id"]:
+                self.buffers.clear()
+            self.buffer_robot_id = identity["robot_id"]
+            self._buffer_resume = True
             if getattr(self, "thermal_dialog", None):
                 self.thermal_dialog.close()
             self.last_frame = None
@@ -1171,6 +1176,9 @@ class MonitorWindow(QMainWindow):
             self.render_health(None)
             self.joint_inspection_panel.mark_disconnected()
             self.operations_panel.mark_disconnected()
+            factory = getattr(self, "factory_panel", None)
+            if factory and hasattr(factory, "mark_disconnected"):
+                factory.mark_disconnected()
             self.source_label.setText("模拟数据 · 非实机" if identity["source_kind"] == "simulated" else "ROS2来源 · 实机待验收")
             self.upload_label.setText("中央上报：等待所选机器人实时数据")
             self.quality_label.setText("所选机器人数据待接入；新鲜度未知")
@@ -1248,6 +1256,7 @@ class MonitorWindow(QMainWindow):
         self.ssh_password.clear()
         self.last_received = 0
         self.last_frame = None
+        self._buffer_resume = True
         self.health_expired = False
         self.connect_button.setEnabled(True)
         self.source_label.setText("来源待确认")
@@ -1259,6 +1268,9 @@ class MonitorWindow(QMainWindow):
         self.joint_inspection_panel.mark_disconnected()
         if hasattr(self, "operations_panel"):
             self.operations_panel.mark_disconnected()
+        factory = getattr(self, "factory_panel", None)
+        if factory and hasattr(factory, "mark_disconnected"):
+            factory.mark_disconnected()
 
     def calibration_connection(self):
         """Use only the selected station's existing binding, never the editable SSH field."""
@@ -1326,10 +1338,18 @@ class MonitorWindow(QMainWindow):
     def on_frame(self, frame):
         self.joint_inspection_panel.set_frame(frame)
         self.operations_panel.set_frame(frame)
+        factory = getattr(self, "factory_panel", None)
+        if factory and hasattr(factory, "set_frame"):
+            factory.set_frame(frame)
         self.last_received = time.monotonic()
         previous = self.last_frame
-        if previous and previous["stream_id"] != frame["stream_id"]:
+        if self.buffer_robot_id != frame["robot_id"]:
             self.buffers.clear()
+            self.buffer_robot_id = frame["robot_id"]
+        elif self._buffer_resume or (previous and previous["stream_id"] != frame["stream_id"]):
+            for buffer in self.buffers.values():
+                if buffer:
+                    buffer.append((buffer[-1][0] + 0.001, np.nan))
         elif previous:
             gap = (
                 datetime.fromisoformat(frame["sampled_at"])
@@ -1340,6 +1360,7 @@ class MonitorWindow(QMainWindow):
                 for buffer in self.buffers.values():
                     buffer.append((before, np.nan))
         self.last_frame = frame
+        self._buffer_resume = False
         self.health_expired = False
         self.render_health(frame)
         upload = frame.get("upload", {})
@@ -1472,6 +1493,9 @@ class MonitorWindow(QMainWindow):
                 self.render_health(None, stale=True)
                 self.joint_inspection_panel.mark_disconnected()
                 self.operations_panel.mark_disconnected()
+                factory = getattr(self, "factory_panel", None)
+                if factory and hasattr(factory, "mark_disconnected"):
+                    factory.mark_disconnected()
                 self.health_expired = True
         elif self.reader and self.last_frame and not self.health_expired:
             self.render_host_cores(
@@ -1489,8 +1513,15 @@ class MonitorWindow(QMainWindow):
         if postzero and not postzero.shutdown():
             event.ignore()
             return
-        execution = self.joint_inspection_panel.limit_analysis.execution_panel
-        if not execution.shutdown():
+        legacy_analysis = getattr(self.joint_inspection_panel, "limit_analysis", None)
+        execution = getattr(legacy_analysis, "execution_panel", None)
+        if execution and not execution.shutdown():
+            event.ignore()
+            return
+        factory_panel = getattr(self, "factory_panel", None)
+        if factory_panel and not factory_panel.shutdown():
+            self.connection_label.setText("正在完成本机日志读写后关闭；机器人记录继续，已保存文件保留")
+            QTimer.singleShot(100, self.close)
             event.ignore()
             return
         if not self._close_connections_stopped:
@@ -1523,18 +1554,27 @@ def _run_desktop(args):
     from .motor_map import MotorMapConfig
 
     station = None
-    if getattr(args, "quick_connect", False):
+    station_error = ""
+    if getattr(args, "quick_connect", False) and not getattr(args, "factory", False):
         from .station import ensure_station
 
-        station = ensure_station(args.station_dir, args.station_port)
+        try:
+            station = ensure_station(args.station_dir, args.station_port)
+        except Exception as exc:
+            station_error = f"电脑后台暂不可用：{type(exc).__name__}；工厂本地导入、曲线和报告仍可使用。"
     app = QApplication.instance() or QApplication([])
     window = AppMonitorWindow(
         args.url,
         motor_map_config=MotorMapConfig.load(args.motor_map),
         thermal_policy=load_central_policy(args.policy),
+        factory_directory=getattr(args, "factory_dir", None),
     )
     window.show()
-    if station:
+    if getattr(args, "factory", False) or station_error:
+        window.navigate(9)
+        if station_error:
+            window.factory_panel.notice.setText(station_error + "\n" + window.factory_panel.notice.text())
+    elif station:
         window.station_url, window.station_token_file = station
         window.connection_mode.setCurrentIndex(2)
         window.ssh_target.setText("ssh robo@192.168.137.250")
@@ -1562,5 +1602,6 @@ def _run_desktop(args):
         worker.requestInterruption()
     for worker in workers:
         worker.wait()
+    window.factory_panel.shutdown()
     window.deleteLater()
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

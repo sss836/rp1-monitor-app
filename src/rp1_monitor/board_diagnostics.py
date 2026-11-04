@@ -1,13 +1,15 @@
-"""Durable board reports and explicit local-only passive check jobs."""
+"""Durable board reports and explicitly requested local factory check jobs."""
 
 import hashlib
 import json
 import math
 import os
 import sqlite3
+import subprocess
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -15,7 +17,8 @@ from fastapi import HTTPException, Query
 from pydantic import BaseModel, ConfigDict
 
 from .diagnostics import canonical_bytes
-from .robopi_tui import PASSIVE_PLUGINS, PLUGIN_GROUPS, BoardReport, TuiRunner
+from .factory_basic_checks import BASIC_CHECKS, BASIC_GROUPS, EXTRA_CHECKS, FactoryCheckReport
+from .robopi_tui import MAX_REPORT_BYTES, PASSIVE_PLUGINS, PLUGIN_GROUPS, BoardReport, TuiRunner
 
 
 def summarize_board_reports(reports):
@@ -71,6 +74,9 @@ class BoardJournal:
             db.execute(
                 "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
+            db.execute("CREATE TABLE IF NOT EXISTS factory_observations (report_id TEXT PRIMARY KEY, sha256 TEXT NOT NULL, payload TEXT NOT NULL)")
+            if "kind" not in {row[1] for row in db.execute("PRAGMA table_info(runs)")}:
+                db.execute("ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'tui'")
             db.execute("INSERT OR IGNORE INTO meta VALUES ('journal_id', ?)", (str(uuid4()),))
 
     @contextmanager
@@ -82,22 +88,46 @@ class BoardJournal:
         finally:
             db.close()
 
-    def append(self, report, db=None):
-        report = BoardReport.model_validate(report).model_dump(mode="json")
+    def append(self, report, db=None, *, observations=None):
+        factory = report.get("report_kind") == "factory_check"
+        model = FactoryCheckReport if factory else BoardReport
+        report = model.model_validate(report).model_dump(mode="json")
         content = canonical_bytes(report)
+        if len(content) > MAX_REPORT_BYTES:
+            raise ValueError("板端报告超过大小限制")
         digest = hashlib.sha256(content).hexdigest()
         if db is None:
             with self.connection() as connection:
-                return self.append(report, connection)
+                return self.append(report, connection, observations=observations)
         old = db.execute(
             "SELECT sha256 FROM runs WHERE report_id=?", (report["report_id"],)
         ).fetchone()
         if old and old[0] != digest:
             raise ValueError("板端报告 ID 冲突，拒绝覆盖原始记录")
         db.execute(
-            "INSERT OR IGNORE INTO runs(report_id,sha256,payload) VALUES (?,?,?)",
-            (report["report_id"], digest, content.decode()),
+            "INSERT OR IGNORE INTO runs(report_id,sha256,payload,kind) VALUES (?,?,?,?)",
+            (report["report_id"], digest, content.decode(), "factory" if factory else "tui"),
         )
+        if observations:
+            if not isinstance(observations, dict):
+                raise ValueError("补充观测格式无效")
+            payload = canonical_bytes(observations)
+            if len(payload) > MAX_REPORT_BYTES:
+                raise ValueError("补充观测超过大小限制")
+            digest = hashlib.sha256(payload).hexdigest()
+            previous = db.execute("SELECT sha256 FROM factory_observations WHERE report_id=?", (report["report_id"],)).fetchone()
+            if previous and previous[0] != digest:
+                raise ValueError("同一报告的补充观测冲突，原始记录保留")
+            db.execute("INSERT OR IGNORE INTO factory_observations VALUES(?,?,?)", (report["report_id"], digest, payload.decode()))
+
+    def observations(self, report_id, db):
+        row = db.execute("SELECT payload,sha256 FROM factory_observations WHERE report_id=?", (report_id,)).fetchone()
+        if row is None:
+            return {}
+        value = json.loads(row[0])
+        if hashlib.sha256(canonical_bytes(value)).hexdigest() != row[1]:
+            raise ValueError("补充观测校验失败")
+        return value
 
     def page(self, after=0):
         with self.connection() as db:
@@ -106,9 +136,17 @@ class BoardJournal:
                 "SELECT sequence,payload,sha256 FROM runs WHERE sequence>? ORDER BY sequence LIMIT 2",
                 (after,),
             ).fetchall()
+            items = []
+            for n, payload, digest in rows:
+                report = self.decode(payload, digest)
+                item = {"sequence": n, "report": report}
+                observations = self.observations(report["report_id"], db)
+                if observations:
+                    item["factory_observations"] = observations
+                items.append(item)
         return {
             "journal_id": identity,
-            "items": [{"sequence": n, "report": self.decode(p, digest)} for n, p, digest in rows],
+            "items": items,
         }
 
     @staticmethod
@@ -121,14 +159,25 @@ class BoardJournal:
     def latest(self):
         with self.connection() as db:
             row = db.execute(
-                "SELECT payload,sha256 FROM runs ORDER BY sequence DESC LIMIT 1"
+                "SELECT payload,sha256 FROM runs WHERE kind='tui' ORDER BY sequence DESC LIMIT 1"
             ).fetchone()
         return self.decode(*row) if row else None
 
     def checks(self):
         with self.connection() as db:
-            rows = db.execute("SELECT payload,sha256 FROM runs ORDER BY sequence DESC")
-            return summarize_board_reports(self.decode(*row) for row in rows)
+            rows = db.execute("SELECT payload,sha256 FROM runs WHERE kind='tui' ORDER BY sequence DESC")
+            checks = summarize_board_reports(self.decode(*row) for row in rows)
+            for check in checks:
+                if check["latest"]:
+                    extra = self.observations(check["latest"]["report_id"], db)
+                    if extra:
+                        check["latest"]["factory_observations"] = extra
+            extras = {}
+            for payload, digest in db.execute("SELECT payload,sha256 FROM runs WHERE kind='factory' ORDER BY sequence DESC"):
+                report = FactoryCheckReport.model_validate(self.decode(payload, digest))
+                extras.setdefault(report.check_id, report.head())
+            checks.extend(dict(id=identity, label=label, group=BASIC_GROUPS[identity], latest=extras.get(identity)) for identity, label in EXTRA_CHECKS.items())
+            return checks
 
     def cursor(self):
         with self.connection() as db:
@@ -153,12 +202,13 @@ class BoardJournal:
             after = cursor["after"]
             for item in page["items"]:
                 sequence = item["sequence"]
-                report = BoardReport.model_validate(item["report"]).model_dump(mode="json")
+                model = FactoryCheckReport if item["report"].get("report_kind") == "factory_check" else BoardReport
+                report = model.model_validate(item["report"]).model_dump(mode="json")
                 if type(sequence) is not int or sequence <= after:
                     raise ValueError("板端报告游标乱序")
                 if (report["robot_id"], report["source_kind"]) != (robot_id, source_kind):
                     raise ValueError("板端报告与上位机绑定身份不一致")
-                self.append(report, db)
+                self.append(report, db, observations=item.get("factory_observations"))
                 after = sequence
             db.execute(
                 "INSERT OR REPLACE INTO meta VALUES ('cursor', ?)",
@@ -170,7 +220,7 @@ class BoardJournal:
             return [
                 self.decode(*row)
                 for row in db.execute(
-                    "SELECT payload,sha256 FROM runs WHERE uploaded=0 ORDER BY sequence LIMIT 2"
+                    "SELECT payload,sha256 FROM runs WHERE uploaded=0 AND kind='tui' ORDER BY sequence LIMIT 2"
                 )
             ]
 
@@ -180,6 +230,37 @@ class BoardJournal:
             if row is None or row[0] != digest:
                 raise ValueError("中央报告确认与本地原始数据不一致")
             db.execute("UPDATE runs SET uploaded=1 WHERE report_id=?", (report_id,))
+
+
+def read_can_interfaces():
+    """Supplement canN-only TUI evidence using a fixed, read-only netlink query."""
+    try:
+        completed = subprocess.run(
+            ["ip", "-j", "-details", "-statistics", "link", "show", "type", "can"],
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        if len(completed.stdout.encode()) > MAX_REPORT_BYTES:
+            raise ValueError("CAN接口查询输出超过大小限制")
+        links = json.loads(completed.stdout)
+        if not isinstance(links, list):
+            raise ValueError("CAN接口查询格式无效")
+        interfaces = []
+        for link in links:
+            info = link.get("linkinfo") or {}
+            if info.get("info_kind") != "can":
+                continue
+            data = info.get("info_data") or {}
+            interfaces.append({
+                "name": link["ifname"], "mtu": link.get("mtu"),
+                "operstate": str(link.get("operstate", "")).lower(),
+                "is_up": "UP" in link.get("flags", []),
+                "can_state": data.get("state"),
+                "bitrate": (data.get("bittiming") or {}).get("bitrate"),
+                "statistics": link.get("stats64", {}),
+            })
+        return {"interfaces": interfaces, "observed_at": datetime.now(timezone.utc).isoformat()}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError) as exc:
+        return {"error": f"补充CAN状态未完成：{str(exc)[:200]}"}
 
 
 class BoardDiagnostics:
@@ -204,18 +285,19 @@ class BoardDiagnostics:
             "enabled": self.runner is not None,
             "job": job,
             "cooldown_remaining_seconds": cooldown,
-            "items": [{"id": key, "label": value} for key, value in PASSIVE_PLUGINS.items()],
+            "items": [{"id": key, "label": value} for key, value in BASIC_CHECKS.items()],
+            "factory_basic_version": 2,
             "latest": self.journal.latest(),
             "checks": self.journal.checks(),
-            "detail": "仅按需运行指定被动检查；不会更新实时曲线或健康阈值"
+            "detail": "支持17项基础自检；IMU版本项发送读取请求，BMS恢复项会重启bms.service。"
             if self.runner
             else "未启用 robopi_TUI；需配置执行器路径，不会自动安装或升级依赖",
         }
 
     def start(self, plugin_id):
-        if plugin_id not in PASSIVE_PLUGINS:
-            raise HTTPException(422, "仅允许指定的被动检查")
-        if self.runner is None:
+        if plugin_id not in BASIC_CHECKS:
+            raise HTTPException(422, "仅允许指定的基础检查")
+        if self.runner is None and plugin_id in PASSIVE_PLUGINS:
             raise HTTPException(503, "未配置 robopi_TUI 执行器")
         with self.lock:
             if self.thread and self.thread.is_alive():
@@ -239,7 +321,24 @@ class BoardDiagnostics:
 
     def _run(self, plugin_id):
         try:
+            if plugin_id in EXTRA_CHECKS:
+                from .factory_basic_runner import run_factory_check
+
+                result = run_factory_check(plugin_id, self.settings.source_kind)
+                report = FactoryCheckReport(
+                    report_id=uuid4(), robot_id=self.settings.robot_id,
+                    source_kind=self.settings.source_kind,
+                    validation_scope="simulated" if self.settings.source_kind == "simulated" else "software_observation_not_hardware_acceptance",
+                    created_at=datetime.now(timezone.utc), check_id=plugin_id, **result,
+                ).model_dump(mode="json")
+                self.journal.append(report)
+                with self.lock:
+                    self.job.update(state="completed", report_id=report["report_id"])
+                return
             raw = self.runner.run(plugin_id)
+            observations = {}
+            if plugin_id == "RP007" and self.settings.source_kind == "ros2":
+                observations["can_interfaces"] = read_can_interfaces()
             report = BoardReport(
                 report_id=raw["run_id"],
                 robot_id=self.settings.robot_id,
@@ -250,7 +349,10 @@ class BoardDiagnostics:
                 else "software_observation_not_hardware_acceptance",
                 board_diagnostics=raw,
             ).model_dump(mode="json")
-            self.journal.append(report)
+            if observations:
+                self.journal.append(report, observations=observations)
+            else:
+                self.journal.append(report)
             with self.lock:
                 self.job.update(state="completed", report_id=report["report_id"])
         except (ValueError, OSError, KeyError, TypeError, AttributeError, sqlite3.Error) as exc:
@@ -290,8 +392,8 @@ def register_board_routes(app, runtime):
 
     @app.post("/api/v1/board-diagnostics/runs", status_code=202)
     def board_run(body: BoardRunRequest) -> dict:
-        if body.robot_id != runtime.settings.robot_id or body.plugin_id not in PASSIVE_PLUGINS:
-            raise HTTPException(422, "机器人身份或被动检查编号无效")
+        if body.robot_id != runtime.settings.robot_id or body.plugin_id not in BASIC_CHECKS:
+            raise HTTPException(422, "机器人身份或基础检查编号无效")
         if getattr(runtime, "role", "") == "upper_computer":
             return runtime.start_board_run(body.model_dump())
         board = getattr(runtime, "board_diagnostics", None)

@@ -6,6 +6,7 @@ from independently verifying that a supported robot has physically stopped.
 """
 
 import argparse
+import errno
 import fcntl
 import hashlib
 import importlib
@@ -26,6 +27,8 @@ try:
     from . import calibration_check as check_logic
     from . import calibration_mapping as joint_mapping
     from . import calibration_runtime as verifier
+    from . import manual_calibration_check as manual_logic
+    from . import manual_check_plan
     from . import motor_trajectory as trajectory
     from . import postzero_reader as reader
     from .gentle_motion import SmoothMove
@@ -36,6 +39,8 @@ except ImportError:  # Explicit modules supplied by the SSH bootstrap.
     import calibration_check as check_logic
     import calibration_mapping as joint_mapping
     import calibration_runtime as verifier
+    import manual_calibration_check as manual_logic
+    import manual_check_plan
     import motor_trajectory as trajectory
     import postzero_reader as reader
     from gentle_motion import SmoothMove
@@ -44,6 +49,7 @@ except ImportError:  # Explicit modules supplied by the SSH bootstrap.
     from torque_estimation import estimate_output_torque
 
 CONTROL_HZ = 50
+SDK_INIT_STEP_S = 0.005  # Verified LRO init_motor normal_sleep_time.
 HEARTBEAT_TIMEOUT_S = 2.0
 FEEDBACK_TIMEOUT_S = 0.25
 SESSION_LIMIT_S = 3600
@@ -137,7 +143,8 @@ class InputPump:
                     self.stop.set()
                 elif name == "disable":
                     self.disable_requested.set()
-                elif name in {"enable", "run", "prepare_check", "check", "continue_check"}:
+                elif name in {"enable", "run", "prepare_check", "check", "continue_check",
+                              "manual_check", "manual_pause", "manual_retest", "manual_skip", "manual_confirm_pin"}:
                     self.commands.put_nowait(command)
                 else:
                     raise ValueError("不支持的电机控制命令")
@@ -175,10 +182,12 @@ def check_other_writers(check_cancel=None):
             continue
         try:
             args = (entry / "cmdline").read_bytes().split(b"\0")
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
+            # /proc may list a PID that exits before cmdline is opened/read.
             continue
         except OSError as error:
-            raise ValueError("无法核对其他电机工具") from error
+            code = errno.errorcode.get(error.errno, "UNKNOWN")
+            raise ValueError(f"无法核对其他电机工具：PID {entry.name}，读取cmdline失败（{code}，errno={error.errno}）") from error
         names = {Path(os.fsdecode(arg)).name for arg in args if arg}
         if names & {"cansend", "cangen", "motor_ota.py", "motors_py_example.py"} or any(
             name.startswith("factory_hmi") for name in names
@@ -193,19 +202,31 @@ class CanFeedback:
         self.motors = motors
         self.connections = {}
         self.values = [None] * len(motors)
+        self.enable_since_ns = [None] * len(motors)
+        self.enabled_seen = [False] * len(motors)
+        self.enable_acks = [None] * len(motors)
+        self.setting_failure_acks = [None] * len(motors)
         self.rejected = {key: 0 for key in (
             "format", "identity", "truncated_or_own_echo", "local_origin",
-            "not_type1", "missing_timestamp", "stale_timestamp", "duplicate_timestamp")}
+            "not_type1", "missing_timestamp", "stale_timestamp", "duplicate_timestamp", "before_enable")}
         self.received_frames = 0
         self.addresses = {(m["interface"], m["motor_id"]): m["index"] for m in motors}
         try:
             for name in dict.fromkeys(m["interface"] for m in motors):
-                self.connections[name] = reader.open_can(name, [
+                self.connections[name] = reader.open_can(name, [0x7FF] + [
                     m["motor_id"] for m in motors if m["interface"] == name
                 ])
         except BaseException:
             self.close()
             raise
+
+    def note_enable_sent(self, index):
+        # SDK sends asynchronously. This is an enqueue boundary, not proof of
+        # CAN delivery; reject older queued evidence but do not infer an ACK.
+        self.enable_since_ns[index] = time.time_ns()
+        self.values[index] = None
+        self.enabled_seen[index] = False
+        self.enable_acks[index] = self.setting_failure_acks[index] = None
 
     def poll(self):
         for name, connection in self.connections.items():
@@ -220,11 +241,8 @@ class CanFeedback:
                     self.rejected["format"] += 1
                     continue
                 can_id, length = struct.unpack_from("=IB", packet)
-                index = self.addresses.get((name, can_id))
-                if index is None:
-                    self.rejected["identity"] += 1
-                    continue
-                if length not in (8, 12) or len(packet) < length + 8:
+                is_ack = can_id == 0x7FF
+                if length not in ((4,) if is_ack else (8, 12)) or len(packet) < length + 8:
                     self.rejected["format"] += 1
                     continue
                 if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC | socket.MSG_CONFIRM):
@@ -235,7 +253,11 @@ class CanFeedback:
                     continue
                 payload = packet[8:8 + length]
                 stamp = reader.kernel_timestamp(ancillary)
-                if payload[0] >> 5 != 1:
+                index = self.addresses.get((name, int.from_bytes(payload[:2], "big") if is_ack else can_id))
+                if index is None:
+                    self.rejected["identity"] += 1
+                    continue
+                if not is_ack and payload[0] >> 5 != 1:
                     self.rejected["not_type1"] += 1
                     continue
                 if stamp is None:
@@ -245,9 +267,25 @@ class CanFeedback:
                 if not 0 <= age <= FEEDBACK_TIMEOUT_S:
                     self.rejected["stale_timestamp"] += 1
                     continue
+                since = self.enable_since_ns[index]
+                if since is not None and stamp <= since:
+                    self.rejected["before_enable"] += 1
+                    continue
                 received = time.monotonic() - age
+                if is_ack:
+                    # 00 is a generic settings failure, including unlock; it
+                    # cannot uniquely identify an enable rejection. Neither ACK
+                    # can replace a fresh, enabled, fault-free Type1 response.
+                    target = (self.enable_acks if payload[2:] == b"\x01\x06" else
+                              self.setting_failure_acks if payload[2:] == b"\x01\x00" else None)
+                    if target is not None and since is not None:
+                        previous = target[index]
+                        if previous is None or received > previous["received"]:
+                            target[index] = dict(received=received, raw_hex=payload.hex())
+                    continue
                 previous = self.values[index]
-                if previous and received <= previous["received"]:
+                if previous and (stamp <= previous["kernel_received_ns"] if "kernel_received_ns" in previous
+                                 else received <= previous["received"]):
                     self.rejected["duplicate_timestamp"] += 1
                     continue
                 motor = self.motors[index]
@@ -256,11 +294,14 @@ class CanFeedback:
                 current_range = (18.0, 32.0, 35.0, 90.0)[motor["model"]]
                 iq = raw_iq / 4095.0 * 2 * current_range - current_range
                 self.values[index] = {
-                    "received": received, "enabled": bool(payload[0] & 16),
+                    "received": received, "kernel_received_ns": stamp, "enabled": bool(payload[0] & 16),
                     "error": payload[0] & 7,
+                    "raw_byte0": payload[0], "raw_hex": payload.hex(),
                     "position": raw_position / 65535.0 * 25.0 - 12.5 + motor["software_offset_rad"],
                     "torque": estimate_output_torque(iq, motor["model"], source_kind="offline")["estimated_torque_nm"],
                 }
+                if since is not None and payload[0] & 16:
+                    self.enabled_seen[index] = True
 
     def snapshot(self, *, require_enabled=True):
         self.poll()
@@ -275,7 +316,7 @@ class CanFeedback:
         if any(value is None or now - value["received"] > FEEDBACK_TIMEOUT_S for value in self.values):
             raise FeedbackUnavailable("电机反馈缺失或超过250ms；" + self.diagnostics()["message"], "missing")
         if require_enabled and not all(value["enabled"] for value in self.values):
-            raise FeedbackUnavailable("部分电机未返回使能状态；" + self.diagnostics()["message"], "disabled")
+            raise FeedbackUnavailable("部分电机未确认使能状态（已收到反馈但使能位为0）；" + self.diagnostics()["message"], "disabled")
         return [v["position"] for v in self.values], [v["torque"] for v in self.values]
 
     def _identity(self, index):
@@ -296,19 +337,35 @@ class CanFeedback:
             rows.append(dict(index=index, interface=motor["interface"], motor_id=motor["motor_id"],
                              status=status, age_ms=age, enabled=None if value is None else value["enabled"],
                              fault=None if value is None else value["error"]))
-        fresh = sum(row["status"] == "fresh" for row in rows)
-        labels = {"missing": "未收到", "stale": "反馈过期", "disabled": "未返回使能位", "fault": "故障"}
-        message = f"有效使能反馈 {fresh}/{len(rows)}"
+            if value is not None and "raw_byte0" in value:
+                rows[-1].update(raw_byte0=value["raw_byte0"], raw_hex=value["raw_hex"])
+            rows[-1]["enabled_seen"] = self.enabled_seen[index]
+            for key, evidence in (("enable_ack", self.enable_acks[index]),
+                                  ("setting_failure_ack", self.setting_failure_acks[index])):
+                rows[-1][key] = (None if evidence is None else dict(
+                    raw_hex=evidence["raw_hex"], age_ms=(now - evidence["received"]) * 1000))
+        received = sum(value is not None for value in self.values)
+        fresh = sum(row["status"] not in {"missing", "stale"} for row in rows)
+        enabled = sum(row["status"] == "fresh" for row in rows)
+        labels = {"missing": "未收到", "stale": "反馈过期", "disabled": "已收到反馈但使能位为0", "fault": "故障"}
+        message = f"已收到反馈 {received}/{len(rows)}；新鲜反馈 {fresh}/{len(rows)}；有效使能反馈 {enabled}/{len(rows)}"
         rejected_labels = {"format": "格式不符", "identity": "身份不符", "truncated_or_own_echo": "截断/自身回显",
                            "local_origin": "本地来源", "not_type1": "非Type1", "missing_timestamp": "无内核时间戳",
-                           "stale_timestamp": "时间戳过期", "duplicate_timestamp": "重复时间戳"}
+                           "stale_timestamp": "时间戳过期", "duplicate_timestamp": "重复时间戳",
+                           "before_enable": "使能发送前的旧帧"}
         rejected = [rejected_labels[key] + str(count) for key, count in self.rejected.items() if count]
         if rejected:
             message += f"；本接收器读帧{self.received_frames}，拒绝" + "、".join(rejected)
         for kind, identities in groups.items():
             if identities:
                 message += "；" + labels[kind] + " " + "、".join(identities)
-        return dict(motors=rows, received_count=sum(v is not None for v in self.values),
+        for row in rows:
+            if row["status"] == "disabled" and self.enable_since_ns[row["index"]] is not None:
+                message += (f"；{row['interface']}/{row['motor_id']}："
+                            + ("收到使能ACK" if row["enable_ack"] else "未看到使能ACK")
+                            + ("，曾收到使能位1后变0" if row["enabled_seen"] else "，尚未看到使能位1")
+                            + ("，观察到通用设置失败ACK（归属未确认）" if row["setting_failure_ack"] else ""))
+        return dict(motors=rows, received_count=received, fresh_count=fresh, enabled_count=enabled,
                     expected_count=len(rows), received_frames=self.received_frames,
                     rejected=dict(self.rejected), message=message[:500])
 
@@ -319,12 +376,14 @@ class CanFeedback:
 
 
 class MotorDriver:
-    """Same SDK enable and per-bus eight-slot MIT dispatch as the reference HMI."""
+    """Existing deploy SDK, with per-bus initialization and eight-slot MIT dispatch."""
 
     def __init__(self, motors):
         self.entries, self.motors, self.feedback = motors, [], None
 
-    def enable(self, control):
+    def enable(self, control, *, damping_kd=0.5):
+        if type(damping_kd) not in (int, float) or not math.isfinite(damping_kd) or not 0 <= damping_kd <= 0.5:
+            raise ValueError("手动阻尼Kd须在0至0.5之间")
         root = Path(reader.ROOT)
         version = "python%d.%d" % sys.version_info[:2]
         site = root / "install/roboparty_motors/lib" / version / "site-packages"
@@ -339,6 +398,7 @@ class MotorDriver:
         sys.path.insert(0, str(site))
         sdk = importlib.import_module("motors_py")
         self.feedback = CanFeedback(self.entries)
+        groups = {}
         for entry in self.entries:
             control.check()
             if control.disable_requested.is_set():
@@ -347,16 +407,43 @@ class MotorDriver:
                 entry["motor_id"], "canfd", entry["interface"], "LRO", entry["model"],
                 16, entry["software_offset_rad"])
             self.motors.append(motor)
-            error_id = motor.init_motor()
-            if type(error_id) is not int or error_id != 0:
-                raise ValueError("电机使能失败：" + entry["interface"] + "/" + str(entry["motor_id"]))
-            motor.set_motor_control_mode(sdk.MotorControlMode.MIT)
+            groups.setdefault(entry["interface"], []).append((entry, motor))
         for task in Path("/proc/self/task").iterdir():
             try:
                 if 0 in os.sched_getaffinity(int(task.name)):
                     raise ValueError("电机SDK线程仍允许运行于CPU0，拒绝继续控制")
             except ProcessLookupError:
                 continue
+        # Deploy creates every object before per-bus init. Python's init_motor
+        # binding holds the GIL through its sleeps, so a Python thread pool would
+        # still serialize all 24/28 motors. Interleave the same public SDK steps
+        # across buses, preserving each bus's one-motor-at-a-time 5ms cadence.
+        def check_init():
+            control.check()
+            if control.disable_requested.is_set():
+                raise StopRequested("使能过程中收到失能请求")
+
+        for ordinal in range(max(map(len, groups.values()))):
+            batch = [group[ordinal] for group in groups.values() if ordinal < len(group)]
+            for phase in ("unlock_motor", "set_motor_control_mode", "lock_motor", "refresh_motor_status"):
+                for entry, motor in batch:
+                    check_init()
+                    if phase == "lock_motor":
+                        self.feedback.note_enable_sent(entry["index"])
+                    if phase == "set_motor_control_mode":
+                        motor.set_motor_control_mode(sdk.MotorControlMode.MIT)
+                    else:
+                        getattr(motor, phase)()
+                    check_init()
+                time.sleep(SDK_INIT_STEP_S)
+                check_init()
+                self.feedback.poll()
+            for entry, motor in batch:
+                check_init()
+                error_id = motor.get_error_id()
+                if type(error_id) is not int or error_id != 0:
+                    raise ValueError("电机使能失败：" + entry["interface"] + "/" + str(entry["motor_id"])
+                                     + f"，SDK故障码 {error_id}")
         # Enable must earn fresh receive evidence; numeric zero is a valid angle.
         deadline = time.monotonic() + 1.0
         last_error = None
@@ -364,16 +451,24 @@ class MotorDriver:
             control.check()
             if control.disable_requested.is_set():
                 raise StopRequested("等待使能反馈时收到失能请求")
-            self.command([0.0] * len(self.entries), kp=0.0, kd=0.5)
+            self.command([0.0] * len(self.entries), kp=0.0, kd=damping_kd)
             time.sleep(1 / CONTROL_HZ)
+            control.check()
+            if control.disable_requested.is_set():
+                raise StopRequested("等待使能反馈时收到失能请求")
             try:
-                return self.feedback.snapshot()
+                result = self.feedback.snapshot()
             except ValueError as error:
                 if isinstance(error, FeedbackUnavailable) and error.kind == "fault":
                     raise
                 last_error = error
+                continue
+            control.check()
+            if control.disable_requested.is_set():
+                raise StopRequested("等待使能反馈时收到失能请求")
+            return result
         detail = str(last_error) if last_error is not None else "未收到反馈"
-        raise ValueError("使能后未取得全部电机的新鲜反馈：" + detail)
+        raise ValueError("使能确认失败：" + detail)
 
     def command(self, positions, *, kp, kd, feedforward=None):
         size = len(self.entries)
@@ -439,6 +534,11 @@ class ControlSession:
         self.check_handoff = None
         self.check_feedforward = None
         self.check_control_context = None
+        self.check_pause_target = self.check_pause_logical = None
+        self.check_pause_motors = set()
+        self.damping_kd = 0.5
+        self.manual_engine = self.manual_mapping = self.manual_logical = None
+        self.manual_run_id = None
 
     def state(self, state, message):
         self.emit({"type": "state", "state": state, "message": message})
@@ -446,7 +546,7 @@ class ControlSession:
     def _holding_gains(self):
         if self.preparation_controller is not None:
             return self.preparation_controller.snapshot()
-        options = self.preparation.options if self.preparation is not None else dict(kp=0.0, kd=0.5)
+        options = self.preparation.options if self.preparation is not None else dict(kp=0.0, kd=self.damping_kd)
         return dict(kp=[options["kp"]] * self.dof, kd=[options["kd"]] * self.dof,
                     feedforward=[0.0] * self.dof)
 
@@ -464,6 +564,10 @@ class ControlSession:
 
     def disable(self):
         self.state("stopping", "正在结束目标发送并发送失能指令")
+        if self.manual_engine is not None:
+            self.manual_engine.interrupt("控制会话结束；本轮记录保留，未完成项目不判通过")
+            self._emit_manual()
+            self.manual_engine = self.manual_mapping = self.manual_logical = None
         if self.check_engine is not None:
             self._check_result("控制结束，保留已读取证据；未完成项目不判通过")
             self.check_engine = None
@@ -475,6 +579,8 @@ class ControlSession:
         self.check_handoff = None
         self.check_feedforward = None
         self.check_control_context = None
+        self.check_pause_target = self.check_pause_logical = None
+        self.check_pause_motors = set()
         self.disable_sent = self.driver.disable()
         self.enabled = False
         self.driver.close()
@@ -487,16 +593,38 @@ class ControlSession:
             if self.enabled:
                 raise ValueError("电机已经使能，不会重复使能")
             try:
-                self.driver.enable(self.control)
+                if "damping_kd" in command:
+                    kd = command["damping_kd"]
+                    if type(kd) not in (int, float) or not math.isfinite(kd) or not 0 <= kd <= 0.5:
+                        raise ValueError("手动阻尼Kd须在0至0.5之间")
+                    self.driver.enable(self.control, damping_kd=kd)
+                    self.damping_kd = kd
+                else:
+                    self.driver.enable(self.control)
+                    self.damping_kd = 0.5
             except BaseException:
                 diagnostic = getattr(self.driver.feedback, "diagnostics", None)
                 if callable(diagnostic):
                     self.emit({"type": "enable_diagnostics", **diagnostic()})
                 raise
             self.enabled, self.disable_sent, self.last_tick = True, False, None
-            self.state("enabled", "已收到全部电机使能反馈；低阻尼模式，不保持站立")
+            self.state("enabled", f"已收到全部电机使能反馈；Kp=0、Kd={self.damping_kd:g}，不保持站立")
+        elif name == "manual_check":
+            self._start_manual(command)
+        elif name in {"manual_pause", "manual_retest", "manual_skip", "manual_confirm_pin"}:
+            if not self.enabled or self.manual_engine is None:
+                raise ValueError("请先开始人工标定检查")
+            if name == "manual_pause":
+                self.manual_engine.pause(command.get("paused"))
+            elif name == "manual_retest":
+                self.manual_engine.retest(command.get("index"))
+            elif name == "manual_confirm_pin":
+                self.manual_engine.confirm_pin(self.clock())
+            else:
+                self.manual_engine.skip()
+            self._emit_manual()
         elif name == "run":
-            if (not self.enabled or self.plan or self.check_engine is not None
+            if (not self.enabled or self.plan or self.check_engine is not None or self.manual_engine is not None
                     or self.preparation is not None or self.check_handoff is not None):
                 raise ValueError("请先使能，且不能重复启动轨迹")
             positions, _ = self.driver.feedback.snapshot()
@@ -537,7 +665,7 @@ class ControlSession:
             raise ValueError("电机控制命令无效")
 
     def _check_inputs(self, command, *, service=None):
-        if (not self.enabled or self.plan or self.check_engine is not None or self.check_handoff is not None
+        if (not self.enabled or self.plan or self.check_engine is not None or self.manual_engine is not None or self.check_handoff is not None
                 or self.preparation is not None and self.preparation.phase != "prepared"):
             raise ValueError("请先使能，且不能同时运行轨迹或标定检查")
         if (command.get("mapping_confirmed") is not True
@@ -564,6 +692,64 @@ class ControlSession:
         positions, torques = self.driver.feedback.snapshot()
         logical, _ = joint_mapping.motor_to_logical(positions, torques, mapping)
         return plan, options, mapping, positions, logical
+
+    def _start_manual(self, command):
+        if (not self.enabled or self.plan or self.check_engine is not None
+                or self.manual_engine is not None and self.manual_engine.phase != "complete"
+                or self.preparation is not None or self.check_handoff is not None):
+            raise ValueError("请先使能，且不能同时运行轨迹或其他检查")
+        if command.get("mapping_confirmed") is not True or command.get("reference_confirmed") is not True:
+            raise ValueError("请先核对关节映射和本次限位参考")
+        plan = manual_check_plan.validate_manual_plan(command.get("plan"), self.dof)
+        self.tick()
+        mapping = joint_mapping.version_bound_mapping(self.dof, self.motors, root=reader.ROOT)
+        self.tick()
+        if plan["joint_names"] != mapping["joint_names"]:
+            raise ValueError("人工检查关节名称与deploy映射不符")
+        engine = manual_logic.ManualCalibrationCheck(plan, command.get("options"))
+        if engine.options.get("torque_required") is not False:
+            raise ValueError("人工检查的力矩只作辅助记录")
+        self.manual_engine, self.manual_mapping = engine, mapping
+        self.manual_logical = None
+        self.manual_run_id = str(uuid4())
+        self._emit_manual()
+
+    def _emit_manual(self):
+        self.emit({"type": "manual_state", "report": self.manual_engine.report(),
+                   "run_id": self.manual_run_id, "damping_kd": self.damping_kd,
+                   "torque_basis": "estimated_from_motor_iq", "timestamp_basis": "kernel_so_timestampns",
+                   "sampling_hz": CONTROL_HZ,
+                   "feedback_evidence": [dict(index=i, kernel_received_ns=value.get("kernel_received_ns"),
+                                              raw_hex=value.get("raw_hex"))
+                                         for i, value in enumerate(self.driver.feedback.values)
+                                         if value is not None]})
+
+    def _tick_manual(self, now, positions, torques):
+        logical, joint_torques = joint_mapping.motor_to_logical(
+            positions, torques, self.manual_mapping, previous=self.manual_logical)
+        if self.manual_logical is None:
+            # First solve ankles without an invented previous pose; their FK
+            # has its own continuity guard. Choose the URDF winding for direct
+            # joints only (shoulder homes cross +/-pi), then track continuously.
+            ranges = self.manual_engine.plan["original_ranges_rad"]
+            for row in self.manual_mapping["rows"]:
+                if row["coupled_side"] is None:
+                    j = row["joint_index"]
+                    middle = sum(ranges[j]) / 2
+                    logical[j] += math.tau * round((middle - logical[j]) / math.tau)
+        self.manual_logical = logical
+        times = [min(self.driver.feedback.values[i]["received"] for i in row["motor_indices"])
+                 for row in self.manual_mapping["rows"]]
+        before = (self.manual_engine.phase, self.manual_engine.current_index)
+        after = self.manual_engine.update(now, logical, joint_torques, sample_times_s=times)
+        # No preparation, search, spring or retreat target exists in this path.
+        self._send_target(positions, kp=0.0, kd=self.damping_kd, feedforward=[0.0] * self.dof)
+        if now - self.last_emit >= 0.2 or before != (after["phase"], after["current_index"]):
+            self.last_emit = now
+            self._emit_manual()
+            self.emit({"type": "feedback", "positions_rad": positions, "torques_nm": torques,
+                       "progress": sum(row["status"] == "passed" for row in after["results"]) / len(after["results"]),
+                       "enabled": self.enabled})
 
     def _start_preparation(self, command):
         if command.get("preparation_confirmed") is not True:
@@ -710,6 +896,8 @@ class ControlSession:
         self.check_target = list(positions if holding_target is None else holding_target)
         self.check_phase, self.check_group = None, None
         self.check_run_id = run_id
+        self.check_pause_target = self.check_pause_logical = None
+        self.check_pause_motors = set()
         self.preparation, self.preparation_mapping = None, None
         self.preparation_phase, self.preparation_target = None, None
         self.preparation_speed_deg_s = None
@@ -843,6 +1031,8 @@ class ControlSession:
 
     def _check_result(self, reason):
         result = self.check_engine.result()
+        if result.get("phase") == "aborted":
+            reason = result.get("abort_reason") or "检查已中止，控制端未提供具体原因"
         result.update(
             source_kind="hardware", run_id=self.check_run_id,
             source_plan_kind="simulated", robot_dof=self.dof,
@@ -871,10 +1061,78 @@ class ControlSession:
             raise ValueError("逻辑关节反馈超过参考范围与本次受限搜索余量")
         phase_before = engine.phase
         step = engine.step(now, logical, joint_torques, feedback_times=self._check_times(mapping, now))
+        grouped_pause = not engine.options["require_pose_settling"]
+        if grouped_pause and phase_before == "transition":
+            self.check_pause_target = self.check_pause_logical = None
+            self.check_pause_motors = set()
+        if grouped_pause and self.check_pause_target is None and (
+                step["phase"] == "confirm_stop" or phase_before == "confirm_stop"):
+            # Include both motors and both logical coordinates of a closed
+            # ankle pair. Partially unloading roll while holding pitch can
+            # leave a spring torque in the supposedly unloaded direction.
+            affected = {i for joint in engine.selected for i in mapping["joint_motor_indices"][joint]}
+            paused = self.check_target[:]
+            for index in affected:
+                paused[index] = positions[index]
+            self.check_pause_target, self.check_pause_motors = paused, affected
+            self.check_pause_logical, _ = joint_mapping.motor_to_logical(
+                paused, [0.0] * self.dof, mapping, previous=logical)
+            engine.targets = self.check_pause_logical[:]
+            step["targets_rad"] = engine.targets[:]
+            if self.check_feedforward is not None:
+                self.check_feedforward = self.check_feedforward[:]
+                for index in affected:
+                    self.check_feedforward[index] = 0.0
+                self.check_control_context["feedforward_unloaded_on_obstruction"] = True
+            self.check_control_context["group_pauses"] = [*self.check_control_context.get("group_pauses", []), {
+                "group": engine.group, "unloaded_motor_indices": sorted(affected),
+                "held_motor_indices": [i for i in range(self.dof) if i not in affected],
+                "commanded_pause_targets_rad": self.check_pause_logical[:],
+            }]
+        if grouped_pause and self.check_pause_target is not None and phase_before == "confirm_stop" and step["phase"] == "retreat":
+            affected_joints = [joint for joint, indices in enumerate(mapping["joint_motor_indices"])
+                               if any(i in self.check_pause_motors for i in indices)]
+            index = max(affected_joints, key=lambda joint: abs(logical[joint] - self.check_pause_logical[joint]))
+            delta = math.degrees(logical[index] - self.check_pause_logical[index])
+            # The measured replay must join the fixed pause command. Reusing
+            # the existing 0.2-degree logical-path edge bound here prevents a
+            # new jump to a rebounded pose without disguising it as a retreat.
+            if abs(delta) > 0.2:
+                engine.phase = step["phase"] = "aborted"
+                engine.abort_reason = f"缓退起点与固定暂停目标不连续：{engine.plan['joint_names'][index]} 偏移{delta:+.3f}°，未发送缓退目标"
+                engine.retreat_path_diagnostics = {**(engine.retreat_path_diagnostics or {}), "pause_join": {
+                    "joint": engine.plan["joint_names"][index], "deviation_deg": delta,
+                    "limit_deg": 0.2, "verified": False,
+                }}
+                axes = engine.candidates or set(engine.selected)
+                engine.retreat_actual_deg, engine.retreat_verified = None, False
+                engine.retreat_joint_distances = [
+                    {"joint": engine.plan["joint_names"][joint], "requested_deg": engine.options["retreat_deg"],
+                     "actual_deg": None, "verified": False} for joint in sorted(axes)
+                ]
+                engine.retreats.append({
+                    "group": engine.group, "requested_deg": engine.options["retreat_deg"],
+                    "actual_deg": None, "verified": False, "reason": engine.abort_reason,
+                    "joint_distances": engine.retreat_joint_distances,
+                })
+                step["done"] = True
+                step["events"] = [event for event in step["events"] if event.get("type") != "retreat_started"]
+                step["events"].append({"type": "review_required", "reason": engine.abort_reason})
         unloading = (phase_before == "confirm_stop" or step["phase"] == "confirm_stop") and all(
             abs(actual - requested) <= 1e-12 for actual, requested in zip(logical, step["targets_rad"]))
         seed = (positions if engine.options["require_pose_settling"] or unloading else self.check_target)
-        target = joint_mapping.logical_to_motor(step["targets_rad"], mapping, previous=seed)
+        if grouped_pause and self.check_pause_target is not None and (step["phase"] == "confirm_stop" or phase_before == "confirm_stop"):
+            target = self.check_pause_target[:]
+            engine.targets = self.check_pause_logical[:]
+            step["targets_rad"] = engine.targets[:]
+        else:
+            target = joint_mapping.logical_to_motor(step["targets_rad"], mapping, previous=seed)
+            if grouped_pause and self.check_pause_target is not None and step["phase"] in ("retreat", "confirm_retreat_stop", "waiting_review"):
+                for index in range(self.dof):
+                    if index not in self.check_pause_motors:
+                        target[index] = self.check_pause_target[index]
+                engine.targets, _ = joint_mapping.motor_to_logical(target, [0.0] * self.dof, mapping, previous=logical)
+                step["targets_rad"] = engine.targets[:]
         # The engine checks logical tracking with the confirmed MIT tolerance;
         # do not impose a second, unrelated five-degree motor-coordinate gate.
         tracking_limit = max(5.0, engine.options["start_tolerance_deg"])
@@ -889,7 +1147,7 @@ class ControlSession:
         # impose a second fixed 20°/s motor-command abort.
         freeze_at_feedback = (unloading and all(
             abs(a - b) <= 1e-6 for a, b in zip(positions, target)))
-        if freeze_at_feedback and self.check_feedforward is not None:
+        if freeze_at_feedback and not grouped_pause and self.check_feedforward is not None:
             # Removing the advancing spring must also unload any preparation
             # compensation. Never keep pushing a detected obstruction with FF.
             self.check_feedforward = [0.0] * self.dof
@@ -948,6 +1206,9 @@ class ControlSession:
         self.last_tick = now
         if abort_torque_nm is not None and any(abs(value) >= abort_torque_nm for value in torques):
             raise ValueError("姿态准备电机输出力矩达到本次中止值")
+        if self.manual_engine is not None:
+            self._tick_manual(now, positions, torques)
+            return
         if self.check_handoff is not None:
             self._tick_handoff(now, positions, torques)
             return
@@ -978,7 +1239,7 @@ class ControlSession:
                 self.disable()
         else:
             # Keep fresh telemetry with no position spring while awaiting a run.
-            self._send_target(positions, kp=0.0, kd=0.5)
+            self._send_target(positions, kp=0.0, kd=self.damping_kd)
         if now - self.last_emit >= 0.2:
             self.last_emit = now
             self.emit({"type": "feedback", "positions_rad": positions, "torques_nm": torques,
@@ -1065,10 +1326,14 @@ def run_session(dof, session_id):
             time.sleep(max(0.0, next_tick - time.monotonic()))
     except StopRequested as error:
         reason = str(error)
+        if session and session.manual_engine is not None:
+            session.manual_engine.interrupt(reason)
         if session and session.check_engine is not None:
             session.check_engine.phase, session.check_engine.abort_reason = "aborted", reason
     except BaseException as error:
         reason = str(error) or "控制会话异常"
+        if session and session.manual_engine is not None:
+            session.manual_engine.interrupt(reason)
         if session and session.check_engine is not None:
             session.check_engine.phase, session.check_engine.abort_reason = "aborted", reason
         try:

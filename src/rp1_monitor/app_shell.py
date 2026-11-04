@@ -6,8 +6,8 @@ from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QByteArray, QPointF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtCore import QByteArray, QPointF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QIcon, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -183,7 +183,7 @@ class RobotOverview(QWidget):
 class AppMonitorWindow(MonitorWindow):
     """Reuse collection, SSH, freshness and rendering; replace presentation only."""
 
-    def __init__(self, url, motor_map_config=None, thermal_policy=None):
+    def __init__(self, url, motor_map_config=None, thermal_policy=None, factory_directory=None):
         from .central_policy import CentralPolicy
 
         self.motor_map_config = motor_map_config or MotorMapConfig()
@@ -192,6 +192,8 @@ class AppMonitorWindow(MonitorWindow):
         self._automatic_central_url = "http://127.0.0.1:8890"
         self._current_motor_map = {}
         self.shell_ready = False
+        self.factory_guidance = None
+        self.hardware_notes_dialog = None
         super().__init__(url)
         self.setStyleSheet(APP_STYLE)
         old_root = self.takeCentralWidget()
@@ -223,22 +225,31 @@ class AppMonitorWindow(MonitorWindow):
         )
         brand.setAccessibleName("ROBO PARTY")
         side.addWidget(brand, alignment=Qt.AlignmentFlag.AlignHCenter)
-        side.addSpacing(26)
+        side.addSpacing(12)
         self.nav = QButtonGroup(self)
         self.nav.setExclusive(True)
-        titles = ("整机健康", "部件监测", "趋势分析", "告警记录", "设备设置", "诊断助手", "硬件自检", "监控记录", "角度与标定")
+        titles = ("整机健康", "部件监测", "趋势分析", "告警记录", "设备设置", "诊断助手", "硬件自检", "监控记录", "角度与标定", "整机测试")
+        nav_body = QWidget()
+        nav_layout = QVBoxLayout(nav_body)
+        nav_layout.setContentsMargins(0, 0, 0, 0)
+        nav_layout.setSpacing(4)
         for index, (title, glyph) in enumerate(
-            zip(titles, ("home", "parts", "trend", "bell", "settings", "chat", "checks", "trend", "settings"))
+            zip(titles, ("home", "parts", "trend", "bell", "settings", "chat", "checks", "trend", "settings", "checks"))
         ):
             button = QPushButton(title)
             button.setObjectName("nav")
             button.setIcon(icon(glyph))
             button.setIconSize(QSize(22, 22))
             button.setCheckable(True)
-            button.setMinimumHeight(48)
+            button.setMinimumHeight(44)
             self.nav.addButton(button, index)
-            side.addWidget(button)
-        side.addStretch()
+            nav_layout.addWidget(button)
+        nav_layout.addStretch()
+        nav_scroll = QScrollArea()
+        nav_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        nav_scroll.setWidgetResizable(True)
+        nav_scroll.setWidget(nav_body)
+        side.addWidget(nav_scroll, 1)
         self.device_id = label("尚未连接机器人", "sectionTitle")
         side.addWidget(self.device_id)
         side.addWidget(label("只读监测 · 独立采集", "cardCaption"))
@@ -260,6 +271,24 @@ class AppMonitorWindow(MonitorWindow):
         self.source_label.setFixedHeight(34)
         heading.addWidget(self.source_label)
         body.addLayout(heading)
+        self.factory_return_bar = QFrame()
+        self.factory_return_bar.setObjectName("healthBanner")
+        return_layout = QVBoxLayout(self.factory_return_bar)
+        context = QHBoxLayout()
+        self.factory_return_label = label("", "sectionTitle")
+        self.factory_tool_hint = label()
+        context.addWidget(self.factory_return_label, 1)
+        self.factory_connection_button = QPushButton("前往设备连接")
+        self.factory_connection_button.clicked.connect(self.open_settings)
+        context.addWidget(self.factory_connection_button)
+        self.factory_return_button = QPushButton("返回工厂保存结果")
+        self.factory_return_button.clicked.connect(self.return_factory_result)
+        context.addWidget(self.factory_return_button)
+        return_layout.addLayout(context)
+        self.factory_tool_hint.setMinimumHeight(54)
+        return_layout.addWidget(self.factory_tool_hint)
+        self.factory_return_bar.hide()
+        body.addWidget(self.factory_return_bar)
         self.pages = QStackedWidget()
         self.pages.addWidget(self.home_page())
         self.pages.addWidget(self.components_page())
@@ -282,6 +311,27 @@ class AppMonitorWindow(MonitorWindow):
         self.recordings_panel = RecordingsPanel(lambda: (self.station_url, self.station_token_file))
         self.pages.addWidget(self.recordings_panel)
         self.pages.addWidget(self.joint_inspection_panel)
+        from .desktop_factory import create_factory_panel
+
+        self.factory_panel = create_factory_panel(
+            lambda: self.active_source_url or self.url.text(), factory_directory,
+            lambda: {**self.calibration_connection(), "station_url": self.station_url,
+                     "station_token_file": self.station_token_file},
+        )
+        self.pages.addWidget(self.factory_panel)
+        if hasattr(self.factory_panel, "tool_requested"):
+            self.factory_panel.tool_requested.connect(self.open_factory_tool)
+            self.factory_panel.sn_changed.connect(self.factory_sn_changed)
+            self.factory_panel.board_saved.connect(self.factory_board_saved)
+        self.factory_board_runs = {}
+        self.joint_inspection_panel.manual_dialog_created.connect(self.connect_factory_manual_dialog)
+        board = self.operations_panel.board_panel
+        if hasattr(self.factory_panel, "store"):
+            board.set_board_profile(self.factory_panel.board_profile_values)
+            board.profile_saver = self.factory_panel.save_board_profile
+        board.factory_sync.clicked.connect(self.sync_existing_board_results)
+        board.run_requested.connect(self.factory_board_run_requested)
+        board.report_ready.connect(self.factory_board_report_ready)
         self.operations_panel.board_checks_requested.connect(lambda: self.navigate(6))
         body.addWidget(self.pages, 1)
         footer = QHBoxLayout()
@@ -526,6 +576,200 @@ class AppMonitorWindow(MonitorWindow):
         self.pages.setCurrentIndex(index)
         self.nav.button(index).setChecked(True)
         self.app_title.setText("RP1 " + self.nav.button(index).text())
+        self.update_factory_guidance()
+
+    def open_factory_tool(self, target, item):
+        if target == "hardware_notes":
+            self.open_factory_hardware_notes()
+            return
+        routes = {
+            "board": (6, self.operations_panel.board_panel.refresh, "新运行的单项自检将自动保存到发起时选定的SN；已经做完的自检可点击“将当前自检结果保存到此SN”，无需重测。"),
+            "calibration": (8, self.joint_inspection_panel.calibrate, "点击“标定”，按原流程操作；结束后返回工厂第2项确认流程状态。"),
+            "calibration_check": (8, self.joint_inspection_panel.motor_control, "点击“标定检查”；腰部插销确认后、左右髋 pitch 在零位±2°内保持5秒，其他关节按URDF引导摆向限位。"),
+            "postzero": (8, self.joint_inspection_panel.postzero, "角度监控已合并到当前页。选择数据来源即可查看或采样；读数不代替标定检查结果。"),
+        }
+        if target not in routes:
+            return
+        index, control, hint = routes[target]
+        self.factory_guidance = {"sn": self.factory_panel.sn, "item": item, "hint": hint}
+        self.navigate(index)
+        if index == 8:
+            scroll = self.joint_inspection_panel.findChild(QScrollArea)
+            QTimer.singleShot(0, control, lambda: scroll.ensureWidgetVisible(control, 20, 30))
+        control.setFocus()
+
+    def update_factory_guidance(self):
+        guidance = self.factory_guidance
+        self.factory_return_bar.setVisible(bool(guidance) and self.pages.currentIndex() != 9)
+        if not guidance:
+            return
+        item, sn = guidance["item"], guidance["sn"]
+        frame = self.last_frame or {}
+        robot = frame.get("robot_id") if self.active_source_url else None
+        connected = bool(robot) and frame.get("upload", {}).get("collector_connected") is not False
+        identity = getattr(self.factory_panel, "identity", None)
+        mismatch = bool(robot and identity and (robot, frame.get("source_kind")) != (identity["robot_id"], identity["source_kind"]))
+        _set_text(self.factory_return_label, f"工厂SN：{sn or '未选择'} · 第{item}项 · 当前工具主连接：{robot or '未连接'}")
+        connection = "请先到“设备设置”连接本SN对应机器人；工厂独立SSH仅用于动作日志。" if not connected else "请核对工具中的机器人身份与本SN对应；已完成与是否通过分别保存。"
+        if mismatch:
+            connection = f"当前工具主连接与动作日志连接 {identity['robot_id']} / {identity['source_kind']} 不一致，请先核对机器人。"
+        _set_text(self.factory_tool_hint, guidance["hint"] + "\n" + connection)
+        _set_style(self.factory_tool_hint, "color:#9a4f11;" if mismatch or not connected else "")
+        self.factory_return_button.setText(f"返回工厂 · 查看第{item}项结果")
+
+    def factory_sn_changed(self, sn):
+        board = self.operations_panel.board_panel
+        board.factory_sn.setText(sn)
+        board.factory_save_note.setText(f"当前SN：{sn}。新发起的检查完成后自动保存；现有历史快照需点击上方按钮关联。")
+        if self.factory_guidance and not self.factory_guidance["sn"]:
+            self.factory_guidance["sn"] = sn
+        self.update_factory_guidance()
+
+    def connect_factory_manual_dialog(self, dialog):
+        target = {"sn": None, "robot_id": None}
+        def started(context):
+            guidance = self.factory_guidance or {}
+            sn = guidance.get("sn") if guidance.get("item") == 3 else None
+            target.update(sn=sn if sn and sn == self.factory_panel.sn and context.get("source_kind") == "ros2" else None,
+                          robot_id=context.get("robot_id"))
+        def saved(result):
+            sn = target["sn"]
+            if not sn or result.get("robot_id") != target["robot_id"]:
+                dialog.save_status.setText(f"本轮已保存在电脑：{result['path']}。未关联SN；请在工厂第3项选择SN后导入此JSON。")
+                return
+            def done(ok, message):
+                dialog.save_status.setText(message if ok else message + " 文件：" + result["path"])
+            self.factory_panel.sync_calibration_check(sn, result["path"], target["robot_id"], done)
+        dialog.check_started.connect(started)
+        dialog.check_saved.connect(saved)
+
+    def factory_board_run_requested(self, request):
+        panel, board = self.factory_panel, self.operations_panel.board_panel
+        self.factory_board_runs.clear()
+        sn = board.factory_sn.text().strip()
+        if not sn:
+            board.factory_save_note.setText("尚未选择SN：检查结果会保留在自检页，完成后输入SN并点击保存即可，无需重测。")
+            return
+        try:
+            sn = panel.store.validate_sn(sn)
+        except (AttributeError, ValueError) as exc:
+            board.factory_save_note.setText(f"SN未能关联：{exc}。本次结果保留，完成后可修正SN并保存，无需重测。")
+            return
+        # This visible field is authoritative for this run, including when a
+        # file import prevents switching the factory page immediately.
+        if panel.sn != sn and not panel.busy:
+            panel.activate_sn(sn)
+        self.factory_board_runs[request["token"]] = {"sn": sn, "robot_id": request["robot_id"], "source_kind": request["source_kind"], "profile": board.factory_profile}
+        board.factory_save_note.setText(f"本次检查归属SN：{sn} · {request['robot_id']}；等待完成后保存到电脑。")
+
+    def factory_board_report_ready(self, result):
+        target = self.factory_board_runs.pop(result["token"], None)
+        if not target:
+            return
+        board = self.operations_panel.board_panel
+        if (target["robot_id"], target["source_kind"]) != (result["robot_id"], result["source_kind"]):
+            board.factory_save_note.setText("检查来源与发起时身份不一致，未自动保存；当前原始结果保留，请核对后手动关联SN。")
+            return
+        self.factory_panel.sync_board_snapshot(target["sn"], result["robot_id"], result["source_kind"], result["reports"], target["profile"])
+        board.factory_save_note.setText(f"正在将本次检查保存到SN：{target['sn']}…")
+
+    def sync_existing_board_results(self):
+        panel, board = self.factory_panel, self.operations_panel.board_panel
+        if not hasattr(panel, "store") or panel.closing:
+            board.factory_save_note.setText("工厂本地目录不可用，当前自检结果保留。")
+            return
+        if panel.busy:
+            board.factory_save_note.setText("本机正在读写日志，请完成后再关联现有自检。当前结果保留，无需重测。")
+            return
+        sn = board.factory_sn.text().strip()
+        if not sn:
+            board.factory_save_note.setText("请先在上方输入整机SN，再保存已经完成的自检。")
+            board.factory_sn.setFocus()
+            return
+        if not board.reports:
+            board.factory_save_note.setText("当前没有可保存的自检快照。请先读取状态 / 历史报告；不会自动运行检查。")
+            return
+        try:
+            panel.store.results(sn)  # validate before changing the current SN
+            if panel.sn != sn:
+                panel.activate_sn(sn)
+        except (ValueError, OSError) as exc:
+            board.factory_save_note.setText(f"未保存：{exc}。当前自检结果保留。")
+            return
+        source = next(iter(board.reports.values()))["source_kind"]
+        panel.sync_board_snapshot(sn, board.robot_id, source, board.reports)
+        board.factory_save_note.setText(f"正在将当前 {len(board.reports)} 项状态快照保存到SN：{sn}；保留原始时间和结论…")
+
+    def factory_board_saved(self, sn, snapshot):
+        board = self.operations_panel.board_panel
+        if snapshot.get("error"):
+            board.factory_save_note.setText(f"SN：{sn} 未保存成功：{snapshot['error']}。当前快照保留，可核对后点击保存重试。")
+            return
+        counts = snapshot.get("display_counts") or (snapshot.get("assessment") or {}).get("counts", {})
+        board.factory_save_note.setText(f"已保存到电脑 · SN：{sn} · {snapshot['robot_id']} · 已执行 {snapshot['executed']}/{snapshot['total']}，通过 {counts.get('通过', 0)}，不通过 {counts.get('不通过', 0)}，未完成 {counts.get('未完成', 0)}，未检查 {counts.get('未检查', 0)}。返回工厂即可查看；拔线或重开上位机仍保留。")
+
+    def return_factory_result(self):
+        if not self.factory_guidance:
+            return
+        guidance = self.factory_guidance
+        if self.factory_panel.busy or self.factory_panel.closing:
+            self.factory_panel.notice.setText("正在完成本机日志读写，请等待当前任务结束后再填写本项结果；当前SN和已有文件保持。")
+            self.factory_tool_hint.setText(self.factory_panel.notice.text())
+            return
+        self.navigate(9)
+        if self.factory_panel.sn != guidance["sn"]:
+            self.factory_panel.notice.setText("工厂SN已变化，请核对本次工具输出属于哪台机器人，再选择对应测试项保存；未自动关联或保存。")
+            return
+        self.factory_panel.show_item_result(guidance["item"])
+
+    def open_factory_hardware_notes(self):
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QTextBrowser
+
+        if self.hardware_notes_dialog:
+            self.hardware_notes_dialog.raise_()
+            self.hardware_notes_dialog.activateWindow()
+            return
+        dialog = QDialog(self)
+        self.hardware_notes_dialog = dialog
+        dialog.setObjectName("hardwareNotesDialog")
+        dialog.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+        palette = dialog.palette()
+        palette.setColor(QPalette.ColorRole.Window, QColor("#eef2fa"))
+        palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor("#142441"))
+        palette.setColor(QPalette.ColorRole.Text, QColor("#142441"))
+        dialog.setPalette(palette)
+        dialog.setAutoFillBackground(True)
+        dialog.setStyleSheet("""
+            QDialog#hardwareNotesDialog { background:#eef2fa; color:#142441; }
+            QDialog#hardwareNotesDialog QLabel { background:transparent; color:#142441; }
+            QDialog#hardwareNotesDialog QTextBrowser { background:#ffffff; color:#142441;
+                border:1px solid #bdcce4; border-radius:6px; padding:12px; }
+        """)
+        dialog.setWindowTitle("第1项 · 灯板与电机参数检查说明")
+        dialog.resize(860, 620)
+        body = QVBoxLayout(dialog)
+        body.addWidget(label("此处只查看原流程说明，不运行脚本。灯板脚本会实际亮灯，六参数检查只读查询；参数修正仍使用原工程工具。"))
+        view = QTextBrowser()
+        view.setOpenLinks(False)
+        view.document().setDefaultStyleSheet("body { color:#142441; } pre, code { color:#294f86; } th, td { border:1px solid #bdcce4; padding:6px; }")
+        path = Path(__file__).resolve().parents[2] / "docs/HARDWARE_CHECK.md"
+        try:
+            view.setMarkdown(path.read_text(encoding="utf-8"))
+        except OSError:
+            view.setPlainText("原入口：scripts/check_rp1_hardware.sh。请在机器人原部署目录按对应机型使用原流程，完成后保存终端输出，回到本SN添加为第1项附件。当前安装未包含完整HARDWARE_CHECK.md；此页不会自动执行或修正电机参数。")
+        body.addWidget(view)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.button(QDialogButtonBox.StandardButton.Close).setText("关闭")
+        buttons.rejected.connect(dialog.reject)
+        body.addWidget(buttons)
+        dialog.finished.connect(lambda: setattr(self, "hardware_notes_dialog", None))
+        dialog.open()
+
+    def clear_preview(self):
+        super().clear_preview()
+        if self.shell_ready:
+            self.update_factory_guidance()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -559,6 +803,8 @@ class AppMonitorWindow(MonitorWindow):
         if self.last_frame and self.last_frame["stream_id"] != frame["stream_id"]:
             self.temp_buffers = [deque(maxlen=600), deque(maxlen=600)]
         super().on_frame(frame)
+        if self.factory_guidance:
+            self.update_factory_guidance()
 
     def open_temperature_region(self, region):
         members = [

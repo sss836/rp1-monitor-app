@@ -8,6 +8,7 @@ late responses. Raw output-shaft degrees are not a mechanical-limit validation.
 """
 
 import argparse
+import errno
 import hashlib
 import json
 import math
@@ -101,16 +102,20 @@ def check_processes(proc=Path("/proc"), check_cancel=lambda: None):
         check_cancel()
         if not entry.name.isdigit() or int(entry.name) == os.getpid():
             continue
+        field = "cmdline"
         try:
             raw = (entry / "cmdline").read_bytes()
             if not raw:
                 continue
             arguments = [argument.decode("utf-8", "replace") for argument in raw.split(b"\0") if argument]
+            field = "exe"
             executable = os.readlink(entry / "exe")
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
+            # Both ENOENT and ESRCH can mean the enumerated process has exited.
             continue
         except OSError as error:
-            raise ValueError("无法确认进程状态，拒绝查询：PID " + entry.name) from error
+            code = errno.errorcode.get(error.errno, "UNKNOWN")
+            raise ValueError(f"无法确认进程状态，拒绝查询：PID {entry.name}，读取{field}失败（{code}，errno={error.errno}）") from error
         if process_conflict(executable, arguments):
             raise ValueError("推理、标零或其他电机工具仍在运行：PID " + entry.name)
 
