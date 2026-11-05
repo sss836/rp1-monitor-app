@@ -55,7 +55,13 @@ _RETIRED_READERS = set()
 
 def pending_desktop_workers():
     """Outstanding native workers, including collector lifecycle operations."""
-    from . import desktop_collector, desktop_factory, desktop_operations, desktop_recordings, desktop_thermal
+    from . import (
+        desktop_collector,
+        desktop_factory,
+        desktop_operations,
+        desktop_recordings,
+        desktop_thermal,
+    )
 
     workers = set(_PROBES) | set(_RETIRED_READERS)
     for module in (desktop_collector, desktop_factory, desktop_operations, desktop_recordings, desktop_thermal):
@@ -1578,46 +1584,29 @@ class MonitorWindow(QMainWindow):
 def run(args):
     from .desktop_diagnostics import desktop_failure_diagnostics
 
-    with desktop_failure_diagnostics(getattr(args, "station_dir", None) or Path("runtime/station")):
+    station_directory = Path(getattr(args, "station_dir", None) or "runtime/station")
+    # Logging must not occupy an uninitialized station before its ownership check.
+    diagnostic_directory = station_directory.with_name(station_directory.name + "-desktop-diagnostics")
+    with desktop_failure_diagnostics(station_directory, directory=diagnostic_directory):
         _run_desktop(args)
 
 
 def _run_desktop(args):
-    from .app_shell import AppMonitorWindow
     from .central_policy import load_central_policy
+    from .desktop_platform import PlatformMonitorWindow, platform_state_path
     from .motor_map import MotorMapConfig
 
-    station = None
-    station_error = ""
-    if getattr(args, "quick_connect", False) and not getattr(args, "factory", False):
-        from .station import ensure_station
-
-        try:
-            station = ensure_station(args.station_dir, args.station_port)
-        except Exception as exc:
-            station_error = f"电脑后台暂不可用：{type(exc).__name__}；工厂本地导入、曲线和报告仍可使用。"
     app = QApplication.instance() or QApplication([])
     install_light_theme(app)
-    window = AppMonitorWindow(
+    window = PlatformMonitorWindow(
         args.url,
         motor_map_config=MotorMapConfig.load(args.motor_map),
         thermal_policy=load_central_policy(args.policy),
         factory_directory=getattr(args, "factory_dir", None),
+        platform_state_directory=platform_state_path(getattr(args, "station_dir", None)),
     )
     window.show()
-    if getattr(args, "factory", False) or station_error:
-        window.navigate(9)
-        if station_error:
-            window.factory_panel.notice.setText(station_error + "\n" + window.factory_panel.notice.text())
-    elif station:
-        window.station_url, window.station_token_file = station
-        window.connection_mode.setCurrentIndex(2)
-        window.ssh_target.setText("ssh robo@192.168.137.250")
-        window.open_settings()
-        window.ssh_password.setFocus()
-        QTimer.singleShot(0, window.restore_station_connection)
-    else:
-        QTimer.singleShot(0, window.connect_source)
+    window.first_authenticated.connect(lambda: window.start_initial_connection(args))
     if args.screenshot:
 
         def screenshot():
@@ -1630,6 +1619,7 @@ def _run_desktop(args):
     app.exec()
     # Normal close has already drained these asynchronously. Keep the safety net
     # for a direct QApplication.quit(), which bypasses the window's closeEvent.
+    window.finish_platform_workers()
     window._closing = True
     window.disconnect_source()
     workers = pending_desktop_workers()

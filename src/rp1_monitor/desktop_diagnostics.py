@@ -20,7 +20,7 @@ def _write_frames(log, stack):
 
 
 @contextmanager
-def desktop_failure_diagnostics(state_dir):
+def desktop_failure_diagnostics(state_dir, *, directory=None):
     """Keep native fatal stacks and uncaught Python frame locations per launch.
 
     This observes errors, without suppressing exceptions or restarting workers.
@@ -34,7 +34,7 @@ def desktop_failure_diagnostics(state_dir):
     configured = False
     try:
         try:
-            directory = Path(state_dir) / "desktop-diagnostics"
+            directory = Path(directory) if directory is not None else Path(state_dir) / "desktop-diagnostics"
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             if directory.is_symlink() or not directory.is_dir():
                 raise ValueError("desktop diagnostics requires a real directory")

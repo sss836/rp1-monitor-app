@@ -8,6 +8,7 @@ import zipfile
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from . import __version__
 from .capabilities import evaluate_capabilities
 
 
@@ -137,7 +138,7 @@ def build_report(snapshot, profile, *, curves=None, query=None):
         "validation_scope": "simulated"
         if snapshot.get("source_kind") == "simulated"
         else "software_observation_not_hardware_acceptance",
-        "software_version": "0.4.0",
+        "software_version": __version__,
         "profile": profile.model_dump(),
         "capabilities": evaluate_capabilities(snapshot, profile),
         "checks": checks_for(snapshot, profile),

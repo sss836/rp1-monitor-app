@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from sqlalchemy.exc import OperationalError
 from starlette.concurrency import run_in_threadpool
 
+from . import __version__
 from .central_data import retention_preview, usage_report
 from .central_policy import load_central_policy
 from .models import BatchAck, DeviceRegistration, MetricKey, RelayStatus, RobotId, TelemetryBatch
@@ -285,7 +286,7 @@ def create_app(settings: BackendSettings, read_dependency=None):
                 administration.close()
             store.engine.dispose()
 
-    app = FastAPI(title="RP1 Whole Robot Monitor", version="0.4.0", lifespan=lifespan)
+    app = FastAPI(title="RP1 Whole Robot Monitor", version=__version__, lifespan=lifespan)
     app.state.store = store
     app.include_router(make_router(store, settings, read_dependency))
     if administration is not None:
@@ -326,7 +327,7 @@ def create_app(settings: BackendSettings, read_dependency=None):
     def health() -> dict:
         return {
             "status": "ok",
-            "version": "0.4.0",
+            "version": __version__,
             "demo": settings.demo_read,
             "management": administration is not None,
         }

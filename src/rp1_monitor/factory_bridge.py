@@ -36,6 +36,7 @@ from uuid import UUID, uuid4
 MAX_CSV_BYTES = 4 * 1024**2
 MAX_CSV_ROWS = 1000
 MAX_RESPONSE_BYTES = 2 * 1024**2
+MAX_RESPONSE_BUDGET_BYTES = 64 * 1024**2
 CSV_COLUMNS = (
     "记录编号", "上位机编号", "样品编号", "机型", "测试体系", "测试分类", "记录层级",
     "测试项目编号", "原始检查ID", "测试内容", "开始时间", "结束时间", "测试人员",
@@ -228,8 +229,8 @@ class DeadlineHTTPHandler(HTTPHandler):
 
 
 class DeadlineHTTPSHandler(HTTPSHandler):
-    def __init__(self, current_deadline):
-        super().__init__(context=ssl.create_default_context())
+    def __init__(self, current_deadline, ca_file=None):
+        super().__init__(context=ssl.create_default_context(cafile=ca_file))
         self.current_deadline = current_deadline
 
     def https_open(self, request):
@@ -239,19 +240,27 @@ class DeadlineHTTPSHandler(HTTPSHandler):
 
 
 class JsonHttpClient:
-    def __init__(self, url, *, allow_http=False, timeout=15):
+    def __init__(self, url, *, allow_http=False, timeout=15, ca_file=None, response_bytes=MAX_RESPONSE_BYTES):
         self.base_url = base_url(url, allow_http=allow_http)
         self.timeout = timeout
         if not math.isfinite(timeout) or timeout <= 0:
             raise BridgeError("invalid_request_timeout")
+        if type(response_bytes) is not int or not 1 <= response_bytes <= MAX_RESPONSE_BUDGET_BYTES:
+            raise BridgeError("invalid_response_budget")
+        self.response_bytes = response_bytes
         self.cookies = CookieJar()
         self._request_lock = threading.Lock()
         self._deadline = None
         self.opener = build_opener(
             ProxyHandler({}), HTTPCookieProcessor(self.cookies), NoRedirect(),
             DeadlineHTTPHandler(lambda: self._deadline),
-            DeadlineHTTPSHandler(lambda: self._deadline),
+            DeadlineHTTPSHandler(lambda: self._deadline, ca_file),
         )
+
+    def cancel_current_request(self):
+        deadline = self._deadline
+        if deadline is not None:
+            deadline.abort()
 
     def request(self, method, path, *, body=None, headers=None):
         request = Request(self.base_url + path, data=body, method=method, headers=headers or {})
@@ -263,15 +272,27 @@ class JsonHttpClient:
                 try:
                     response = self.opener.open(request, timeout=self.timeout)
                     with response:
-                        raw = response.read(MAX_RESPONSE_BYTES + 1)
+                        status = getattr(response, "status", None)
+                        raw = response.read(self.response_bytes + 1)
                         deadline.check()
-                        if len(raw) > MAX_RESPONSE_BYTES:
+                        if len(raw) > self.response_bytes:
                             raise BridgeError("response_too_large")
                 except HTTPError as exc:
-                    # No response text, request body, cookies, or URL is persisted.
-                    exc.close()
+                    # Retain only a bounded, safe machine code, never response text.
+                    code = f"http_{exc.code}"
+                    try:
+                        error_raw = exc.read(16385)
+                        if len(error_raw) <= 16384:
+                            error = json.loads(error_raw).get("error", {})
+                            candidate = error.get("code") if isinstance(error, dict) else None
+                            if isinstance(candidate, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,95}", candidate):
+                                code = candidate
+                    except (ValueError, TypeError, AttributeError, OSError):
+                        pass
+                    finally:
+                        exc.close()
                     deadline.check()
-                    raise BridgeError(f"http_{exc.code}", exc.code) from None
+                    raise BridgeError(code, exc.code) from None
                 except (URLError, OSError, TimeoutError, HTTPException):
                     deadline.check()
                     raise BridgeError("network_error") from None
@@ -283,6 +304,8 @@ class JsonHttpClient:
             finally:
                 deadline.finish()
                 self._deadline = None
+        if status == 204 and not raw:
+            return {}
         try:
             data = json.loads(raw)
         except (ValueError, UnicodeError):
@@ -465,6 +488,31 @@ def presence_payload(source, kind, station_name, bindings, snapshot, *, now=None
     }, skipped
 
 
+def read_result_csv(path):
+    """Read one explicit original file with bounded row count; no verification claim."""
+    path = Path(path)
+    if path.suffix.lower() != ".csv" or "\\" in path.name or len(path.name) > 200:
+        raise BridgeError("csv_file_required")
+    raw = private_file(path, MAX_CSV_BYTES)
+    try:
+        decoded = raw.decode("utf-8-sig")
+        if "\x00" in decoded:
+            raise BridgeError("invalid_17_column_csv")
+        reader = csv.reader(io.StringIO(decoded, newline=""), strict=True)
+        if tuple(next(reader, [])) != CSV_COLUMNS:
+            raise BridgeError("invalid_17_column_csv")
+        rows = []
+        for row in reader:
+            if len(rows) >= MAX_CSV_ROWS or len(row) != 17 or any(len(value) > 65536 for value in row):
+                raise BridgeError("invalid_17_column_csv")
+            rows.append(row)
+    except (UnicodeError, csv.Error):
+        raise BridgeError("invalid_utf8_csv") from None
+    if not rows:
+        raise BridgeError("invalid_17_column_csv")
+    return path, raw, rows
+
+
 def result_upload(path, *, source, robot_id, kind, verified, completed, submit, reason):
     if not verified or not completed or not submit:
         raise BridgeError("explicit_verified_completed_submit_required")
@@ -474,23 +522,12 @@ def result_upload(path, *, source, robot_id, kind, verified, completed, submit, 
     if not isinstance(robot_id, str) or not ROBOT_PATTERN.fullmatch(robot_id):
         raise BridgeError("invalid_robot_id")
     reason = clean_text(reason, 300)
-    path = Path(path)
-    if path.suffix.lower() != ".csv" or "\\" in path.name or len(path.name) > 200:
-        raise BridgeError("csv_file_required")
-    raw = private_file(path, MAX_CSV_BYTES)
-    try:
-        rows = list(csv.reader(io.StringIO(raw.decode("utf-8-sig"), newline="")))
-    except (UnicodeError, csv.Error):
-        raise BridgeError("invalid_utf8_csv") from None
-    if not rows or tuple(rows[0]) != CSV_COLUMNS or not 1 <= len(rows) - 1 <= MAX_CSV_ROWS:
-        raise BridgeError("invalid_17_column_csv")
-    if any(len(row) != 17 for row in rows[1:]):
-        raise BridgeError("invalid_17_column_csv")
-    if any(row[1] != source or not row[0].strip() for row in rows[1:]):
+    path, raw, rows = read_result_csv(path)
+    if any(row[1] != source or not row[0].strip() for row in rows):
         raise BridgeError("csv_source_or_record_identity_mismatch")
-    if len({row[2] for row in rows[1:]}) != 1 or not rows[1][2].strip():
+    if len({row[2] for row in rows}) != 1 or not rows[0][2].strip():
         raise BridgeError("csv_single_sn_required")
-    if len({row[3] for row in rows[1:]}) != 1 or rows[1][3] not in {"24轴", "28轴"}:
+    if len({row[3] for row in rows}) != 1 or rows[0][3] not in {"24轴", "28轴"}:
         raise BridgeError("csv_single_model_required")
     metadata = {
         "source_id": source, "robot_id": robot_id, "source_kind": kind,

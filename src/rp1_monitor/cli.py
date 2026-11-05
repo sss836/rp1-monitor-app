@@ -211,7 +211,7 @@ def main(allowed_commands: set[str] | None = None):
     desktop.add_argument("--policy", type=Path, help="与中央服务共用的温度限值策略JSON")
     desktop.add_argument("--motor-map", type=Path, help="与网页共用的关节部位与温度色阶JSON")
     desktop.add_argument("--quick-connect", action="store_true", help="启动独立电脑后台，使用SSH地址与密码连接已有监听")
-    desktop.add_argument("--factory", action="store_true", help="直接打开工厂本地入口，无需中央或PostgreSQL")
+    desktop.add_argument("--factory", action="store_true", help="完整平台登录后打开原工厂本地入口；本地工厂结果无需PostgreSQL")
     desktop.add_argument("--factory-dir", type=Path, help="工厂本地SN、日志及报告目录（默认用户数据目录）")
     desktop.add_argument("--station-dir", type=Path, default=Path("runtime/station"))
     desktop.add_argument("--station-port", type=int, default=18980)

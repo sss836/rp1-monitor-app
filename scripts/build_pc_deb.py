@@ -16,7 +16,7 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = "rp1-monitor-app"
-DEFAULT_VERSION = "0.4.0+20261104.1"
+DEFAULT_VERSION = "0.4.1+platform.20261106.1"
 APP_ROOT = "/opt/rp1-monitor-app"
 EXTRAS = "desktop,server,station"
 SOURCE_IGNORE = shutil.ignore_patterns(

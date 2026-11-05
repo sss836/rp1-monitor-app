@@ -8,8 +8,8 @@
 
 ```bash
 .venv/bin/python scripts/build_pc_deb.py \
-  --output /tmp/rp1-monitor-deb-20261104-1 \
-  --version 0.4.0+20261104.1
+  --output /交付目录/native-monitor-platform-20261106/build \
+  --version 0.4.1+platform.20261106.1
 ```
 
 默认构建会访问 Python 包源下载依赖。脚本先复用 `build_role_packages.py --role pc` 的允许清单导出电脑源码，随后以 `pip wheel --no-index --no-deps --no-build-isolation` 构建当前应用 wheel，再下载 `[desktop,server,station]` 的完整二进制 wheel 依赖。任何依赖没有匹配的二进制 wheel 时失败，不转为源码编译。
@@ -20,7 +20,7 @@
 
 ```bash
 .venv/bin/python scripts/build_pc_deb.py \
-  --output /tmp/rp1-monitor-deb-20261104-2 \
+  --output /交付目录/native-monitor-platform-20261106-offline/build \
   --wheelhouse /实际路径/上次构建的wheelhouse
 ```
 
@@ -34,10 +34,10 @@
 
 ```bash
 sha256sum -c SHA256SUMS
-sudo apt install ./rp1-monitor-app_0.4.0+20261104.1_amd64.deb
+sudo apt install ./rp1-monitor-app_0.4.1+platform.20261106.1_amd64.deb
 ```
 
-deb 自带应用及全部 Python 依赖 wheel，安装脚本仅在 `/opt/rp1-monitor-app/venv` 创建独立环境，以 `pip --no-index` 从包内安装。升级会重新安装包内 wheel，确保同为 `0.4.0` 的应用 wheel 也更新为此次打包代码。安装、升级均不启动或停止服务，不连接机器人，不初始化 PostgreSQL，不改写或删除用户结果。
+deb 自带应用及全部 Python 依赖 wheel，安装脚本仅在 `/opt/rp1-monitor-app/venv` 创建独立环境，以 `pip --no-index` 从包内安装。升级会重新安装包内 wheel，确保实际代码来自此次安装包。安装、升级均不启动或停止服务，不连接机器人，不初始化 PostgreSQL，不改写或删除用户结果。
 
 系统层面的 Python venv、Qt/X11/WebEngine 库及中文字体由 deb 的 `Depends` 声明。全新电脑如果缺少这些系统组件，`apt` 仍需包源或提前准备匹配 Ubuntu 24.04 的系统 deb 集合；只拿本应用 deb 不能保证全新离线电脑具备系统依赖。
 
@@ -49,7 +49,7 @@ rp1-monitor-app factory
 rp1-monitor-app web
 ```
 
-默认数据目录为 `${XDG_DATA_HOME:-$HOME/.local/share}/rp1-monitor-app/`，工厂结果和后台状态分别写在其中的 `factory/`、`station/`。应用由当前普通用户运行；不在 `/opt` 写测试结果。查看教程及 CSV 模板可进入 `/usr/share/doc/rp1-monitor-app/`。包内保留的导出源码在 `/opt/rp1-monitor-app/source/`，日常使用上面的安装入口。
+默认数据目录为 `${XDG_DATA_HOME:-$HOME/.local/share}/rp1-monitor-app/`，工厂结果和后台状态分别写在其中的 `factory/`、`station/`，独立平台工作区位于同级 `station-platform/`。应用由当前普通用户运行；不在 `/opt` 写测试结果。查看教程及 CSV 模板可进入 `/usr/share/doc/rp1-monitor-app/`。包内保留的导出源码在 `/opt/rp1-monitor-app/source/`，日常使用上面的安装入口。
 
 需要明确复用原有电脑目录时，先关闭该电脑的旧界面，确认现场后台和记录状态，再为新入口指定原 `runtime` 路径。例如：
 
