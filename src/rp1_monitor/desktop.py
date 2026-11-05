@@ -45,6 +45,7 @@ from .desktop_connection import (
     local_endpoint,
     ssh_arguments,
 )
+from .desktop_theme import DIALOG_STYLE, install_light_theme
 from .health_view import build_health
 from .models import metric_max_age_ms
 
@@ -53,11 +54,11 @@ _RETIRED_READERS = set()
 
 
 def pending_desktop_workers():
-    """Threads owning only this computer's outstanding preview/HTTP reads."""
-    from . import desktop_factory, desktop_operations, desktop_recordings, desktop_thermal
+    """Outstanding native workers, including collector lifecycle operations."""
+    from . import desktop_collector, desktop_factory, desktop_operations, desktop_recordings, desktop_thermal
 
     workers = set(_PROBES) | set(_RETIRED_READERS)
-    for module in (desktop_factory, desktop_operations, desktop_recordings, desktop_thermal):
+    for module in (desktop_collector, desktop_factory, desktop_operations, desktop_recordings, desktop_thermal):
         workers.update(module._WORKERS)
     return [worker for worker in workers if isinstance(worker, QThread) and worker.isRunning()]
 
@@ -106,12 +107,16 @@ QScrollBar:vertical { background:#edf3fb; width:10px; margin:0; }
 QScrollBar::handle:vertical { background:#b6c7df; min-height:28px; border-radius:5px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
 QSplitter::handle { background:#d6e3f5; }
-"""
+""" + DIALOG_STYLE
 
 
 class GridBackground(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
+        if self.property("plainBackground"):
+            painter.fillRect(self.rect(), QColor("#f4f7fc"))
+            painter.end()
+            return
         painter.fillRect(self.rect(), QColor("#eef5ff"))
         painter.setPen(QPen(QColor("#e1ebfb"), 1))
         for x in range(0, self.width(), 40):
@@ -180,6 +185,7 @@ class Reader(QThread):
 class MonitorWindow(QMainWindow):
     def __init__(self, url):
         super().__init__()
+        install_light_theme(QApplication.instance())
         self.setWindowTitle("RP1 整机健康监测")
         self.resize(1380, 860)
         self.setMinimumSize(1000, 680)
@@ -1290,6 +1296,28 @@ class MonitorWindow(QMainWindow):
             "generation": self.connection_generation,
         }
 
+    def open_collector_manager(self):
+        from .desktop_collector import CollectorDialog
+
+        dialog = getattr(self, "collector_dialog", None)
+        selected = self.station_robots.currentData() or self.station_robot_id
+        row = self.station_connections.get(selected, {})
+        context = {
+            "target": row.get("target") or self.ssh_target.text().strip(),
+            "robot_id": selected if row else "",
+            "known_hosts": (Path(self.station_token_file).with_name("known_hosts")
+                            if self.station_token_file else Path("runtime/station/known_hosts")),
+        }
+        if (dialog is not None and not dialog.isVisible() and not dialog.worker
+                and dialog.target.text().strip() != context["target"]):
+            dialog.deleteLater()
+            dialog = None
+        if dialog is None:
+            self.collector_dialog = dialog = CollectorDialog(context, self)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
     def populate_metrics(self):
         self.metric_list.blockSignals(True)
         self.metric_list.clear()
@@ -1505,6 +1533,12 @@ class MonitorWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._closing = True
+        collector = getattr(self, "collector_dialog", None)
+        if collector and not collector.shutdown():
+            self.connection_label.setText("正在完成机器人采集端管理操作，请等待结果后关闭。")
+            QTimer.singleShot(100, self.close)
+            event.ignore()
+            return
         motor_control = getattr(self.joint_inspection_panel, "motor_control_dialog", None)
         if motor_control and not motor_control.shutdown():
             event.ignore()
@@ -1563,6 +1597,7 @@ def _run_desktop(args):
         except Exception as exc:
             station_error = f"电脑后台暂不可用：{type(exc).__name__}；工厂本地导入、曲线和报告仍可使用。"
     app = QApplication.instance() or QApplication([])
+    install_light_theme(app)
     window = AppMonitorWindow(
         args.url,
         motor_map_config=MotorMapConfig.load(args.motor_map),

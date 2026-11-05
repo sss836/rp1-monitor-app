@@ -103,18 +103,25 @@ def _motor_summary(result, dof, *, parameters):
              "partial": "部分更新", "unknown": "结果未知", "rejected": "操作未完成"}.get(result.get("state"), "未知")
     lines = [f"回执记录覆盖 {len(motors)}/{dof} 台；{state}；观察时间：{_display(result.get('observed_at'))}。"]
     for motor in motors:
-        line = f"{_display(motor.get('address'))}：FW {_display(motor.get('firmware'))}；HW {_display(motor.get('hardware'))}；协议 {_display(motor.get('protocol'))}。"
+        line = f"{_display(motor.get('address'))}：型号 {_display(motor.get('model'))}；FW {_display(motor.get('firmware'))}；HW {_display(motor.get('hardware'))}；协议 {_display(motor.get('protocol'))}。"
         if parameters:
             values = motor.get("parameters") or {}
             values = values if isinstance(values, dict) else {}
+            readings = []
             differences = []
             for key in ("KP", "KD", "POS", "SPD", "TOR"):
                 value = values.get(key) or {}
                 if not isinstance(value, dict) or not value:
-                    differences.append(key + "未读取")
-                elif value.get("matches") is not True:
-                    differences.append(f"{key} 实际 {_range(value.get('actual'))}，期望 {_range(value.get('expected'))} {value.get('unit') or ''}".rstrip())
-            line += " 回执量程：" + ("；".join(differences) if differences else "KP/KD/POS/SPD/TOR一致") + "。"
+                    readings.append(key + "未读取")
+                    differences.append(key)
+                else:
+                    readings.append(f"{key} 实际 {_range(value.get('actual'))}，期望 {_range(value.get('expected'))} {value.get('unit') or ''}".rstrip())
+                    if value.get("matches") is not True:
+                        differences.append(key)
+            line += " 回执量程：" + "；".join(readings) + "。"
+            if not differences:
+                line += " KP/KD/POS/SPD/TOR一致。"
+            line += f" CAN_TIMEOUT {_display(motor.get('can_timeout_ms'))} ms（只读记录，未判定合规）。"
         if motor.get("errors"):
             line += " 读取异常：" + "；".join(str(error) for error in motor["errors"])
         lines.append(line)
@@ -309,11 +316,7 @@ def _motor_rows(store, by_key, reports, binding, dof):
     except (ValueError, TypeError, AttributeError, KeyError) as validation_error:
         request_valid = False
         error = error or "参数请求校验失败：" + str(validation_error)
-    identity_matches = bool(request_valid and binding
-                            and request.get("robot_id") == result.get("robot_id") == binding.get("robot_id")
-                            and request.get("request_id") == result.get("request_id")
-                            and request.get("dof") == result.get("dof") == dof
-                            and type(result.get("dof")) is int)
+    identity_matches = request_valid and _motor_identity_matches(request, result, binding, dof)
     for code in ("SYS-003", "SYS-004"):
         row = by_key[code]
         row.update(source_kind=binding["source_kind"] if identity_matches else "", verdict="待复核",
@@ -373,6 +376,46 @@ def _motor_rows(store, by_key, reports, binding, dof):
             row["actual_result"] += f"\n覆盖 {len(motors)}/{dof} 台，完整性待复核。"
             if row["verdict"] == "通过":
                 row["verdict"] = "待复核"
+
+
+def _motor_identity_matches(request, result, binding, dof):
+    return bool(binding and request.get("robot_id") == result.get("robot_id") == binding.get("robot_id")
+                and request.get("request_id") == result.get("request_id")
+                and request.get("dof") == result.get("dof") == dof
+                and type(result.get("dof")) is int)
+
+
+def motor_parameter_report(store, sn):
+    """The latest checked receipt, only after native hash and SN/robot validation."""
+    from .motor_parameters_remote import validate_request
+
+    sn = store.validate_sn(sn)
+    with store.lock:
+        reports = _motor_attachments(store, sn)
+        if not reports:
+            return None
+        attachment, body, error = reports[-1]
+        if error:
+            return None
+        request, result = body["request"], body["result"]
+        try:
+            validate_request(dict(request))
+        except (ValueError, TypeError, AttributeError, KeyError):
+            return None
+        binding, dof = store.sn_identity(sn), store.model_dof(sn)
+        if not _motor_identity_matches(request, result, binding, dof) or result.get("state") != "checked":
+            return None
+        motors = result.get("rows")
+        if (not isinstance(motors, list) or not 0 < len(motors) <= dof
+                or any(not isinstance(motor, dict) or not isinstance(motor.get("address"), str)
+                       or not motor["address"] or not isinstance(motor.get("parameters"), dict)
+                       or any(not isinstance(value, dict) for value in motor["parameters"].values())
+                       for motor in motors)
+                or len({motor["address"] for motor in motors}) != len(motors)):
+            return None
+        return {"attachment_id": attachment["attachment_id"], "sha256": attachment["sha256"],
+                "source_kind": binding["source_kind"], "robot_id": binding["robot_id"],
+                "request_id": request["request_id"], "dof": dof, "result": result}
 
 
 def _motion_summary(store, segment):

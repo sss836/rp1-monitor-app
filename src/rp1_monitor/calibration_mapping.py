@@ -29,6 +29,13 @@ _SOURCE_SHA256 = {
     "src/motors/src/drivers/lro/lro_motor_driver.hpp":
         "ba9c9192ba95737f48c546c7c799cdaae6f2851f6d438b43f20d320a61513d08",
 }
+# The pinned 103d0f policy-gain configuration has been identified offline,
+# but the changed RobotInterface lifecycle and gain path lack hardware/closed-
+# chain validation. Recognising it here is deliberately not an authorization.
+_UNVERIFIED_POLICY_CONFIG_SHA256 = {
+    24: "a61ba9f01dbfbc088f451dd05e0a8ab3330ebf730351c76b9d0295af0acf523b",
+    28: "3f5afbd5dd4f242616dffbd2b5c55098a7cadb1cc288f24e084da3e014f5dee3",
+}
 _LEG = ("hip_pitch", "hip_roll", "hip_yaw", "knee", "ankle_pitch", "ankle_roll")
 _ARM = ("shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow", "wrist_roll",
         "wrist_yaw", "wrist_pitch")
@@ -119,6 +126,13 @@ def version_bound_mapping(dof, motors=None, *, root=None):
             base = Path(root).resolve(strict=True)
             if not base.is_dir():
                 raise ValueError("deploy根路径不是目录")
+            robot_source = (base / profile["robot_config_path"]).resolve(strict=True)
+            if not robot_source.is_relative_to(base) or not robot_source.is_file():
+                raise ValueError("标定映射机器人配置路径不合法")
+            if hashlib.sha256(robot_source.read_bytes()).hexdigest() == _UNVERIFIED_POLICY_CONFIG_SHA256[dof]:
+                raise ValueError("检测到新版策略增益 deploy；机器人控制接口与复位流程已变化，"
+                                 "关节/电机映射和踝部闭链尚未完成该版本实机验证，"
+                                 "已阻止标定及限位真机动作")
             for relative, expected in sources.items():
                 source = (base / relative).resolve(strict=True)
                 if (not source.is_relative_to(base) or not source.is_file()

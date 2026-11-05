@@ -562,6 +562,12 @@ class AppMonitorWindow(MonitorWindow):
             "上位机服务填写 relay 的根地址，不是中央网页地址。缺失、过期数据保持未知。"
         )
         layout.addWidget(self.connection_summary)
+        self.collector_manager_button = QPushButton("机器人采集端管理…")
+        self.collector_manager_button.setAccessibleName("机器人采集端安装更新启动停止卸载")
+        self.collector_manager_button.setMinimumHeight(44)
+        self.collector_manager_button.clicked.connect(self.open_collector_manager)
+        layout.addWidget(self.collector_manager_button)
+        layout.addWidget(label("采集端尚未启动时，也可通过 SSH 安装、更新和启动；卸载会清除机器人上的本工具及其测试数据。"))
         layout.addStretch()
         self.update_connection_mode()
         scroll = QScrollArea()
@@ -574,6 +580,8 @@ class AppMonitorWindow(MonitorWindow):
         if index == 7:
             self.recordings_panel.refresh_context()
         self.pages.setCurrentIndex(index)
+        self.centralWidget().setProperty("plainBackground", index == 9)
+        self.centralWidget().update()
         self.nav.button(index).setChecked(True)
         self.app_title.setText("RP1 " + self.nav.button(index).text())
         self.update_factory_guidance()
@@ -584,14 +592,15 @@ class AppMonitorWindow(MonitorWindow):
             return
         routes = {
             "board": (6, self.operations_panel.board_panel.refresh, "新运行的单项自检将自动保存到发起时选定的SN；已经做完的自检可点击“将当前自检结果保存到此SN”，无需重测。"),
-            "calibration": (8, self.joint_inspection_panel.calibrate, "点击“标定”，按原流程操作；结束后返回工厂第2项确认流程状态。"),
+            "calibration": (8, self.joint_inspection_panel.calibrate, "点击“标定”，按原流程操作；结束后返回SYS-005确认流程状态。"),
             "calibration_check": (8, self.joint_inspection_panel.motor_control, "点击“标定检查”；腰部插销确认后、左右髋 pitch 在零位±2°内保持5秒，其他关节按URDF引导摆向限位。"),
             "postzero": (8, self.joint_inspection_panel.postzero, "角度监控已合并到当前页。选择数据来源即可查看或采样；读数不代替标定检查结果。"),
         }
         if target not in routes:
             return
         index, control, hint = routes[target]
-        self.factory_guidance = {"sn": self.factory_panel.sn, "item": item, "hint": hint}
+        code = {"board": "SYS-001", "calibration": "SYS-005", "calibration_check": "SYS-006", "postzero": "SYS-006"}[target]
+        self.factory_guidance = {"sn": self.factory_panel.sn, "item": item, "case_code": code, "hint": hint}
         self.navigate(index)
         if index == 8:
             scroll = self.joint_inspection_panel.findChild(QScrollArea)
@@ -604,18 +613,19 @@ class AppMonitorWindow(MonitorWindow):
         if not guidance:
             return
         item, sn = guidance["item"], guidance["sn"]
+        case = guidance.get("case_code") or f"第{item}项"
         frame = self.last_frame or {}
         robot = frame.get("robot_id") if self.active_source_url else None
         connected = bool(robot) and frame.get("upload", {}).get("collector_connected") is not False
         identity = getattr(self.factory_panel, "identity", None)
         mismatch = bool(robot and identity and (robot, frame.get("source_kind")) != (identity["robot_id"], identity["source_kind"]))
-        _set_text(self.factory_return_label, f"工厂SN：{sn or '未选择'} · 第{item}项 · 当前工具主连接：{robot or '未连接'}")
+        _set_text(self.factory_return_label, f"工厂SN：{sn or '未选择'} · {case} · 当前工具主连接：{robot or '未连接'}")
         connection = "请先到“设备设置”连接本SN对应机器人；工厂独立SSH仅用于动作日志。" if not connected else "请核对工具中的机器人身份与本SN对应；已完成与是否通过分别保存。"
         if mismatch:
             connection = f"当前工具主连接与动作日志连接 {identity['robot_id']} / {identity['source_kind']} 不一致，请先核对机器人。"
         _set_text(self.factory_tool_hint, guidance["hint"] + "\n" + connection)
         _set_style(self.factory_tool_hint, "color:#9a4f11;" if mismatch or not connected else "")
-        self.factory_return_button.setText(f"返回工厂 · 查看第{item}项结果")
+        self.factory_return_button.setText(f"返回整机测试 · 查看{case}结果")
 
     def factory_sn_changed(self, sn):
         board = self.operations_panel.board_panel
@@ -720,7 +730,10 @@ class AppMonitorWindow(MonitorWindow):
         if self.factory_panel.sn != guidance["sn"]:
             self.factory_panel.notice.setText("工厂SN已变化，请核对本次工具输出属于哪台机器人，再选择对应测试项保存；未自动关联或保存。")
             return
-        self.factory_panel.show_item_result(guidance["item"])
+        if guidance.get("case_code"):
+            self.factory_panel.show_case_result(guidance["case_code"])
+        else:
+            self.factory_panel.show_item_result(guidance["item"])
 
     def open_factory_hardware_notes(self):
         from PySide6.QtWidgets import QDialog, QDialogButtonBox, QTextBrowser

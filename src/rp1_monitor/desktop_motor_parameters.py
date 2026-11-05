@@ -52,11 +52,14 @@ def range_text(value):
 
 
 class MotorParameterDialog(QDialog):
+    report_requested = Signal(str)
+
     def __init__(self, context, sn, dof, save_report, parent=None):
         super().__init__(parent)
         self.context, self.sn, self.dof, self.save_report = dict(context), sn, dof, save_report
         self.worker = None
         self.snapshot = None
+        self.report_available = False
         self.setObjectName("motorParameterDialog")
         self.setWindowTitle("电机参数检查与更新")
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
@@ -106,9 +109,18 @@ class MotorParameterDialog(QDialog):
         self.update.setEnabled(False)
         self.close_button = QPushButton("关闭")
         self.close_button.clicked.connect(self.reject)
+        self.report_button = QPushButton("查看报告 / 导出…")
+        self.report_button.setToolTip("检查结果自动加入当前SN；进入报告页可编辑结果并导出CSV。")
+        self.report_button.setEnabled(False)
+        self.report_button.clicked.connect(self.open_report)
         buttons.addWidget(self.update, 1)
+        buttons.addWidget(self.report_button)
         buttons.addWidget(self.close_button)
         body.addLayout(buttons)
+
+    def open_report(self):
+        if self.report_available and self.worker is None:
+            self.report_requested.emit(self.sn)
 
     def selected(self):
         return [self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
@@ -162,6 +174,7 @@ class MotorParameterDialog(QDialog):
         self.confirm.setEnabled(False)
         self.table.setEnabled(False)
         self.close_button.setEnabled(False)
+        self.report_button.setEnabled(False)
         self.status.setText("正在逐台读取参数…" if operation == "check" else "正在重新核对原值并更新所选差异；请勿关闭或拔线…")
         self.worker = ParameterWorker(self.context, password, request, self)
         self.worker.completed.connect(self.complete)
@@ -173,8 +186,10 @@ class MotorParameterDialog(QDialog):
             self.save_report(self.sn, self.request, result)
         except Exception as error:
             self.snapshot = None
+            self.report_available = False
             self.status.setText(f"操作回执在本次窗口，归档失败：{error}。请核对实际值，勿重复更新。")
             return
+        self.report_available = True
         self.snapshot = result if result["state"] == "checked" else None
         if self.snapshot:
             self.render(result)
@@ -207,13 +222,14 @@ class MotorParameterDialog(QDialog):
                 self.table.setItem(index, column, item)
         self.table.resizeRowsToContents()
         self.table.blockSignals(False)
-        self.status.setText(f"范围一致{counts['match']}台 · 有差异{counts['different']}台 · 未完成{counts['unreadable']}台。检查已归档到SN：{self.sn}；固件版本及其他Pn参数未判定合规。")
+        self.status.setText(f"范围一致{counts['match']}台 · 有差异{counts['different']}台 · 未完成{counts['unreadable']}台。已加入SN：{self.sn}的SYS-003 / SYS-004报告，可点击“查看报告 / 导出”。固件版本及其他Pn参数未判定合规。")
 
     def finished_worker(self):
         self.worker.deleteLater()
         self.worker = None
         for widget in (self.check, self.password, self.confirm, self.table, self.close_button):
             widget.setEnabled(True)
+        self.report_button.setEnabled(self.report_available)
         self.update_enabled()
 
     def reject(self):

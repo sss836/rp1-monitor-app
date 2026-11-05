@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import time
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -15,7 +16,6 @@ from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -30,7 +30,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
-    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -45,11 +44,9 @@ from .factory_models import FactorySegmentStart
 from .factory_store import FUNCTIONAL_CHECK_NAMES, ITEM_NAMES, STATUS_NAMES, FactoryStore
 from .factory_test_catalog import (
     BOARD_CASE_CODES,
-    CALIBRATION_CASE_CODES,
     CATEGORY_NAMES,
     ESTOP_PAIRING_CASE_CODE,
     FUNCTION_CASE_CODES,
-    LIGHT_CASE_CODE,
     MOTION_CASE_CODES,
     MOTOR_PARAMETERS_CASE_CODE,
     TEST_FAMILIES,
@@ -157,12 +154,16 @@ class FactoryPanel(QScrollArea):
         self.selected_stage = 1
         self.board_queue = []
         self.setWidgetResizable(True)
+        self.setStyleSheet("""
+            QPushButton#factorySecondaryAction { background:white; color:#45618b;
+                border:1px solid #cbd8ec; font-weight:500; }
+            QTabWidget#factoryTabs::pane { border:none; background:transparent; }
+            QTabBar#factoryTabBar::tab { border:0; background:transparent; padding:12px 20px; }
+            QTabBar#factoryTabBar::tab:selected { border-bottom:2px solid #3559e6; color:#3559e6; }
+        """)
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.addWidget(_text("整机测试 · SYS编号体系。按整机SN保存，独立于单元老化、独立主控和串联测试。先打开整机SN，再选择测试分类。"))
-        self._button(layout, "查看测试编号目录", self.show_test_catalog)
         self.notice = _text("主控、标定、功能、运控分别测试。运控先开始记录，再到机器人端手动启动deploy，测试后读取数据。", label_type=_NoticeLabel)
-        layout.addWidget(self.notice)
         row = QHBoxLayout()
         self.sn_edit = QComboBox()
         self.sn_edit.setEditable(True)
@@ -178,6 +179,8 @@ class FactoryPanel(QScrollArea):
         self.model.setAccessibleName("工厂SN机型")
         self.model.currentIndexChanged.connect(self.model_changed)
         row.addWidget(self.model)
+        catalog_button = self._button(row, "编号目录", self.show_test_catalog)
+        catalog_button.setObjectName("factorySecondaryAction")
         layout.addLayout(row)
         self.current_sn = _text("当前SN：未选择")
         layout.addWidget(self.current_sn)
@@ -212,6 +215,8 @@ class FactoryPanel(QScrollArea):
         form.addRow(buttons)
         connection_layout.addWidget(connection)
         self.work_tabs = QTabWidget()
+        self.work_tabs.setObjectName("factoryTabs")
+        self.work_tabs.tabBar().setObjectName("factoryTabBar")
         layout.addWidget(self.work_tabs)
 
         record = QGroupBox("机器人本地测试记录")
@@ -381,147 +386,80 @@ class FactoryPanel(QScrollArea):
         body.addWidget(self.attachment_note)
         self.item.currentIndexChanged.connect(self.select_item)
         self.work_tabs.addTab(results, "测试结果与报告")
+        layout.addWidget(self.notice)
         layout.addWidget(_text(f"本地目录：{self.store.directory}；数据保存在本机，中央工厂报告同步暂未接入。"))
         self.setWidget(page)
         self.select_stage(1)
         self.refresh_local()
 
     def build_workflow(self, record):
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 8, 0, 0)
-        steps = QHBoxLayout()
-        self.category_buttons = QButtonGroup(self)
-        self.category_buttons.setExclusive(True)
-        for category in CATEGORY_NAMES:
-            button = self._button(steps, CATEGORY_NAMES[category], lambda _checked=False, value=category: self.select_category(value))
-            button.setObjectName("factoryStage")
-            button.setCheckable(True)
-            button.setMinimumHeight(44)
-            button.setProperty("testCategory", category)
-            self.category_buttons.addButton(button)
-        layout.addLayout(steps)
-        self.stage_selector = QWidget()
-        substeps = QHBoxLayout(self.stage_selector)
-        substeps.setContentsMargins(0, 0, 0, 0)
-        self.stage_buttons = QButtonGroup(self)
-        self.tool_buttons = {}
-        self.stage_buttons.setExclusive(True)
-        for number, title in enumerate(("板卡 / 电机参数", "整机标定", "标定检查", "运动 / 急停 / 换电", "特技测试"), 1):
-            caption = f"{CALIBRATION_CASE_CODES[number]} · {title}" if number in CALIBRATION_CASE_CODES else title
-            button = self._button(substeps, caption, lambda _checked=False, value=number: self.select_stage(value))
-            button.setObjectName("factoryStage")
-            button.setCheckable(True)
-            button.setMinimumHeight(44)
-            self.stage_buttons.addButton(button, number)
-            button.setVisible(number in (2, 3))
-        self.setStyleSheet("QPushButton#factoryStage {background:#ffffff;color:#2853a8;border:1px solid #a7bcd8;padding:8px;} QPushButton#factoryStage:checked {background:#dae8ff;color:#234fd1;border:2px solid #2b59e8;font-weight:700;} QPushButton#factoryStage:focus {border:2px solid #142441;}")
-        layout.addWidget(self.stage_selector)
-        self.stage_status = _text("未选择SN。可以先查看各项入口；打开SN后保存对应结果。")
-        layout.addWidget(self.stage_status)
-        self.stage_pages = QStackedWidget()
-        definitions = (
-            ("第1项 · 镜像、板卡、电气与电机参数", "进入“硬件自检”，点击“一键执行17项基础自检”：原14项、IMU连续数据、IMU固件版本和BMS重启恢复依次运行，中文结果自动归档到当前SN。灯板和电机参数使用下方独立流程。", (("前往基础自检（17项）", "board"), ("查看灯板 / 电机参数说明", "hardware_notes"))),
-            ("第2项 · 整机标定", "进入“角度与标定”→“标定”，使用机器人已有标零流程。结束后返回此处确认流程状态。", (("前往标定", "calibration"),)),
-            ("第3项 · 标定检查", "进入“角度与标定”→“标定检查”。腰部插销确认后、左右髋 pitch 在零位±2°内保持5秒；其他关节按URDF引导摆向限位。合格后自动切换。", (("前往标定检查", "calibration_check"),)),
-        )
-        for number, (title, description, actions) in enumerate(definitions, 1):
-            box = QGroupBox(title)
-            body = QVBoxLayout(box)
-            body.addWidget(_text(description))
-            body.addWidget(_text("连接：这些原工具使用“设备设置”中的主界面连接。跳转只定位入口，不自动运行；请核对工具显示的机器人身份与本SN对应。"))
-            buttons = QHBoxLayout()
-            for caption, target in actions:
-                self.tool_buttons[target] = self._button(buttons, caption, lambda _checked=False, route=target, item=number: self.tool_requested.emit(route, item))
-            self._button(buttons, f"填写第{number}项结果 / 添加附件", lambda _checked=False, item=number: self.show_item_result(item))
-            body.addLayout(buttons)
-            if number == 1:
-                self.parameter_button = self._button(body, f"{MOTOR_PARAMETERS_CASE_CODE} · 电机参数检查 / 更新…", self.open_motor_parameters)
-                self.light_stage_note = _text("灯板现场确认：尚未记录。")
-                body.addWidget(self.light_stage_note)
-                self._button(body, f"{LIGHT_CASE_CODE} · 确认灯板是否亮灯", self.confirm_light)
-                body.addWidget(_text("板卡自检：选定SN后新运行的检查会自动保存；已做完的检查可在自检页直接关联SN。灯板按原流程点亮后，在此记录实际观察。"))
-                self.estop_pairing_box = QGroupBox(f"{ESTOP_PAIRING_CASE_CODE} · 远程急停开关对频测试")
-                pairing_layout = QVBoxLayout(self.estop_pairing_box)
-                pairing_layout.addWidget(_text("现场完成对频后点击结果；这里只记录人工结论，不发送对频或急停命令。"))
-                self.estop_pairing_note = _text("未测试；请先选择整机SN。")
-                pairing_layout.addWidget(self.estop_pairing_note)
-                pairing_buttons = QHBoxLayout()
-                self.estop_pairing_buttons = {}
-                for value, caption in (("pass", "通过"), ("fail", "不通过")):
-                    button = self._button(pairing_buttons, caption,
-                        lambda _checked=False, status=value: self.record_estop_pairing(status))
-                    button.setAccessibleName(f"{ESTOP_PAIRING_CASE_CODE} 远程急停开关对频测试 {caption}")
-                    button.setMinimumHeight(44)
-                    self.estop_pairing_buttons[value] = button
-                pairing_layout.addLayout(pairing_buttons)
-                body.addWidget(self.estop_pairing_box)
-            elif number == 2:
-                self.calibration_confirmation_note = _text("整机标定：尚未确认。")
-                body.addWidget(self.calibration_confirmation_note)
-                self._button(body, "标定结束，确认状态", self.confirm_calibration)
-                body.addWidget(_text("人工确认流程状态后自动保存到当前SN；逐电机写零结果仍需后续标定检查。"))
-            elif number == 3:
-                self.calibration_stage_note = _text("标定检查：尚未关联；先选SN，已有结果可导入。")
-                body.addWidget(self.calibration_stage_note)
-                self._button(body, "导入已有标定检查 JSON", self.import_calibration_check)
-                body.addWidget(_text("从本项入口开始检查后，结果自动保存到开始时选定的SN。逐关节结果在“测试结果与报告”中查看；跳过或未测不算合格。"))
-            else:
-                body.addWidget(_text("原工具的记录可作为附件保存；返回本SN后可直接勾选“已完成”，并保存实际结论和备注。"))
-            body.addStretch()
-            self.stage_pages.addWidget(box)
-        self.motion_record_box = record
-        self.stage_pages.addWidget(record)
-        functions = QWidget()
-        function_layout = QVBoxLayout(functions)
-        function_layout.addWidget(self.functional_check_box)
-        self._button(function_layout, "查看功能测试结果 / SOC截图", lambda: self.show_item_result(4))
-        function_layout.addStretch()
-        self.stage_pages.addWidget(functions)
-        layout.addWidget(self.stage_pages)
-        return page
+        from .desktop_factory_workbench import FactoryWorkbench
+
+        self.workbench = FactoryWorkbench(self, record)
+        return self.workbench
+
+    def select_case(self, code):
+        return self.workbench.select_case(code)
 
     def select_category(self, category):
-        if category == "FUNC":
-            self.selected_stage = 4
-            self.stage_pages.setCurrentIndex(4)
-            self.functional_check_box.show()
-            self.stage_selector.hide()
-            self._check_category("FUNC")
-        else:
-            self.select_stage({"CTRL": 1, "CAL": 2, "MOTION": 4}[category])
-
-    def _check_category(self, category):
-        for button in self.category_buttons.buttons():
-            button.setChecked(button.property("testCategory") == category)
+        return self.workbench.select_category(category)
 
     def select_stage(self, number):
-        if not 1 <= number <= 5:
-            return
-        if number == 5 and self.model.currentData() == 28:
-            self.notice.setText("28轴不进行特技测试；第5项报告自动注明不适用。")
-            return
-        self.selected_stage = number
-        self.stage_buttons.button(number).setChecked(True)
-        self.stage_pages.setCurrentIndex(number - 1 if number <= 3 else 3)
-        self._check_category("CTRL" if number == 1 else "CAL" if number in (2, 3) else "MOTION")
-        self.stage_selector.setVisible(number in (2, 3))
-        if number == 5:
-            self.test_type.setCurrentIndex(self.test_type.findData("stunt"))
-        elif number == 4 and self.test_type.currentData() == "stunt":
-            self.test_type.setCurrentIndex(self.test_type.findData("walking"))
-        self.motion_record_box.setTitle(f"第{number}项 · {ITEM_NAMES[number]} · 测试记录" if number >= 4 else "动作日志")
-        self.functional_check_box.hide()
-        if number >= 4:
-            self.motion_result_button.setText(f"保存到第{number}项结果")
+        # Legacy item numbers remain the archive keys, not a second navigation bar.
+        return self.workbench.select_stage(number)
 
     def motion_type_changed(self):
-        if not hasattr(self, "stage_pages"):
+        if hasattr(self, "workbench"):
+            self.workbench.motion_type_changed()
+
+    def show_case_result(self, code):
+        from .factory_test_catalog import test_catalog
+
+        entry = next((row for row in test_catalog(self.model.currentData()) if row["code"] == code), None)
+        if entry is None:
             return
-        if self.test_type.currentData() == "stunt" and self.selected_stage != 5:
-            self.select_stage(5)
-        elif self.test_type.currentData() != "stunt" and self.selected_stage == 5:
-            self.select_stage(4)
+        self.item.setCurrentIndex(self.item.findData(entry["item"]))
+        self.work_tabs.setCurrentIndex(2)
+        table = self.result_summary.table
+        for index in range(table.rowCount()):
+            if table.item(index, 0).text() == code:
+                table.setCurrentCell(index, 0)
+                table.selectRow(index)
+                table.scrollToItem(table.item(index, 0))
+                break
+        table.setFocus()
+        self.ensureWidgetVisible(self.result_summary)
+        self.notice.setText(f"当前SN：{self.sn or '未选择，请先打开SN'} · {code} · {entry['name']}。"
+                            "已有结果与测试规则已带入，可编辑当前最终版、添加附件并导出。")
+
+    def confirm_motor_check(self, code, verdict):
+        """Save the operator's final conclusion for this local motor check only."""
+        summary = self.result_summary
+        if self.busy or self.closing or summary.busy:
+            return
+        if code not in ("SYS-003", "SYS-004") or verdict not in ("通过", "不通过"):
+            return
+        sn = self.sn
+        row = next((row for row in summary._rows if row["row_key"] == code), None)
+        if not sn or not row or not row.get("evidence"):
+            self.notice.setText("请先打开对应SN，并读取电机固件 / 参数检查结果，再确认本项结论。")
+            return
+        edit = deepcopy(summary._drafts.get(sn, {}).get(code, {
+            "row_key": code, "source_token": row["source_token"], "fields": {},
+        }))
+        edit["fields"]["verdict"] = verdict
+        notes = edit["fields"].get("notes", row.get("notes", ""))
+        notes = "\n".join(line for line in notes.splitlines() if not line.startswith("本项人工确认："))
+        edit["fields"]["notes"] = (notes + f"\n本项人工确认：{verdict}。").lstrip("\n")
+        station = summary._station_saved
+
+        def saved(_):
+            summary._drafts.get(sn, {}).pop(code, None)
+            self.refresh_local()
+            self.notice.setText(f"SN：{sn} · {code} 已人工确认{verdict}，左侧状态与报告已更新，可直接导出。")
+
+        self._job(lambda: self.store.save_report_edits(sn, [edit], station_id=station), saved,
+                  progress=f"正在保存SN：{sn} · {code} 的人工结论：{verdict}…")
 
     def show_item_result(self, number):
         self.item.setCurrentIndex(self.item.findData(number))
@@ -554,6 +492,7 @@ class FactoryPanel(QScrollArea):
         if progress:
             self.notice.setText(progress)
         self.busy = True
+        self.workbench.set_busy(True)
         self.widget().setEnabled(False)
         for button in self.action_buttons:
             button.setEnabled(False)
@@ -592,6 +531,7 @@ class FactoryPanel(QScrollArea):
                     on_error(exc)
         def finished():
             self.busy = False
+            self.workbench.set_busy(False)
             self.widget().setEnabled(not self.closing)
             for button in self.action_buttons:
                 button.setEnabled(not self.closing)
@@ -637,7 +577,7 @@ class FactoryPanel(QScrollArea):
         self.model.setCurrentIndex(self.model.findData(self.store.model_dof(sn)))
         self.model.blockSignals(False)
         self.sn_edit.setEditText(sn)
-        self.current_sn.setText(f"当前SN：{sn}")
+        self.current_sn.setText(f"样品 SN：{sn} · RP1 / {self.store.model_dof(sn)}轴 · 本地测试工作台")
         self.refresh_local()
         self.select_item()
         self.sn_changed.emit(sn)
@@ -656,14 +596,10 @@ class FactoryPanel(QScrollArea):
         self.update_model_controls()
 
     def update_model_controls(self):
-        if not hasattr(self, "stage_buttons") or not hasattr(self, "completed"):
+        if not hasattr(self, "workbench") or not hasattr(self, "completed"):
             return
         supported = self.model.currentData() == 24
-        self.stage_buttons.button(5).setEnabled(supported and not self.busy)
-        self.stage_buttons.button(5).setText("5. 特技测试" if supported else "5. 特技测试（28轴不适用）")
         self.test_type.model().item(self.test_type.findData("stunt")).setEnabled(supported)
-        if not supported and self.test_type.currentData() == "stunt":
-            self.test_type.setCurrentIndex(self.test_type.findData("walking"))
         applicable = not (not supported and self.item.currentData() == 5)
         self.completed.setEnabled(applicable)
         self.completed.setText("本项已完成" if applicable else "本项不适用（28轴）")
@@ -671,6 +607,7 @@ class FactoryPanel(QScrollArea):
         self.save_result_button.setEnabled(applicable and not self.busy)
         for button in self.functional_buttons.values():
             button.setEnabled(bool(self.sn) and not self.busy and not self.closing)
+        self.workbench.update_model_controls()
 
     def refresh_local(self):
         text = self.sn_edit.currentText()
@@ -678,7 +615,10 @@ class FactoryPanel(QScrollArea):
         self.sn_edit.addItems([row["sn"] for row in self.store.roster()])
         self.sn_edit.setEditText(text)
         if not self.sn:
+            if hasattr(self, "workbench"):
+                self.workbench.refresh_status([])
             return
+        self.current_sn.setText(f"样品 SN：{self.sn} · RP1 / {self.model.currentData()}轴 · 本地测试工作台")
         self.local_rows = self.store.list_segments(self.sn)
         self.local_table.setRowCount(len(self.local_rows))
         for index, row in enumerate(self.local_rows):
@@ -694,14 +634,6 @@ class FactoryPanel(QScrollArea):
         self.estop_pairing_history.setRowCount(len(pairing["history"]))
         for index, entry in enumerate(pairing["history"]):
             self._fill(self.estop_pairing_history, index, [entry["observed_at"], labels[entry["status"]]])
-        functions = self.result_rows[3]["functional_checks"]
-        category_done = {
-            "主控": self.result_rows[0]["completed"] and pairing["status"] in {"pass", "fail"},
-            "标定": all(row["completed"] for row in self.result_rows[1:3]),
-            "功能": all(row["status"] in {"pass", "fail"} for row in functions.values()),
-            "运控": self.result_rows[3]["completed"] and (self.result_rows[4]["completed"] or self.result_rows[4]["status"] == "not_applicable"),
-        }
-        self.stage_status.setText(f"SN：{self.sn} · " + "  |  ".join(f"{name}：{'已完成' if done else '未完成'}" for name, done in category_done.items()))
         self.result_table.blockSignals(True)
         self.result_table.setRowCount(5)
         for index, row in enumerate(self.result_rows):
@@ -780,6 +712,7 @@ class FactoryPanel(QScrollArea):
             self.result_summary.set_sn(self.sn)
         else:
             self.result_summary.refresh()
+        self.workbench.refresh_status(self.result_summary._rows)
 
     def _summary_busy_changed(self, busy):
         enabled = not busy and not self.busy and not self.closing
@@ -788,8 +721,10 @@ class FactoryPanel(QScrollArea):
         self.result_table.setEnabled(enabled)
         for button in self.action_buttons:
             button.setEnabled(enabled)
+        self.workbench.set_busy(not enabled)
         if not busy:
             self.update_model_controls()
+            self.workbench.refresh_status(self.result_summary._rows)
             QTimer.singleShot(0, self._drain_board_sync)
 
     def import_calibration_check(self):
@@ -992,7 +927,7 @@ class FactoryPanel(QScrollArea):
         ids = segment_ids if link.isChecked() else []
         def saved(_):
             self.refresh_local()
-            self.show_item_result(4)
+            self.show_case_result(FUNCTION_CASE_CODES[kind])
             self.notice.setText(f"已保存SN：{sn} 的{title}人工结论：{STATUS_NAMES[status]}；完整复测历史进入第4项报告。")
         if monitor.interrupted or monitor.reboot_observed:
             text += "\nSOC监听备注：" + ("观察到开机时长回退。" if monitor.reboot_observed else "曾断流或采集流切换。")
@@ -1040,12 +975,16 @@ class FactoryPanel(QScrollArea):
             return
         self.live_frame = frame
         self.live_frame_received = time.monotonic()
+        if hasattr(self, "workbench"):
+            self.workbench.refresh_status()
         if self.battery_swap_dialog:
             self.battery_swap_dialog.set_frame(frame)
 
     def mark_disconnected(self):
         self.live_frame = None
         self.live_frame_received = None
+        if hasattr(self, "workbench"):
+            self.workbench.refresh_status()
         if self.battery_swap_dialog:
             self.battery_swap_dialog.mark_disconnected()
 
@@ -1246,6 +1185,7 @@ class FactoryPanel(QScrollArea):
             def save_parameter_evidence(bound_sn, request, result):
                 self.save_motor_parameter_report(bound_sn, request, result, board_test_profile=profile_snapshot)
             self.motor_parameter_dialog = MotorParameterDialog(context, sn, dof, save_parameter_evidence, self)
+            self.motor_parameter_dialog.report_requested.connect(self.show_motor_parameter_report)
             self.motor_parameter_dialog.finished.connect(self.motor_parameter_dialog_closed)
             self.motor_parameter_dialog.open()
         self._job(lambda: FactoryClient(context["relay_url"]).probe(), complete,
@@ -1255,6 +1195,27 @@ class FactoryPanel(QScrollArea):
         if self.motor_parameter_dialog:
             self.motor_parameter_dialog.deleteLater()
             self.motor_parameter_dialog = None
+
+    def show_motor_parameter_report(self, sn):
+        """Open the already-archived check; never query hardware or duplicate evidence."""
+        if sn != self.sn or self.result_summary.busy or self.closing:
+            self.notice.setText("请先打开检查对应的SN并等待当前报告操作结束。")
+            return
+        if self.motor_parameter_dialog:
+            if self.motor_parameter_dialog.worker:
+                return
+            self.motor_parameter_dialog.reject()
+        self.refresh_local()
+        self.show_item_result(1)
+        table = self.result_summary.table
+        for index in range(table.rowCount()):
+            if table.item(index, 0).text() == MOTOR_PARAMETERS_CASE_CODE:
+                table.setCurrentCell(index, 0)
+                table.selectRow(index)
+                table.scrollToItem(table.item(index, 0))
+                break
+        self.notice.setText(f"SN：{sn} · 电机检查已自动加入SYS-003固件与SYS-004参数报告。"
+                            "可编辑当前最终版后导出CSV，或导出原始HTML / 明细CSV查看逐电机参数。")
 
     def save_motor_parameter_report(self, sn, request, result, *, board_test_profile=None):
         directory = self.store.directory / "motor-parameters"
@@ -1323,6 +1284,8 @@ class FactoryPanel(QScrollArea):
         self.update_duration()
 
     def update_duration(self):
+        if hasattr(self, "workbench"):
+            self.workbench.refresh_status()
         row = next((row for row in self.remote_rows if row["sn"] == self.sn and row["state"] == "recording"), None)
         if not row:
             self.duration_label.setText("每段记录要求超过2小时；已结束记录的实际时长在“本地曲线”查看。")

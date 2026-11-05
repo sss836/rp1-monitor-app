@@ -39,6 +39,7 @@ from .factory_test_catalog import (
     FUNCTION_CASE_CODES,
     LIGHT_CASE_CODE,
     MOTION_CASE_CODES,
+    MOTOR_PARAMETERS_CASE_CODE,
     SUITE_CODE,
     SUITE_NAME,
 )
@@ -1073,6 +1074,11 @@ class FactoryStore:
             raise OSError("报告目录磁盘空间不足；已有报告保留")
         with self.lock:
             segments, results = self.list_segments(sn), self.results(sn)
+            from .factory_result_summary import motor_parameter_report
+
+            parameters = motor_parameter_report(self, sn)
+            if parameters:
+                results[0] = {**results[0], "motor_parameters": parameters}
             for index, segment in enumerate(segments):
                 try:
                     _verify_file(self.packages / segment["segment_id"] / "segment.sqlite", segment["bytes"], segment["sha256"])
@@ -1116,6 +1122,19 @@ class FactoryStore:
                         write_row(["item_state", sn, item, "", "", "", "", "", "", "", "", "", "", result["status"], "28轴不进行特技测试" if result["status"] == "not_applicable" else "独立完成标记不改变人工结论或板卡结果", ""], completed=result["completed"], case_code=item_case)
                         for entry in result["history"]:
                             write_row(["human_result", sn, item, entry["result_id"], "", "", entry["created_at"], "", "", "", "", "", "", entry["status"], entry["notes"], ""], completed=entry.get("completed", entry["status"] != "incomplete"), case_code=item_case)
+                        parameter_report = result.get("motor_parameters")
+                        if parameter_report:
+                            receipt = parameter_report["result"]
+                            for sequence, motor in enumerate(receipt["rows"], 1):
+                                note = "MIT编码量程核查；固件与CAN_TIMEOUT为读取值，不自动判定合规或整项通过"
+                                if parameter_report["source_kind"] == "simulated":
+                                    note = "SIMULATED 模拟数据，不能作为实机结果；" + note
+                                write_row(["motor_parameter_check", sn, item, parameter_report["request_id"],
+                                           motor["address"], sequence, receipt.get("observed_at", ""), "", "",
+                                           parameter_report["source_kind"], _json(motor),
+                                           _json({"POS": "rad", "SPD": "rad/s", "TOR": "N·m", "can_timeout_ms": "ms"}),
+                                           "", motor.get("status", "unknown"), note, ""],
+                                          case_code=MOTOR_PARAMETERS_CASE_CODE)
                         pairing = result.get("estop_pairing")
                         if pairing:
                             head = pairing["latest"] or {}
@@ -1184,7 +1203,8 @@ class FactoryStore:
         board = result["board"]
         simulated = (any(segment["source_kind"] == "simulated" for segment in segments)
                      or bool(board and board["source_kind"] == "simulated")
-                     or any(row["source_kind"] == "simulated" for row in result.get("soc_observations", [])))
+                     or any(row["source_kind"] == "simulated" for row in result.get("soc_observations", []))
+                     or result.get("motor_parameters", {}).get("source_kind") == "simulated")
         warning = '<p class="warning">SIMULATED 模拟数据 · 不能作为实机测试结果</p>' if simulated else ""
         conclusion_label = "第4项有效结果" if result.get("functional_checks") else "人工结论"
         parts = [f'<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="suite_type" content="whole_robot"><meta name="suite_code" content="{esc(SUITE_CODE)}"><meta name="suite_name" content="{esc(SUITE_NAME)}"><title>{esc(sn)} · {esc(result["name"])}</title><style>body{{font:14px sans-serif;max-width:1100px;margin:30px auto;color:#182438;padding:0 16px}}table{{border-collapse:collapse;width:100%;font-size:12px}}th,td{{border:1px solid #bcc6d2;padding:6px;text-align:left;overflow-wrap:anywhere}}pre{{white-space:pre-wrap;overflow-wrap:anywhere}}.warning{{font-weight:bold;color:#ad2134;border:2px solid;padding:12px}}svg{{max-width:100%;height:auto}}section{{break-inside:avoid}}@media print{{button{{display:none}}body{{margin:0}}}}</style><body><button onclick="window.print()">打印 / 保存PDF</button><h1>{esc(SUITE_NAME)} {esc(SUITE_CODE)} · 第{result["item"]}项：{esc(result["name"])}</h1><p>SN：<strong>{esc(sn)}</strong> · 报告版本：{esc(version)}</p>{warning}<p>{conclusion_label}：<strong>{esc(STATUS_NAMES[result["status"]])}</strong>。人工填写与观测数据分别保留，不代表自动验收、审批或MTBF结果。</p><p>缺失只提示，不阻止后续测试或报告。策略名来自操作员标签，策略目标不等于最终电机目标。<a href="{esc(csv_name)}">完整数据CSV</a></p>']
@@ -1192,6 +1212,23 @@ class FactoryStore:
             parts.append('<p>本SN机型为28轴，第5项特技测试不适用，无需执行，不计为通过或待完成；既有历史记录保留。</p>')
         else:
             parts.append(f'<p>独立完成标记：<strong>{"已完成" if result["completed"] else "未完成"}</strong>。完成标记与人工结论、逐项板卡结果分别保存，勾选完成不代表测试通过。</p>')
+        parameter_report = result.get("motor_parameters")
+        if parameter_report:
+            from .factory_result_summary import _display, _range
+
+            receipt = parameter_report["result"]
+            parts.append(f'<section><h2>{MOTOR_PARAMETERS_CASE_CODE} · 电机参数检查明细</h2><p>机器人：{esc(parameter_report["robot_id"])} · 覆盖 {len(receipt["rows"])}/{parameter_report["dof"]} 台 · 读取时间：{esc(receipt.get("observed_at", "未知"))} · 附件SHA256：{esc(parameter_report["sha256"])}</p><p>各量程列为“实际 / 期望”。固件和CAN_TIMEOUT仅记录读取值；量程一致不自动代表整项通过。</p><table><tr><th>电机 / 型号</th><th>固件（读取值）</th><th>KP</th><th>KD</th><th>POS / rad</th><th>SPD / rad/s</th><th>TOR / N·m</th><th>CAN_TIMEOUT / ms</th><th>量程检查结果</th></tr>')
+            for motor in receipt["rows"]:
+                cells = [f'{motor["address"]} · 型号 {_display(motor.get("model"))}',
+                         _display(motor.get("firmware"))]
+                for key in ("KP", "KD", "POS", "SPD", "TOR"):
+                    value = motor["parameters"].get(key)
+                    cells.append(f'{_range(value.get("actual"))} / {_range(value.get("expected"))}'
+                                 if value else "未读取")
+                cells += [_display(motor.get("can_timeout_ms")),
+                          {"match": "范围一致", "different": "有差异", "unreadable": "未完成"}.get(motor.get("status"), "未知")]
+                parts.append('<tr>' + ''.join(f'<td>{esc(cell)}</td>' for cell in cells) + '</tr>')
+            parts.append('</table></section>')
         if result.get("functional_checks"):
             parts.append('<p>现场判据：远程急停使用独立急停遥控器／无线急停按钮切断电机电源，主控保持供电，核对电机断电、主控持续运行、保持及解除状态。电机反馈中断不等于主控掉电，也不能单独证明电机已断电。热换电允许全程连接网线，要求主控全程不断电、无重启，并核对通信及运行状态。未观测的现象不能据遥测恢复推断为通过。</p>')
             parts.append('<section><h2>整机功能测试：远程急停与热换电</h2><p>24轴与28轴均适用。人员在机器人现场操作并填写实际观察；上位机不触发急停、换电或策略。子项不要求持续2小时；动作记录仍要求每段超过2小时。数据中断不能自动证明急停或换电成功，也不推断断电原因。</p><p>第4项有效结果同时考虑整项人工结论和以下两项最新人工结论；任一子项失败时第4项不通过；缺失或未完成时不能标记完成。两个子项均已明确填写通过或失败后，可标记测试已完成，已完成不代表通过。历史原始结论保留。</p><table><tr><th>功能</th><th>最新人工结论</th><th>记录时间</th><th>现场观察 / 备注</th><th>关联片段 / SOC证据</th></tr>')

@@ -174,12 +174,16 @@ def _dof(value):
     return value
 
 
-def analyze_deploy_config(motor_config: dict, robot_config: dict, dof: int) -> dict:
+def analyze_deploy_config(
+    motor_config: dict, robot_config: dict, dof: int, *, policy_config: dict | None = None
+) -> dict:
     """Validate already parsed sections; valid structure never authorizes robot motion.
 
     ``urdf2motor[j]`` selects the physical motor index for logical joint ``j``.
     The files do not provide reliable joint names; callers must bind a specific URDF.
-    ``kp``/``kd`` are reported as configured gains, not approved probe parameters.
+    Legacy robot gains use physical-motor order. New policy gains use logical
+    joint order and must be mapped through ``urdf2motor`` before reporting
+    physical entries. Neither source is approved for hardware probing.
     """
     _dof(dof)
     if not isinstance(motor_config, dict) or not isinstance(robot_config, dict):
@@ -221,10 +225,27 @@ def analyze_deploy_config(motor_config: dict, robot_config: dict, dof: int) -> d
     signs = _array(robot_config, "motor_sign", dof)
     if any(type(sign) not in (int, float) or sign not in (-1, 1) for sign in signs):
         raise ValueError("motor_sign每项必须为+1或-1")
-    kp = [_number(item, "kp") for item in _array(robot_config, "kp", dof)]
-    kd = [_number(item, "kd") for item in _array(robot_config, "kd", dof)]
-    if any(gain < 0 for gain in kp + kd):
-        raise ValueError("kp和kd不能为负")
+    has_kp, has_kd = "kp" in robot_config, "kd" in robot_config
+    if has_kp != has_kd:
+        raise ValueError("robot.yaml的kp和kd必须同时提供")
+    if has_kp:
+        kp = [_number(item, "kp") for item in _array(robot_config, "kp", dof)]
+        kd = [_number(item, "kd") for item in _array(robot_config, "kd", dof)]
+        if any(gain < 0 for gain in kp + kd):
+            raise ValueError("kp和kd不能为负")
+        gain_source = "robot_yaml_physical_motor_order"
+    else:
+        if not isinstance(policy_config, dict):
+            raise ValueError("robot.yaml无kp/kd；必须明确选择包含增益的策略配置")
+        logical_kp = [_number(item, "kp") for item in _array(policy_config, "kp", dof)]
+        logical_kd = [_number(item, "kd") for item in _array(policy_config, "kd", dof)]
+        if any(gain <= 0 for gain in logical_kp) or any(gain < 0 for gain in logical_kd):
+            raise ValueError("策略kp必须大于0，kd不能为负")
+        kp, kd = [0.0] * dof, [0.0] * dof
+        for logical_index, motor_index in enumerate(mapping):
+            kp[motor_index] = logical_kp[logical_index]
+            kd[motor_index] = logical_kd[logical_index]
+        gain_source = "policy_yaml_logical_joint_order"
     closed = [
         _integer(item, "close_chain_motor_idx", 0, dof - 1)
         for item in _array(robot_config, "close_chain_motor_idx", 4)
@@ -306,6 +327,7 @@ def analyze_deploy_config(motor_config: dict, robot_config: dict, dof: int) -> d
         "calibration_passed": None,
         "name_binding": "unverified_logical_indices_only",
         "source_compatibility": analyze_lro_source_compatibility(None, None),
+        "gain_source": gain_source,
         "logical_joints": logical_joints,
         "closed_chain_pairs": pairs,
         "blockers": [{"code": code, "message": message} for code, message in _BLOCKERS.items()],
@@ -317,7 +339,7 @@ def analyze_deploy_config(motor_config: dict, robot_config: dict, dof: int) -> d
     }
 
 
-def inspect_deploy(root: str | Path, dof: int) -> dict:
+def inspect_deploy(root: str | Path, dof: int, *, policy: str | None = None) -> dict:
     """Read local source files only; optional PyYAML is needed for this file convenience API."""
     _dof(dof)
     try:
@@ -340,7 +362,29 @@ def inspect_deploy(root: str | Path, dof: int) -> dict:
         raise ValueError("robot.yaml不是可安全解析的YAML配置") from error
     if not isinstance(data, dict):
         raise ValueError("robot.yaml必须为配置对象")
-    report = analyze_deploy_config(data.get("motors"), data.get("robot"), dof)
+    robot = data.get("robot")
+    policy_path, policy_raw, policy_config = None, None, None
+    if isinstance(robot, dict) and "kp" not in robot and "kd" not in robot:
+        if not isinstance(policy, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", policy):
+            raise ValueError("robot.yaml无kp/kd；请使用--policy明确选择策略")
+        name = policy if policy.endswith(".yaml") else policy + ".yaml"
+        policy_dir = (config_path.parent / "configs").resolve(strict=True)
+        if not policy_dir.is_relative_to(config_path.parent):
+            raise ValueError("策略配置目录位于所选机器人配置目录之外")
+        policy_path = (policy_dir / name).resolve(strict=True)
+        if not policy_path.is_relative_to(policy_dir) or not policy_path.is_file():
+            raise ValueError("策略配置文件位于策略目录之外或不存在")
+        policy_raw = policy_path.read_bytes()
+        if len(policy_raw) > 512 * 1024:
+            raise ValueError("策略配置文件超过512KiB")
+        try:
+            policy_data = yaml.safe_load(policy_raw)
+        except yaml.YAMLError as error:
+            raise ValueError("策略配置不是可安全解析的YAML") from error
+        if not isinstance(policy_data, dict) or not isinstance(policy_data.get("inference_node"), dict):
+            raise ValueError("策略配置缺少inference_node对象")
+        policy_config = policy_data["inference_node"].get("ros__parameters")
+    report = analyze_deploy_config(data.get("motors"), robot, dof, policy_config=policy_config)
     report["deploy_root"] = str(root)
     report["source_files"] = []
     source_text = {}
@@ -368,6 +412,15 @@ def inspect_deploy(root: str | Path, dof: int) -> dict:
                 source_text[path] = content.decode("utf-8") if content is not None else None
             except UnicodeDecodeError:
                 source_text[path] = ""
+    if policy_path is not None:
+        report["selected_policy"] = {
+            "name": policy,
+            "path": str(policy_path.relative_to(root)),
+            "sha256": hashlib.sha256(policy_raw).hexdigest(),
+            "gain_order": "logical_joint",
+        }
+        report["source_files"].append({"path": str(policy_path.relative_to(root)),
+                                       "sha256": hashlib.sha256(policy_raw).hexdigest()})
     report["source_compatibility"] = analyze_lro_source_compatibility(
         source_text[_LRO_CPP], source_text[_LRO_HPP]
     )
@@ -378,9 +431,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True, help="本地deploy根目录，仅静态读取")
     parser.add_argument("--dof", type=int, choices=(24, 28), required=True)
+    parser.add_argument("--policy", help="新版增益所在的策略名，例如default；旧版机器人配置可省略")
     args = parser.parse_args(argv)
     try:
-        result = inspect_deploy(args.root, args.dof)
+        result = inspect_deploy(args.root, args.dof, policy=args.policy)
     except (OSError, ValueError, RuntimeError) as error:
         parser.exit(2, f"静态预检失败：{error}\n")
     print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))

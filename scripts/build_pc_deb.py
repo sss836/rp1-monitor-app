@@ -3,11 +3,13 @@
 
 import argparse
 import hashlib
+import json
 import platform
 import re
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import tomllib
@@ -136,7 +138,7 @@ def copy_pc_source(source, destination):
         raise ValueError("PC source includes a robot collector; use the PC role exporter")
 
 
-def prepare_source_and_wheels(output, wheelhouse=None, source_project=None):
+def prepare_source_and_wheels(output, wheelhouse=None, source_project=None, collector_bundle=None):
     """Export only the PC role, then resolve all binary dependencies into a new directory."""
     source = output / "source/upper-computer"
     role_builder = ROOT / "scripts/build_role_packages.py"
@@ -150,6 +152,10 @@ def prepare_source_and_wheels(output, wheelhouse=None, source_project=None):
     else:
         # The public PC repository is already role-separated and has no role exporter.
         copy_pc_source(ROOT, source)
+    if collector_bundle is not None:
+        target_bundle = source / "src/rp1_monitor/data/collector-bundle.zip"
+        target_bundle.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(collector_bundle, target_bundle)
     wheels = output / "application-wheel"
     wheels.mkdir()
     run([
@@ -233,7 +239,41 @@ def prepare_package(source, wheelhouse, stage, version):
     return stage
 
 
-def build(output, *, version=DEFAULT_VERSION, wheelhouse=None, source=None):
+def collector_bundle_for_build(output, *, source=None, supplied=None, wheelhouse=None):
+    """Every production PC package ships an installable ARM64 collector payload."""
+    candidate = Path(supplied) if supplied else (Path(source) if source else ROOT) / "src/rp1_monitor/data/collector-bundle.zip"
+    if not candidate.is_file():
+        if supplied:
+            raise ValueError("--collector-bundle does not name an existing bundle")
+        script = ROOT / "scripts/build_collector_bundle.py"
+        if not script.is_file():
+            raise ValueError("PC source lacks its collector bundle; provide --collector-bundle")
+        candidate = output / "collector-bundle.zip"
+        command = [sys.executable, str(script), "--output", str(candidate)]
+        if wheelhouse is not None:
+            command += ["--wheelhouse", str(wheelhouse)]
+        run(command)
+    if candidate.is_symlink() or not 0 < candidate.stat().st_size <= 128 * 1024 * 1024:
+        raise ValueError("Invalid collector bundle size or symlink")
+    with zipfile.ZipFile(candidate) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+        if not (manifest.get("schema") == 1 and manifest.get("package") == "rp1-monitor-robot"
+                and manifest.get("python") == [3, 12] and manifest.get("machine") == "aarch64"):
+            raise ValueError("Collector bundle must target Python 3.12 ARM64")
+        files = manifest.get("files")
+        if not isinstance(files, dict) or not files:
+            raise ValueError("Collector bundle file manifest is missing")
+        if set(archive.namelist()) != {*files, "manifest.json"}:
+            raise ValueError("Collector bundle files differ from manifest")
+        if sum(item.file_size for item in archive.infolist()) > 256 * 1024 * 1024:
+            raise ValueError("Collector bundle expanded size exceeds limit")
+        for name, digest in files.items():
+            if hashlib.sha256(archive.read(name)).hexdigest() != digest:
+                raise ValueError("Collector bundle file checksum mismatch")
+    return candidate
+
+
+def build(output, *, version=DEFAULT_VERSION, wheelhouse=None, source=None, collector_bundle=None, collector_wheelhouse=None):
     output = Path(output)
     if output.exists() or output.is_symlink():
         raise ValueError("Output already exists; choose a new directory. No existing package was replaced.")
@@ -242,7 +282,8 @@ def build(output, *, version=DEFAULT_VERSION, wheelhouse=None, source=None):
     check_host()
     output = output.resolve()
     output.mkdir(parents=True)
-    pc_source, resolved = prepare_source_and_wheels(output, wheelhouse, source)
+    robot_bundle = collector_bundle_for_build(output, source=source, supplied=collector_bundle, wheelhouse=collector_wheelhouse)
+    pc_source, resolved = prepare_source_and_wheels(output, wheelhouse, source, robot_bundle)
     stage = prepare_package(pc_source, resolved, output / "package", version)
     target = output / f"{PACKAGE}_{version}_amd64.deb"
     run(["dpkg-deb", "--root-owner-group", "-Zxz", "--threads-max=2", "--build", str(stage), str(target)])
@@ -257,10 +298,13 @@ def main():
     parser.add_argument("--version", default=DEFAULT_VERSION)
     parser.add_argument("--source", type=Path, help="Already exported rp1-monitor-pc source; copied cleanly before wheel building")
     parser.add_argument("--wheelhouse", type=Path, help="Existing complete dependency wheels; disables package-index access")
+    parser.add_argument("--collector-bundle", type=Path, help="Verified Python 3.12 ARM64 collector ZIP to include")
+    parser.add_argument("--collector-wheelhouse", type=Path, help="Offline ARM64 wheel cache used only when building the collector ZIP")
     args = parser.parse_args()
     try:
-        target = build(args.output, version=args.version, wheelhouse=args.wheelhouse, source=args.source)
-    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        target = build(args.output, version=args.version, wheelhouse=args.wheelhouse, source=args.source,
+                       collector_bundle=args.collector_bundle, collector_wheelhouse=args.collector_wheelhouse)
+    except (OSError, ValueError, subprocess.CalledProcessError, zipfile.BadZipFile, KeyError) as error:
         parser.exit(1, f"Build failed: {error}\nNew partial output, if any, has been kept for inspection.\n")
     print(target)
     print(target.parent / "SHA256SUMS")
