@@ -769,6 +769,8 @@ class PlatformMonitorWindow(AppMonitorWindow):
         row.addStretch()
         layout.addLayout(row)
         grid = QGridLayout()
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
         self.research_catalog = combo("已发布SYS测试用例")
         self.research_catalog.currentIndexChanged.connect(self._filter_contexts)
         self.research_campaign = combo("研发测试计划")
