@@ -17,6 +17,7 @@ dev = ["pytest>=8,<10", "ruff>=0.9,<1"]
 
 [project.scripts]
 rp1-monitor = "rp1_monitor.pc_cli:main"
+rp1-factory-bridge = "rp1_monitor.factory_bridge:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
