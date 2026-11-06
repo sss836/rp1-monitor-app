@@ -9,7 +9,7 @@
 
 ## Ubuntu 安装包与整机工厂测试
 
-本地平台适配版 `0.4.1+platform.20261106.1` 已增加与可靠性大屏共用账号的原生登录，以及独立的研发/工厂归档入口。原有采集、控制、记录和工厂结果保存继续使用原实现；平台送审须由人员核实并显式提交。配置、两域流程、恢复和验收范围见 [平台接入说明](docs/PLATFORM_NATIVE_INTEGRATION.md)。本适配分支尚未推送 GitHub，公开 Releases 不包含本次本地修改。
+本地平台适配版 `0.4.1+platform.20261106.2` 已增加与可靠性大屏共用账号的顶部可选登录栏，以及独立的研发/工厂归档入口。原有采集、控制、记录和工厂结果保存继续使用原实现；平台送审须由人员核实并显式提交。配置、两域流程、恢复和验收范围见 [平台接入说明](docs/PLATFORM_NATIVE_INTEGRATION.md)。本适配分支尚未推送 GitHub，公开 Releases 不包含本次本地修改。
 
 GitHub Releases 提供 Ubuntu 24.04 amd64 的 `.deb`，内置电脑端 Python 依赖。安装后从应用菜单打开“RP1 工厂测试”，或执行 `rp1-monitor-app factory`。安装、数据目录和从源码构建安装包见[deb 安装说明](docs/PC_DEB.md)。
 

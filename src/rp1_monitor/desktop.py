@@ -1605,8 +1605,10 @@ def _run_desktop(args):
         factory_directory=getattr(args, "factory_dir", None),
         platform_state_directory=platform_state_path(getattr(args, "station_dir", None)),
     )
+    if getattr(args, "factory", False):
+        window.open_local_workbench(9)
     window.show()
-    window.first_authenticated.connect(lambda: window.start_initial_connection(args))
+    QTimer.singleShot(0, lambda: window.start_initial_connection(args))
     if args.screenshot:
 
         def screenshot():

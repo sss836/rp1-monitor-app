@@ -11,6 +11,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from math import isfinite
 from pathlib import Path
+from threading import Event
 from urllib.parse import urlencode, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
@@ -178,6 +179,48 @@ def platform_state_path(station_directory):
     """Keep platform state outside the station's marker-protected directory."""
     station = Path(station_directory or "runtime/station").expanduser()
     return station.with_name(station.name + "-platform")
+
+
+class LazyPlatformService:
+    """Platform persistence/client creation belongs to explicit background work."""
+
+    def __init__(self, state_directory):
+        self.state_directory = state_directory
+        self._service = None
+        self._cancelled = Event()
+        self._closed = False
+
+    def begin_request(self):
+        if not self._closed:
+            self._cancelled.clear()
+
+    def _check_cancelled(self):
+        if self._closed or self._cancelled.is_set() or QThread.currentThread().isInterruptionRequested():
+            raise RuntimeError("平台任务已取消")
+
+    def operation(self, action, payload):
+        self._check_cancelled()
+        if self._service is None:
+            from .platform_workspace import NativePlatformService
+
+            self._service = NativePlatformService(self.state_directory)
+        try:
+            self._check_cancelled()
+        except RuntimeError:
+            self._service.cancel_current()
+            raise
+        return self._service.operation(action, payload)
+
+    def cancel_current(self):
+        self._cancelled.set()
+        if self._service is not None:
+            self._service.cancel_current()
+
+    def close(self):
+        self._closed = True
+        self.cancel_current()
+        if self._service is not None:
+            self._service.close()
 
 
 class PlatformJob(QThread):
@@ -360,7 +403,7 @@ class PlatformMonitorWindow(AppMonitorWindow):
         self._current_ticket = None
         self._result_callback = None
         self._cancel_requested = False
-        self._ever_authenticated = False
+        self._local_initialization_started = False
         self._first_login_emitted = False
         self._platform_url = ""
         self.session = {"authenticated": False, "user": None}
@@ -379,27 +422,37 @@ class PlatformMonitorWindow(AppMonitorWindow):
         self._detail_dialogs = set()
         super().__init__(url, **kwargs)
         if platform_service is None:
-            from .platform_workspace import NativePlatformService
-
             state = platform_state_directory or Path.home() / ".local/share/rp1-monitor/platform"
-            platform_service = NativePlatformService(state)
+            platform_service = LazyPlatformService(state)
         self.platform_service = platform_service
         self.setWindowTitle("RP1 整机测试工作台")
         self.setMinimumSize(1080, 720)
         self.resize(1440, 920)
         self.setStyleSheet(PLATFORM_STYLE)
-        self.local_workbench = self.takeCentralWidget()
+        self.local_workbench_root = self.takeCentralWidget()
+        self.local_workbench = QScrollArea()
+        self.local_workbench.setWidgetResizable(True)
+        self.local_workbench.setFrameShape(QFrame.Shape.NoFrame)
+        self.local_workbench.setWidget(self.local_workbench_root)
         root = GridBackground()
         layout = QVBoxLayout(root)
         layout.setContentsMargins(16, 12, 16, 14)
         layout.setSpacing(10)
         layout.addWidget(self._build_header())
-        self.platform_notice = text("请使用可靠性测试平台账号登录。当前未连接机器人。", "platformNotice")
+        self.platform_notice = text("本地工作台可直接连接、测试与保存。需要查询或提交平台数据时，再在顶栏登录。", "platformNotice")
         self.platform_notice.setAccessibleName("平台操作状态")
         layout.addWidget(self.platform_notice)
         self.platform_stack = CurrentPageStack()
         self.login_page = self._build_login()
-        self.platform_stack.addWidget(self.login_page)
+        self.account_dialog = QDialog(self)
+        self.account_dialog.setWindowTitle("平台连接设置")
+        self.account_dialog.setModal(False)
+        self.account_dialog.resize(780, 620)
+        settings_layout = QVBoxLayout(self.account_dialog)
+        settings_layout.addWidget(self.login_page, 1)
+        settings_close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        settings_close.rejected.connect(self.account_dialog.hide)
+        settings_layout.addWidget(settings_close)
         self.platform_stack.addWidget(self.local_workbench)
         self.workspace = self._build_workspace()
         self.platform_stack.addWidget(self.workspace)
@@ -408,7 +461,7 @@ class PlatformMonitorWindow(AppMonitorWindow):
         layout.addWidget(self.platform_stack, 1)
         self.setCentralWidget(root)
         self.platform_ready = True
-        self.platform_stack.setCurrentWidget(self.login_page)
+        self.platform_stack.setCurrentWidget(self.local_workbench)
         summary = getattr(self.factory_panel, "result_summary", None)
         if summary:
             summary.exported.connect(self._local_exported)
@@ -428,7 +481,39 @@ class PlatformMonitorWindow(AppMonitorWindow):
     def _build_header(self):
         frame = QFrame()
         frame.setObjectName("platformHeader")
-        layout = QHBoxLayout(frame)
+        outer = QVBoxLayout(frame)
+        outer.setContentsMargins(12, 8, 12, 8)
+        outer.setSpacing(7)
+        account = QHBoxLayout()
+        account.setSpacing(8)
+        account.addWidget(text("模式", "fieldLabel"))
+        self.platform_mode = QComboBox()
+        self.platform_mode.setAccessibleName("工作台模式")
+        for label, value in (("本地工作台", "LOCAL"), ("研发平台", "RESEARCH"), ("工厂平台", "FACTORY")):
+            self.platform_mode.addItem(label, value)
+        self.platform_mode.setFixedWidth(128)
+        self.platform_mode.currentIndexChanged.connect(self._mode_selected)
+        account.addWidget(self.platform_mode)
+        account.addWidget(text("账号", "fieldLabel"))
+        self.username_edit = edit("平台用户名", "平台账号（可选）")
+        self.username_edit.setFixedWidth(145)
+        account.addWidget(self.username_edit)
+        account.addWidget(text("密码", "fieldLabel"))
+        self.password_edit = edit("平台密码", "平台密码", password=True)
+        self.password_edit.setFixedWidth(145)
+        self.password_edit.returnPressed.connect(self.login)
+        account.addWidget(self.password_edit)
+        self.login_button = button("登录", self.login, "primary")
+        self.logout_button = button("退出", self.logout)
+        account.addWidget(self.login_button)
+        account.addWidget(self.logout_button)
+        self.account_label = text("未登录（本地可用）", "platformAccount")
+        self.account_label.setWordWrap(False)
+        account.addWidget(self.account_label, 1)
+        self.account_button = button("连接设置", self.open_account)
+        account.addWidget(self.account_button)
+        outer.addLayout(account)
+        layout = QHBoxLayout()
         logo = QLabel()
         pixmap = QPixmap(str(Path(__file__).parent / "web/brand/logo.png"))
         if pixmap.isNull():
@@ -437,23 +522,28 @@ class PlatformMonitorWindow(AppMonitorWindow):
             logo.setPixmap(pixmap.scaled(122, 42, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         logo.setAccessibleName("RoboParty")
         layout.addWidget(logo)
-        layout.addWidget(text("RP1 整机测试平台", "sectionTitle"))
-        self.research_nav = button("研发测试", lambda: self.select_domain("RESEARCH"), "domainNav")
-        self.factory_nav = button("工厂测试", lambda: self.select_domain("FACTORY"), "domainNav")
+        layout.addWidget(text("RP1 整机测试工作台", "sectionTitle"))
+        self.local_nav = button("本地工作台", self.open_local_workbench)
+        self.local_nav.setCheckable(True)
+        layout.addWidget(self.local_nav)
+        self.research_nav = button("研发平台", lambda: self.select_domain("RESEARCH"), "domainNav")
+        self.factory_nav = button("工厂平台", lambda: self.select_domain("FACTORY"), "domainNav")
         for item in (self.research_nav, self.factory_nav):
             item.setCheckable(True)
             layout.addWidget(item)
-        self.local_nav = button("本地监控与工具", self.open_local_workbench)
-        self.local_nav.setCheckable(True)
-        layout.addWidget(self.local_nav)
         layout.addStretch()
-        self.account_label = text("未登录", "platformAccount")
-        layout.addWidget(self.account_label)
-        self.account_button = button("平台账号", self.open_account)
         self.screen_button = button("打开大屏", self.open_bigscreen)
-        layout.addWidget(self.account_button)
         layout.addWidget(self.screen_button)
+        outer.addLayout(layout)
         return frame
+
+    def _mode_selected(self):
+        value = self.platform_mode.currentData()
+        if value == "LOCAL":
+            self.open_local_workbench()
+        else:
+            self.select_domain(value)
+        self._update_platform_actions()
 
     def _build_login(self):
         scroll = QScrollArea()
@@ -470,7 +560,7 @@ class PlatformMonitorWindow(AppMonitorWindow):
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         form.setContentsMargins(30, 26, 30, 26)
         form.addRow(text("RP1 / RELIABILITY TEST", "eyebrow"))
-        form.addRow(text("登录整机测试工作台", "title"))
+        form.addRow(text("平台连接设置", "title"))
         introduction = text("与可靠性测试大屏使用同一平台账号。原生会话与浏览器会话各自登录，密码和会话 Cookie 不落盘。")
         introduction.setMinimumHeight(48)
         form.addRow(introduction)
@@ -486,17 +576,10 @@ class PlatformMonitorWindow(AppMonitorWindow):
         certificates = Disclosure("证书设置（可选）")
         certificates.body_layout.addLayout(ca_row)
         form.addRow(certificates)
-        self.username_edit = edit("平台用户名")
-        self.password_edit = edit("平台密码", password=True)
-        self.password_edit.returnPressed.connect(self.login)
-        form.addRow("账号", self.username_edit)
-        form.addRow("密码", self.password_edit)
-        self.login_button = button("登录平台", self.login, "primary")
-        form.addRow(self.login_button)
         self.password_box = QWidget()
         passwords = QFormLayout(self.password_box)
         passwords.setContentsMargins(0, 0, 0, 0)
-        passwords.addRow(text("首次登录须先修改密码，完成前不能访问或提交平台测试数据。"))
+        passwords.addRow(text("首次登录须先修改密码；仅限制平台功能，本地工作台继续可用。"))
         self.current_password = edit("当前平台密码", password=True)
         self.new_password = edit("新平台密码", password=True)
         self.confirm_password = edit("确认新平台密码", password=True)
@@ -509,11 +592,9 @@ class PlatformMonitorWindow(AppMonitorWindow):
         form.addRow(self.password_box)
         account_actions = QHBoxLayout()
         self.profile_button = button("核对会话", lambda: self.request("profile", {}, self._profile_loaded))
-        self.logout_button = button("退出平台账号", self.logout)
         account_actions.addWidget(self.profile_button)
-        account_actions.addWidget(self.logout_button)
         form.addRow(account_actions)
-        self.offline_button = button("只读查看本地历史", self.open_offline_history)
+        self.offline_button = button("不登录，使用本地工作台", self.open_local_workbench)
         form.addRow(self.offline_button)
         footer = text("平台会话默认8小时，失效后须重新登录。退出或失效不会停止已开始的本地采集、记录或控制。")
         footer.setMinimumHeight(54)
@@ -920,12 +1001,17 @@ class PlatformMonitorWindow(AppMonitorWindow):
             except ValueError:
                 expiry = "有效期未返回"
             suffix = " · 须先修改密码" if user.get("must_change_password") else ""
-            self.account_label.setText(f"{name} · {role}{suffix}\n有效期：{expiry}")
+            self.account_label.setText(f"{name} · {role}{suffix}")
+            self.account_label.setToolTip(f"平台会话有效期：{expiry}；本地工作不依赖平台登录。")
         else:
-            self.account_label.setText("平台未登录 · 本地工作独立运行")
+            self.account_label.setText("未登录（本地可用）")
+            self.account_label.setToolTip("平台会话默认8小时；本地连接、测试、控制与保存独立可用。")
+            for field in (self.current_password, self.new_password, self.confirm_password):
+                field.clear()
+            if self.platform_stack.currentWidget() is self.workspace:
+                self.open_local_workbench()
         self.password_box.setVisible(bool(user.get("must_change_password")))
         if self._valid_session():
-            self._ever_authenticated = True
             summary = getattr(self.factory_panel, "result_summary", None)
             if summary and not summary.operator_edit.text().strip():
                 summary.operator_edit.setText(user.get("display_name") or user.get("username") or "")
@@ -949,12 +1035,16 @@ class PlatformMonitorWindow(AppMonitorWindow):
         self.offline_history.setEnabled(idle)
         self.account_button.setEnabled(idle)
         self.local_nav.setEnabled(not self._platform_closing)
-        self.research_nav.setEnabled(idle and valid and user.get("role") != "FACTORY_REVIEWER")
-        self.factory_nav.setEnabled(idle and valid)
+        self.research_nav.setEnabled(idle and user.get("role") != "FACTORY_REVIEWER")
+        self.factory_nav.setEnabled(idle)
         in_domain = self.platform_stack.currentWidget() is self.workspace
         self.research_nav.setChecked(self.domain == "RESEARCH" and valid and in_domain)
         self.factory_nav.setChecked(self.domain == "FACTORY" and valid and in_domain)
         self.local_nav.setChecked(self.platform_stack.currentWidget() is self.local_workbench)
+        self.platform_mode.blockSignals(True)
+        self.platform_mode.setCurrentIndex(self.platform_mode.findData(self.domain if in_domain else "LOCAL"))
+        self.platform_mode.blockSignals(False)
+        self.platform_mode.setEnabled(idle)
         self.screen_button.setEnabled(idle and valid and bool(self._platform_url))
         self.workspace.setEnabled(idle and valid)
         self.factory_submit_button.setEnabled(idle and valid and bool(self.session.get("can_submit_factory")))
@@ -1008,6 +1098,8 @@ class PlatformMonitorWindow(AppMonitorWindow):
         frozen = deepcopy(payload)
         if local_operation is None and action not in public:
             frozen.setdefault("session_generation", self.session.get("generation"))
+        if hasattr(self.platform_service, "begin_request"):
+            self.platform_service.begin_request()
         operation = local_operation or (lambda: self.platform_service.operation(action, frozen))
         worker = PlatformJob(operation, ticket)
         worker.setObjectName("RP1NativePlatformTask")
@@ -1018,7 +1110,7 @@ class PlatformMonitorWindow(AppMonitorWindow):
         worker.finished.connect(self._platform_finished)
         worker.finished.connect(lambda: _WORKERS.discard(worker))
         worker.finished.connect(worker.deleteLater)
-        self.platform_notice.setText("正在处理平台任务；本地采集、记录和控制独立运行。")
+        self.platform_notice.setText("正在准备本地连接；无需平台登录，不会自动开始测试。" if action == "local_bootstrap" else "正在处理平台任务；本地采集、记录和控制独立运行。")
         self._update_platform_actions()
         worker.start()
         return True
@@ -1026,7 +1118,7 @@ class PlatformMonitorWindow(AppMonitorWindow):
     @Slot(object)
     def _platform_succeeded(self, result):
         ticket = result["ticket"]
-        if self._platform_closing or ticket[0] != self._identity_epoch:
+        if self._platform_closing or (self._request_action != "local_bootstrap" and ticket[0] != self._identity_epoch):
             return
         value = result["value"]
         if isinstance(value, dict) and "session" in value:
@@ -1038,7 +1130,7 @@ class PlatformMonitorWindow(AppMonitorWindow):
         if self._cancel_requested:
             self.platform_notice.setText("平台请求已结束。取消前已送达的提交仍可能存在，请刷新台账核对；不会自动再次提交。")
             return
-        if getattr(self, "_request_action", "") not in {"configure", "login", "profile", "change_password", "logout"} and ticket != (self._identity_epoch, self._source_epoch, self.domain, self._ticket_serial):
+        if getattr(self, "_request_action", "") not in {"configure", "login", "profile", "change_password", "logout", "local_bootstrap"} and ticket != (self._identity_epoch, self._source_epoch, self.domain, self._ticket_serial):
             self.platform_notice.setText("此前身份下的任务已结束；当前来源或分区已变化，请刷新对应台账核对。")
             return
         callback = self._result_callback
@@ -1052,7 +1144,7 @@ class PlatformMonitorWindow(AppMonitorWindow):
 
     @Slot(object)
     def _platform_failed(self, result):
-        if self._platform_closing or result["ticket"][0] != self._identity_epoch:
+        if self._platform_closing or (self._request_action != "local_bootstrap" and result["ticket"][0] != self._identity_epoch):
             return
         error = result["error"]
         session = getattr(error, "session", None)
@@ -1115,7 +1207,7 @@ class PlatformMonitorWindow(AppMonitorWindow):
         user = self.session.get("user") or {}
         if user.get("must_change_password"):
             self.platform_notice.setText("账号已验证，请先修改初始密码。修改完成前不能访问或提交平台测试数据。")
-            self.platform_stack.setCurrentWidget(self.login_page)
+            self.open_account()
             return
         if not self._valid_session():
             self.platform_notice.setText("平台未返回有效会话，请重新登录。")
@@ -1123,7 +1215,7 @@ class PlatformMonitorWindow(AppMonitorWindow):
         self.platform_notice.setText("平台登录成功。可进入研发或工厂流程；本地采集与控制仍沿用原逻辑。")
         if user.get("role") == "FACTORY_REVIEWER":
             self.domain = "FACTORY"
-        self.platform_stack.setCurrentWidget(self.local_workbench)
+        self.account_dialog.hide()
         if not self._first_login_emitted:
             self._first_login_emitted = True
             self._emit_first_login_after_finish = True
@@ -1150,7 +1242,7 @@ class PlatformMonitorWindow(AppMonitorWindow):
         rows_into(self.results_table, [])
         rows_into(self.tasks_table, [])
         self.platform_notice.setText("已退出平台账号。已开始的本地采集、记录和控制继续运行；平台操作须重新登录。")
-        self.platform_stack.setCurrentWidget(self.login_page)
+        self.open_local_workbench()
 
     def _check_session_expiry(self):
         if not self.session.get("authenticated"):
@@ -1168,7 +1260,9 @@ class PlatformMonitorWindow(AppMonitorWindow):
             self.platform_notice.setText("平台会话已到期，请重新登录。已开始的本地采集、记录和控制不受影响。")
 
     def open_account(self):
-        self.platform_stack.setCurrentWidget(self.login_page)
+        self.account_dialog.show()
+        self.account_dialog.raise_()
+        self.account_dialog.activateWindow()
         self._update_platform_actions()
 
     def choose_ca(self):
@@ -1178,7 +1272,8 @@ class PlatformMonitorWindow(AppMonitorWindow):
 
     def select_domain(self, domain):
         if not self._valid_session() or self.platform_worker is not None:
-            self.platform_notice.setText("请先完成登录，并等待当前平台任务结束后切换分区。")
+            self.platform_notice.setText("平台查询和提交需要有效账号，请在顶栏登录；本地工作台可继续使用。当前任务须先结束。")
+            self._update_platform_actions()
             return
         if domain not in {"RESEARCH", "FACTORY"}:
             return
@@ -1203,9 +1298,7 @@ class PlatformMonitorWindow(AppMonitorWindow):
         self._update_platform_actions()
 
     def open_local_workbench(self, index=None):
-        if not self._ever_authenticated and not self._valid_session():
-            self.open_offline_history()
-            return
+        self.account_dialog.hide()
         self.platform_stack.setCurrentWidget(self.local_workbench)
         # clicked(bool) is not a page index.
         if isinstance(index, int) and not isinstance(index, bool):
@@ -1215,8 +1308,8 @@ class PlatformMonitorWindow(AppMonitorWindow):
     def navigate(self, index):
         super().navigate(index)
         if getattr(self, "platform_ready", False):
-            self.local_workbench.setProperty("plainBackground", index == 9)
-            self.local_workbench.update()
+            self.local_workbench_root.setProperty("plainBackground", index == 9)
+            self.local_workbench_root.update()
             self.platform_stack.setCurrentWidget(self.local_workbench)
             self._update_platform_actions()
 
@@ -1912,9 +2005,13 @@ class PlatformMonitorWindow(AppMonitorWindow):
         super().on_frame(frame)
 
     def start_initial_connection(self, args):
-        """Called once after full login/password change, never from offline history."""
-        if not self._valid_session() or self._platform_closing:
+        """Original local startup, once per window and independent of any account."""
+        if self._platform_closing or self._local_initialization_started:
             return
+        if self.platform_worker is not None:
+            QTimer.singleShot(100, lambda: self.start_initial_connection(args))
+            return
+        self._local_initialization_started = True
         if getattr(args, "factory", False):
             self.open_local_workbench(9)
         elif getattr(args, "quick_connect", False):

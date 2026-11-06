@@ -8,6 +8,7 @@ import threading
 import time
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import QApplication
 
 from rp1_monitor.desktop_platform import (
     _WORKERS,
+    LazyPlatformService,
     PlatformMonitorWindow,
     platform_link,
     platform_state_path,
@@ -190,19 +192,33 @@ def test_platform_state_does_not_block_fresh_station_marker_initialization(tmp_p
         service.close()
 
 
-def test_startup_is_login_only_and_preserves_all_original_pages(ui):
+def test_startup_is_full_local_and_platform_login_is_optional(ui):
     window, service = ui
-    assert window.platform_stack.currentWidget() is window.login_page
+    assert window.platform_stack.currentWidget() is window.local_workbench
     assert window.pages.count() == 10
     assert window.platform_worker is None
     assert service.calls == []
-    assert not window.research_nav.isEnabled()
+    assert window.research_nav.isEnabled()
     assert not window.factory_submit_button.isEnabled()
     assert window.reader is None
     assert not window.station_url
+    assert window.account_label.text() == "未登录（本地可用）"
+    assert window.username_edit.isVisible() and window.password_edit.isVisible()
+    assert not window.account_dialog.isVisible()
+    assert window.platform_mode.currentData() == "LOCAL"
+    window.research_nav.click()
+    assert window.platform_stack.currentWidget() is window.local_workbench
+    assert "顶栏登录" in window.platform_notice.text()
+    assert not window.research_nav.isChecked()
+    window.open_account()
+    assert window.account_dialog.isVisible() and not window.account_dialog.isModal()
+    assert window.platform_stack.currentWidget() is window.local_workbench
+    window.offline_button.click()
+    assert window.platform_stack.currentWidget() is window.local_workbench
+    assert not window.account_dialog.isVisible()
 
 
-def test_login_clears_password_and_emits_initial_connection_only_after_success(app, ui):
+def test_login_clears_password_and_emits_account_event_without_local_reinitialization(app, ui):
     window, service = ui
     emitted = []
     window.first_authenticated.connect(lambda: emitted.append(True))
@@ -223,15 +239,20 @@ def test_login_clears_password_and_emits_initial_connection_only_after_success(a
     assert window.factory_nav.isEnabled()
 
 
-def test_first_password_change_gates_every_platform_flow_and_then_allows_first_connection(app, ui):
+def test_first_password_change_gates_only_platform_and_preserves_local_workbench(app, ui):
     window, service = ui
     service.login_session = session(needs_password=True)
     emitted = []
     window.first_authenticated.connect(lambda: emitted.append(True))
     sign_in(app, window, service)
     assert window.password_box.isVisible()
-    assert not window.factory_nav.isEnabled()
-    assert not window.research_nav.isEnabled()
+    assert window.factory_nav.isEnabled() and window.research_nav.isEnabled()
+    assert not window.factory_submit_button.isEnabled()
+    assert window.platform_stack.currentWidget() is window.local_workbench
+    window.open_local_workbench(9)
+    assert window.pages.currentIndex() == 9
+    assert window.factory_panel.isEnabled()
+    window.open_account()
     assert emitted == []
     window.current_password.setText("synthetic-old")
     window.new_password.setText("synthetic-new")
@@ -249,8 +270,12 @@ def test_logout_and_expiry_do_not_stop_local_source_or_recording(app, ui, monkey
     stopped = []
     monkeypatch.setattr(window, "disconnect_source", lambda: stopped.append("source"))
     monkeypatch.setattr(window.recordings_panel, "stop_recording", lambda: stopped.append("recording"))
+    window.open_local_workbench(8)
     window.logout()
     wait_for(app, lambda: window.platform_worker is None)
+    assert window.platform_stack.currentWidget() is window.local_workbench
+    assert window.pages.currentIndex() == 8
+    assert window.joint_inspection_panel.isEnabled()
     assert stopped == []
     assert not window._valid_session()
     window.open_local_workbench()
@@ -262,6 +287,138 @@ def test_logout_and_expiry_do_not_stop_local_source_or_recording(app, ui, monkey
     assert not window._valid_session()
     assert stopped == []
     assert "到期" in window.platform_notice.text()
+    assert window.platform_stack.currentWidget() is window.local_workbench
+    assert window.pages.currentIndex() == 8
+    assert window.joint_inspection_panel.isEnabled()
+
+
+def test_unauthenticated_original_tools_and_local_save_remain_available(app, ui, tmp_path, monkeypatch):
+    window, service = ui
+    monkeypatch.setattr(window.recordings_panel, "refresh_context", lambda: None)
+    for index in range(10):
+        assert window.nav.button(index).isEnabled()
+        window.nav.button(index).click()
+        app.processEvents()
+        assert window.pages.currentIndex() == index
+        assert window.platform_stack.currentWidget() is window.local_workbench
+        assert window.pages.currentWidget().isEnabled()
+    path = make_result_csv(window, tmp_path / "local-only.csv")
+    window.factory_panel.result_summary.exported.emit(str(path))
+    assert path.is_file() and "MOCK-SN-A" in path.read_text()
+    assert service.calls == []
+    assert window._factory_preview is None
+    assert window.platform_stack.currentWidget() is window.local_workbench
+
+
+@pytest.mark.parametrize("action", ["setup", "contexts", "factory_preview", "factory_results", "factory_detail", "factory_submit", "factory_review", "research_records", "research_export", "research_submit", "research_results", "research_detail", "tasks", "retry"])
+def test_unauthenticated_central_operations_never_start_a_worker_or_service(ui, action):
+    window, service = ui
+    assert not window.request(action, {})
+    assert window.platform_worker is None and service.calls == []
+    assert window.platform_stack.currentWidget() is window.local_workbench
+
+
+def test_original_local_initialization_runs_once_across_platform_account_changes(app, ui, monkeypatch):
+    window, service = ui
+    connections = []
+    monkeypatch.setattr(window, "connect_source", lambda: connections.append("local-connect"))
+    args = SimpleNamespace(factory=False, quick_connect=False)
+    window.start_initial_connection(args)
+    window.start_initial_connection(args)
+    assert connections == ["local-connect"] and service.calls == []
+    sign_in(app, window, service)
+    window.request("profile", {}, window._profile_loaded)
+    wait_for(app, lambda: window.platform_worker is None)
+    window.logout()
+    wait_for(app, lambda: window.platform_worker is None)
+    service.login_session = session(needs_password=True)
+    sign_in(app, window, service)
+    window.current_password.setText("old")
+    window.new_password.setText("new")
+    window.confirm_password.setText("new")
+    window.change_password()
+    wait_for(app, lambda: window.platform_worker is None)
+    window.start_initial_connection(args)
+    assert connections == ["local-connect"]
+
+
+def test_quick_connect_bootstraps_local_backend_once_without_platform_login(app, ui, tmp_path, monkeypatch):
+    window, service = ui
+    calls, restored = [], []
+    def ensure(directory, port):
+        calls.append((directory, port))
+        return "http://127.0.0.1:19999", tmp_path / "mock-token"
+    monkeypatch.setattr("rp1_monitor.station.ensure_station", ensure)
+    monkeypatch.setattr(window, "restore_station_connection", lambda: restored.append(True))
+    args = SimpleNamespace(factory=False, quick_connect=True, station_dir=tmp_path / "station", station_port=19999)
+    window.start_initial_connection(args)
+    window.start_initial_connection(args)
+    wait_for(app, lambda: window.platform_worker is None and restored)
+    assert calls == [(args.station_dir, 19999)] and restored == [True]
+    assert service.calls == [] and not window._valid_session()
+    sign_in(app, window, service)
+    window.start_initial_connection(args)
+    assert len(calls) == 1 and restored == [True]
+
+
+def test_factory_startup_only_opens_local_page_and_never_bootstraps_station(ui, monkeypatch):
+    window, service = ui
+    def forbidden(*args, **kwargs):
+        pytest.fail("factory startup must not connect or start the local station")
+    monkeypatch.setattr(window, "connect_source", forbidden)
+    monkeypatch.setattr("rp1_monitor.station.ensure_station", forbidden)
+    window.start_initial_connection(SimpleNamespace(factory=True, quick_connect=True))
+    window.start_initial_connection(SimpleNamespace(factory=True, quick_connect=True))
+    assert window.pages.currentIndex() == 9
+    assert window.platform_stack.currentWidget() is window.local_workbench
+    assert window.platform_worker is None and service.calls == []
+
+
+def test_platform_service_is_lazy_and_close_without_login_never_creates_state(app, tmp_path, monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("local startup/close must not instantiate platform persistence")
+    monkeypatch.setattr("rp1_monitor.platform_workspace.NativePlatformService", forbidden)
+    state = tmp_path / "platform-not-created"
+    window = PlatformMonitorWindow("http://127.0.0.1:1", platform_state_directory=state, factory_directory=tmp_path / "factory")
+    assert isinstance(window.platform_service, LazyPlatformService)
+    assert not state.exists()
+    window.show()
+    window.open_local_workbench(9)
+    app.processEvents()
+    window.close()
+    wait_for(app, lambda: not window.isVisible())
+    window.finish_platform_workers()
+    assert not state.exists()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_lazy_service_cancellation_during_construction_prevents_login(app, tmp_path, monkeypatch):
+    created = threading.Event()
+    release = threading.Event()
+    services = []
+    class SlowPlatform(MockPlatform):
+        def __init__(self, _state):
+            super().__init__()
+            services.append(self)
+            created.set()
+            assert release.wait(3)
+    monkeypatch.setattr("rp1_monitor.platform_workspace.NativePlatformService", SlowPlatform)
+    window = PlatformMonitorWindow("http://127.0.0.1:1", platform_state_directory=tmp_path / "platform", factory_directory=tmp_path / "factory")
+    window.platform_url_edit.setText("https://platform.example:8443")
+    window.username_edit.setText("person-a")
+    window.password_edit.setText("synthetic")
+    window.login()
+    wait_for(app, created.is_set)
+    window.cancel_platform_task()
+    release.set()
+    wait_for(app, lambda: window.platform_worker is None)
+    assert len(services) == 1 and services[0].calls == []
+    assert not window._valid_session()
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+    assert services[0].closed
 
 
 def test_offline_history_reads_local_store_without_platform_or_device_calls(app, ui):
