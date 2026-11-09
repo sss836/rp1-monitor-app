@@ -121,6 +121,15 @@ class NativePlatformService:
         if self.client is not None:
             self.client.cancel_current_request()
 
+    def display_session(self):
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            if self.client is not None and not self._closed:
+                return self.client.display_session(self.state_dir)
+        finally:
+            self._lock.release()
+
     def close(self):
         self._closed = True
         self.cancel_current()

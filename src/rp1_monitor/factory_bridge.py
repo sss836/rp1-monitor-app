@@ -277,7 +277,7 @@ class JsonHttpClient:
         if deadline is not None:
             deadline.abort()
 
-    def request(self, method, path, *, body=None, headers=None):
+    def request(self, method, path, *, body=None, headers=None, cancel_event=None):
         request = Request(self.base_url + path, data=body, method=method, headers=headers or {})
         with self._request_lock:
             deadline = RequestDeadline(self.timeout)
@@ -285,6 +285,9 @@ class JsonHttpClient:
             deadline.start()
             try:
                 try:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise BridgeError("cancelled")
+                    deadline.check()
                     response = self.opener.open(request, timeout=self.timeout)
                     with response:
                         status = getattr(response, "status", None)

@@ -50,6 +50,7 @@ class PlatformSessionClient(JsonHttpClient):
     def __init__(self, url, *, ca_file=None, allow_http=False, timeout=15):
         super().__init__(url, ca_file=ca_file, allow_http=allow_http, timeout=timeout,
                          response_bytes=MAX_RESPONSE_BUDGET_BYTES)
+        self._ca_file, self._allow_http = ca_file, allow_http
         self.user = None
         self.expires_at = None
         self.generation = 0
@@ -81,6 +82,13 @@ class PlatformSessionClient(JsonHttpClient):
             "can_submit_research": ready and role in {"SYSTEM_ADMIN", "TEST_EXECUTOR"},
             "can_review_factory": ready and role in {"SYSTEM_ADMIN", "TEST_EXECUTOR", "FACTORY_REVIEWER"},
         }
+
+    def display_session(self, directory):
+        if not self.session()["can_submit_research"] or not self.csrf():
+            return None
+        from .display_presence import DisplaySession
+
+        return DisplaySession(self, directory, ca_file=self._ca_file, allow_http=self._allow_http)
 
     def call(self, method, path, *, payload=None, body=None, key=None, public=False):
         self.check_cancel()

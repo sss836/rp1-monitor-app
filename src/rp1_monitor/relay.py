@@ -485,6 +485,11 @@ class RelayRuntime:
                 self.board_error = "；".join(errors)
                 self.stop_event.wait(5)
 
+    def display_connected(self):
+        """Use the same live receive boundary as preview, without rendering a frame."""
+        with self._lock:
+            return self._preview is not None and time.monotonic() - self._received_at <= 1
+
     def snapshot(self):
         with self._lock:
             if self._preview is None:

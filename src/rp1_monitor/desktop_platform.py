@@ -57,6 +57,7 @@ from PySide6.QtWidgets import (
 
 from .app_shell import APP_STYLE, AppMonitorWindow
 from .desktop import GridBackground
+from .display_presence import INTERVAL_MS, DisplayPublisher, observation
 
 _WORKERS = set()
 DEFAULT_PLATFORM_URL = "https://10.43.17.214:8443"
@@ -217,6 +218,10 @@ class LazyPlatformService:
         self._cancelled.set()
         if self._service is not None:
             self._service.cancel_current()
+
+    def display_session(self):
+        if self._service is not None and not self._closed and not self._cancelled.is_set():
+            return self._service.display_session()
 
     def close(self):
         self._closed = True
@@ -427,6 +432,10 @@ class PlatformMonitorWindow(AppMonitorWindow):
             state = platform_state_directory or Path.home() / ".local/share/rp1-monitor/platform"
             platform_service = LazyPlatformService(state)
         self.platform_service = platform_service
+        self.display_publisher = DisplayPublisher()
+        self.display_timer = QTimer(self)
+        self.display_timer.setInterval(INTERVAL_MS)
+        self.display_timer.timeout.connect(self._tick_display_presence)
         self.setWindowTitle("RP1 整机测试工作台")
         self.setMinimumSize(1080, 720)
         self.resize(1440, 920)
@@ -444,6 +453,9 @@ class PlatformMonitorWindow(AppMonitorWindow):
         self.platform_notice = text("本地工作台可直接连接、测试与保存。需要查询或提交平台数据时，再在顶栏登录。", "platformNotice")
         self.platform_notice.setAccessibleName("平台操作状态")
         layout.addWidget(self.platform_notice)
+        self.display_notice = text("", "cardHint")
+        self.display_notice.hide()
+        layout.addWidget(self.display_notice)
         self.platform_stack = CurrentPageStack()
         self.login_page = self._build_login()
         self.account_dialog = QDialog(self)
@@ -964,6 +976,10 @@ class PlatformMonitorWindow(AppMonitorWindow):
         old_identity = (old_user.get("id"), old_user.get("role"), old_user.get("kind"))
         self.session = deepcopy(value)
         user = value.get("user") or {}
+        display = self.display_publisher.session
+        if display and (not self._valid_session() or not value.get("can_submit_research")
+                        or display.owner != str(user.get("id")) or display.generation != value.get("generation")):
+            self._stop_display_presence()
         if old_identity != (user.get("id"), user.get("role"), user.get("kind")):
             for dialog in list(self._detail_dialogs):
                 dialog.reject()
@@ -1102,7 +1118,18 @@ class PlatformMonitorWindow(AppMonitorWindow):
             frozen.setdefault("session_generation", self.session.get("generation"))
         if hasattr(self.platform_service, "begin_request"):
             self.platform_service.begin_request()
-        operation = local_operation or (lambda: self.platform_service.operation(action, frozen))
+        execute = local_operation or (lambda: self.platform_service.operation(action, frozen))
+
+        def operation():
+            value = execute()
+            if action in {"login", "change_password", "profile"} and hasattr(self.platform_service, "display_session"):
+                try:
+                    return {**value, "_display_session": self.platform_service.display_session()}
+                except Exception:
+                    # Local display setup must not turn a valid login into a failure.
+                    return {**value, "_display_setup_failed": True}
+            return value
+
         worker = PlatformJob(operation, ticket)
         worker.setObjectName("RP1NativePlatformTask")
         self.platform_worker = worker
@@ -1132,6 +1159,14 @@ class PlatformMonitorWindow(AppMonitorWindow):
         if self._cancel_requested:
             self.platform_notice.setText("平台请求已结束。取消前已送达的提交仍可能存在，请刷新台账核对；不会自动再次提交。")
             return
+        if isinstance(value, dict) and self._valid_session():
+            if value.get("_display_session") is not None:
+                self.display_publisher.replace(value["_display_session"])
+                self.display_timer.start()
+                self._tick_display_presence()
+            elif value.get("_display_setup_failed"):
+                self.display_notice.setText("大屏状态上报未初始化，请核对上位机状态目录。")
+                self.display_notice.show()
         if getattr(self, "_request_action", "") not in {"configure", "login", "profile", "change_password", "logout", "local_bootstrap"} and ticket != (self._identity_epoch, self._source_epoch, self.domain, self._ticket_serial):
             self.platform_notice.setText("此前身份下的任务已结束；当前来源或分区已变化，请刷新对应台账核对。")
             return
@@ -1237,7 +1272,32 @@ class PlatformMonitorWindow(AppMonitorWindow):
         self.platform_notice.setText("已核对平台会话；原生与浏览器登录会话独立。")
 
     def logout(self):
+        if self.platform_worker is None:
+            self._stop_display_presence()
         self.request("logout", {}, self._logout_loaded)
+
+    def _stop_display_presence(self):
+        self.display_timer.stop()
+        self.display_publisher.stop()
+        self.display_notice.hide()
+
+    def _tick_display_presence(self):
+        session = self.display_publisher.session
+        if session is None or not self._valid_session() or self._platform_closing:
+            self._stop_display_presence()
+            return
+        self.display_notice.setText("大屏展示 · " + session.notice)
+        self.display_notice.show()
+        if not session.valid():
+            self.display_timer.stop()
+            return
+        frame = self.last_frame if self.reader is not None else None
+        upload = (frame or {}).get("upload", {})
+        online = (not self.health_expired and bool(self.last_received)
+                  and time.monotonic() - self.last_received < 2
+                  and (upload.get("stage") == "robot_buffer" or upload.get("collector_connected") is True))
+        self.display_publisher.tick(station_url=self.station_url, token_file=self.station_token_file,
+                                    current=observation(frame, online=online))
 
     def _logout_loaded(self, _value):
         self._identity_epoch += 1
@@ -1981,6 +2041,7 @@ class PlatformMonitorWindow(AppMonitorWindow):
 
     def closeEvent(self, event):
         self._platform_closing = True
+        self._stop_display_presence()
         if self.platform_worker is not None and self.platform_worker.isRunning():
             self.platform_service.cancel_current()
             self.platform_worker.requestInterruption()
@@ -1996,6 +2057,7 @@ class PlatformMonitorWindow(AppMonitorWindow):
     def finish_platform_workers(self):
         """Safety net after the Qt event loop, including direct QApplication.quit()."""
         self._platform_closing = True
+        self._stop_display_presence()
         self.platform_service.cancel_current()
         for worker in list(_WORKERS):
             worker.requestInterruption()

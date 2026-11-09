@@ -128,6 +128,30 @@ class FleetRecorder:
     def state(self, robot_id=None):
         return self.context(robot_id)
 
+    def display_sessions(self, robot_ids):
+        """Read only active identity and timing, without scanning recording queues."""
+        # Starting a recording can hold these locks across PostgreSQL I/O.
+        # Display refreshes skip the unavailable run and keep connectivity.
+        if not self.lock.acquire(blocking=False):
+            return {}
+        try:
+            selected = [(robot_id, self.recorders.get(robot_id)) for robot_id in robot_ids]
+        finally:
+            self.lock.release()
+        result = {}
+        for robot_id, recorder in selected:
+            if recorder is None or not recorder.lock.acquire(blocking=False):
+                continue
+            try:
+                session = (recorder.active or {}).get("session")
+                if session:
+                    result[robot_id] = {key: session.get(key) for key in (
+                        "robot_id", "source_kind", "run_number", "started_at", "ended_at",
+                    )}
+            finally:
+                recorder.lock.release()
+        return result
+
     def start(self, query):
         with self.lock:
             if self._closed:

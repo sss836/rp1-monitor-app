@@ -364,6 +364,14 @@ class StationManager:
             if errors:
                 raise errors[0]
 
+    def display_connected(self, robot_id):
+        with self.state_lock:
+            connection = self.connections.get(robot_id)
+            if not (self._projection(connection)["connected"] and connection.relay_server):
+                return False
+            server = connection.relay_server
+        return server.config.app.state.runtime.display_connected()
+
     def recording_source(self, robot_id=None):
         with self.state_lock:
             managed = bool(self.connections)
@@ -438,6 +446,25 @@ def create_station_app(directory, port=DEFAULT_PORT, *, tunnel_factory=None):
     recorder = FleetRecorder(app.state.store, directory, recording_source, recording_roster)
     app.state.recorder = recorder
     register_recordings(app, recorder, recording_source, reader, record_control)
+
+    @app.get("/api/v1/station/display-presence", dependencies=[Depends(reader)])
+    def display_presence():
+        from .display_presence import MAX_ROBOTS, active_run, observation
+
+        roster = [item for item in recording_roster() if item.get("source_kind") == "ros2"]
+        roster = sorted(roster, key=lambda item: not item["connected"])[:MAX_ROBOTS]
+        sessions = recorder.display_sessions([item["robot_id"] for item in roster])
+        rows = []
+        for item in roster:
+            robot_id = item["robot_id"]
+            online = item["connected"] and manager.display_connected(robot_id)
+            row = observation(item, online=online)
+            if row is not None:
+                if online and (run := active_run(sessions.get(robot_id), robot_id)):
+                    row["run"] = run
+                rows.append(row)
+        return {"robots": rows}
+
     original_lifespan = app.router.lifespan_context
 
     @asynccontextmanager

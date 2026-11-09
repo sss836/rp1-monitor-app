@@ -161,6 +161,29 @@ def test_fixed_site_ca_and_explicit_overrides(app, ui, monkeypatch, address, ca,
         assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname
 
 
+def test_display_publication_starts_after_valid_login_and_stops_at_logout_and_expiry(app, ui, monkeypatch):
+    window, service = ui
+    stopped, pulses = [], []
+    display = SimpleNamespace(owner="person-a", generation=1, notice="测试显示", valid=lambda: True,
+                              stop=lambda: stopped.append(True))
+    monkeypatch.setattr(service, "display_session", lambda: display, raising=False)
+    monkeypatch.setattr(window.display_publisher, "tick", lambda **values: pulses.append(values))
+    assert not window.display_timer.isActive() and not pulses
+    sign_in(app, window, service)
+    assert window.display_timer.isActive() and pulses
+    assert window.display_publisher.session is display and window.platform_worker is None
+    window.logout()
+    assert stopped == [True] and not window.display_timer.isActive()
+    wait_for(app, lambda: window.platform_worker is None)
+    assert window.platform_stack.currentWidget() is window.local_workbench
+
+    sign_in(app, window, service)
+    window.session["expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    window._check_session_expiry()
+    assert stopped == [True, True] and not window.display_timer.isActive()
+    assert window.platform_stack.currentWidget() is window.local_workbench
+
+
 def make_result_csv(window, path, *, sn="MOCK-SN-A", simulated=False):
     store = window.factory_panel.store
     store.set_model_dof(sn, 24)
