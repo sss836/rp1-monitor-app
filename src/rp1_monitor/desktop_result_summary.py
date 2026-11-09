@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QPlainTextEdit,
@@ -287,7 +288,8 @@ class ResultSummaryPanel(QWidget):
                 f"SN：{self.sn}　机型：{row.get('model', '')}　分类：{row.get('category', '')}\n"
                 f"本地编号：{row.get('case_code', '')}　层级：{row.get('level', '')}\n"
                 f"原始来源ID：{row.get('source_id') or '—'}　记录ID：{row.get('record_id') or '—'}\n"
-                f"数据来源：{row.get('source_kind') or '未知'} {simulation}"
+                f"数据来源：{row.get('source_kind') or '未知'} {simulation}\n"
+                f"来源结论：{row.get('original_verdict') or '未知'}；人工修改记录：{row.get('edit_token', 0)}（导出时自动附带追溯清单）"
             )
         else:
             self.identity_label.setText("请先打开整机SN，再选择项目。")
@@ -312,7 +314,7 @@ class ResultSummaryPanel(QWidget):
         if key == "verdict" and self._not_applicable(row):
             value = "不适用"
         drafts = self._drafts.setdefault(self.sn, {})
-        draft = drafts.setdefault(row["row_key"], {"row_key": row["row_key"], "source_token": row.get("source_token", ""), "fields": {}})
+        draft = drafts.setdefault(row["row_key"], {"row_key": row["row_key"], "source_token": row.get("source_token", ""), "edit_token": row.get("edit_token", 0), "fields": {}})
         if value == str(row.get(key) or ""):
             draft["fields"].pop(key, None)
         else:
@@ -325,7 +327,7 @@ class ResultSummaryPanel(QWidget):
             self.table.item(index, 1).setText(("    " if row.get("level") == "子项" else "") + str(effective.get("test_name", "")))
             self.table.item(index, 2).setText(str(effective.get("verdict", "")))
             self.table.item(index, 3).setText("未保存" if row["row_key"] in drafts else ("已编辑" if row.get("edited") else "来源结果"))
-        self.notice.setText(f"当前SN有 {len(drafts)} 项未保存编辑；保存仅更新当前最终版。")
+        self.notice.setText(f"当前SN有 {len(drafts)} 项未保存编辑；原值与每次修改会自动留底。")
         self._update_actions()
 
     def apply_operator(self):
@@ -367,6 +369,18 @@ class ResultSummaryPanel(QWidget):
         station = self.station_edit.currentText().strip()
         sn = self.sn
         drafts = [] if station_only else deepcopy(list(self._drafts.get(sn, {}).values()))
+        by_key = {row["row_key"]: row for row in self._rows}
+        rejudgments = [draft for draft in drafts if
+            by_key[draft["row_key"]].get("verdict") in {"通过", "不通过", "中断"}
+            and "verdict" in draft["fields"]
+            and draft["fields"]["verdict"] != by_key[draft["row_key"]]["verdict"]]
+        if rejudgments:
+            reason, accepted = QInputDialog.getText(self, "记录改判原因", "本次修改已有结论的原因（自动记录本机账号和时间）：")
+            if not accepted or not reason.strip():
+                self.notice.setText("未保存改判；请填写原因。原始数据和日常采集不受影响。")
+                return
+            for draft in rejudgments:
+                draft["reason"] = reason.strip()
         directory = self.export_directory
 
         def operation():

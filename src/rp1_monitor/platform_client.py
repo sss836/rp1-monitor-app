@@ -175,3 +175,7 @@ class PlatformSessionClient(JsonHttpClient):
     def upload_result(self, metadata, raw_bytes, idempotency_key):
         from .factory_bridge import PlatformClient
         return PlatformClient.upload_result(self, metadata, raw_bytes, idempotency_key)
+
+    def upload_trace(self, archive_id, raw_bytes, digest):
+        from .factory_bridge import PlatformClient
+        return PlatformClient.upload_trace(self, archive_id, raw_bytes, digest)

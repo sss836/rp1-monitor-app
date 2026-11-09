@@ -445,10 +445,98 @@ class UploadTests(unittest.TestCase):
             client, transport = platform([])
             box = Outbox(Path(directory) / "state" / "outbox.sqlite")
             try:
-                box.enqueue(client.base_url, "different-owner", metadata, raw)
+                key = box.enqueue(client.base_url, "different-owner", metadata, raw)
+                self.assertEqual(box.drain(client), [])
                 with self.assertRaisesRegex(BridgeError, "outbox_account_or_destination_mismatch"):
-                    box.drain(client)
+                    box.drain(client, task_key=key)
                 self.assertEqual(len(transport.requests), 1)
+            finally:
+                box.close()
+
+    def test_selected_task_after_first_ten_and_old_destination_is_exact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metadata, raw = upload(csv_file(directory))
+            client, transport = platform([(200, {"data": archive_receipt(metadata)}, [])])
+            box = Outbox(Path(directory) / "state" / "outbox.sqlite")
+            try:
+                old = box.enqueue("https://old.example", "owner-1", metadata, raw)
+                keys = [box.enqueue(client.base_url, "owner-1", {**metadata, "reason": str(i)}, raw) for i in range(12)]
+                result = box.drain(client, task_key=keys[-1], source="PC-01")
+                self.assertEqual([item["task_key"] for item in result], [keys[-1]])
+                self.assertEqual(transport.requests[-1].get_header("Idempotency-key"), keys[-1])
+                self.assertEqual([r["status"] for r in box.status()], ["pending"] * 12 + ["sent"])
+                with self.assertRaisesRegex(BridgeError, "destination_mismatch"):
+                    box.drain(client, task_key=old)
+            finally:
+                box.close()
+
+    def test_bulk_filters_target_before_limit_and_isolates_permanent_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metadata, raw = upload(csv_file(directory))
+            client, transport = platform([(422, {"error": {"code": "invalid_csv"}}, []),
+                                          (200, {"data": archive_receipt(metadata)}, [])])
+            box = Outbox(Path(directory) / "state" / "outbox.sqlite")
+            try:
+                for i in range(12):
+                    box.enqueue("https://old.example", "owner-1", {**metadata, "reason": str(i)}, raw)
+                bad = box.enqueue(client.base_url, "owner-1", metadata, raw)
+                good = box.enqueue(client.base_url, "owner-1", {**metadata, "reason": "good"}, raw)
+                result = box.drain(client, limit=2)
+                self.assertEqual([r["task_key"] for r in result], [good])
+                self.assertEqual(box.status()[-2]["status"], "blocked")
+                self.assertEqual(box.db.execute("SELECT payload FROM tasks WHERE task_key=?", (bad,)).fetchone()[0], raw)
+                self.assertEqual(box.enqueue(client.base_url, "owner-1", metadata, raw), bad)
+                self.assertEqual(box.drain(client), [])
+                self.assertEqual(len(transport.requests), 3)
+            finally:
+                box.close()
+
+    def test_lost_ack_reopen_reuses_frozen_key_and_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metadata, raw = upload(csv_file(directory))
+            client, transport = platform([(503, {}, []), (200, {"data": archive_receipt(metadata)}, [])])
+            state = Path(directory) / "state" / "outbox.sqlite"
+            box = Outbox(state)
+            key = box.enqueue(client.base_url, "owner-1", metadata, raw)
+            with self.assertRaises(BridgeError):
+                box.drain(client, task_key=key)
+            box.close()
+            box = Outbox(state)
+            try:
+                self.assertEqual(box.enqueue(client.base_url, "owner-1", metadata, raw), key)
+                box.drain(client, task_key=key)
+                self.assertEqual([r.get_header("Idempotency-key") for r in transport.requests[1:]], [key, key])
+                self.assertEqual([r.data for r in transport.requests[1:]], [raw, raw])
+            finally:
+                box.close()
+
+    def test_ambiguous_and_recoverable_409_are_not_permanently_isolated(self):
+        from rp1_monitor.factory_bridge import permanent_submission_error
+
+        for code in ("http_409", "archive_conflict", "offset_conflict", "incomplete_upload"):
+            self.assertFalse(permanent_submission_error(BridgeError(code, 409)))
+        self.assertTrue(permanent_submission_error(BridgeError("chunk_conflict", 409)))
+
+    def test_blocked_payload_counts_toward_budget_and_explicit_retry_keeps_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metadata, raw = upload(csv_file(directory))
+            client, transport = platform([(409, {"error": {"code": "factory_result_content_conflict"}}, []),
+                                          (200, {"data": archive_receipt(metadata)}, [])])
+            state = Path(directory) / "state" / "outbox.sqlite"
+            box = Outbox(state, max_pending_count=1)
+            key = box.enqueue(client.base_url, "owner-1", metadata, raw)
+            with self.assertRaises(BridgeError):
+                box.drain(client, task_key=key)
+            box.close()
+            box = Outbox(state, max_pending_count=1)
+            try:
+                with self.assertRaisesRegex(BridgeError, "outbox_full"):
+                    box.enqueue(client.base_url, "owner-1", {**metadata, "reason": "new"}, raw)
+                box.drain(client, task_key=key)
+                self.assertEqual(transport.requests[-1].data, raw)
+                self.assertEqual(transport.requests[-1].get_header("Idempotency-key"), key)
+                self.assertEqual(box.status()[0]["status"], "sent")
+                self.assertEqual(box.drain(client, task_key=key), [])
             finally:
                 box.close()
 

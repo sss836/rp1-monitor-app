@@ -447,6 +447,15 @@ class FactoryPanel(QScrollArea):
         edit = deepcopy(summary._drafts.get(sn, {}).get(code, {
             "row_key": code, "source_token": row["source_token"], "fields": {},
         }))
+        edit.setdefault("edit_token", row.get("edit_token", 0))
+        if row.get("verdict") in {"通过", "不通过", "中断"} and row["verdict"] != verdict:
+            from PySide6.QtWidgets import QInputDialog
+
+            reason, accepted = QInputDialog.getText(self, "记录改判原因", "修改已有结论的原因：")
+            if not accepted or not reason.strip():
+                self.notice.setText("改判未保存；正常采集不受影响。")
+                return
+            edit["reason"] = reason.strip()
         edit["fields"]["verdict"] = verdict
         notes = edit["fields"].get("notes", row.get("notes", ""))
         notes = "\n".join(line for line in notes.splitlines() if not line.startswith("本项人工确认："))

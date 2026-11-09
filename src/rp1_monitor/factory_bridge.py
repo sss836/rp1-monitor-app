@@ -58,6 +58,21 @@ class BridgeError(Exception):
         self.code, self.status = code, status
 
 
+def permanent_submission_error(error):
+    """Only deterministic task errors are isolated; outages/auth remain retryable."""
+    # archive_conflict also covers deadlocks/serialization failures on the server;
+    # offset_conflict/incomplete_upload recover by rereading its stored progress.
+    return error.status in {400, 413, 415, 422} or error.code in {
+        "export_evidence_changed", "export_evidence_unavailable", "archive_processing_failed",
+        "archive_context_conflict", "archive_verification_conflict", "archive_revision_conflict",
+        "factory_result_storage_conflict", "factory_result_content_conflict",
+        "archive_storage_conflict", "archive_storage_incomplete", "immutable_archive",
+        "chunk_conflict", "archive_corrupt", "segmented_upload_required",
+        "factory_trace_conflict", "factory_trace_state_conflict", "factory_trace_required", "factory_trace_frozen_hash_mismatch",
+        "factory_trace_csv_mismatch", "invalid_factory_trace", "invalid_factory_trace_size", "payload_hash_mismatch",
+    }
+
+
 def clean_text(value, maximum=128):
     if not isinstance(value, str) or not value.strip() or len(value) > maximum:
         raise BridgeError("invalid_identity")
@@ -385,6 +400,16 @@ class PlatformClient(JsonHttpClient):
         )
         return validate_receipt(metadata, raw_bytes, receipt)
 
+    def upload_trace(self, archive_id, raw, digest):
+        from .factory_trace_upload import validate_trace_receipt
+
+        archive_id = str(UUID(archive_id))
+        receipt = self.post(
+            f"/api/v1/factory/robot-result-archives/{archive_id}/trace", raw, "application/json",
+            idempotency_key="factory-trace-" + digest,
+        )
+        return validate_trace_receipt(archive_id, digest, receipt)
+
 
 def private_file(path, maximum):
     """Read only an explicitly named regular file; reject symlink/device inputs."""
@@ -590,44 +615,59 @@ class Outbox:
             self.db.execute(
                 "UPDATE tasks SET envelope_hash=substr(task_key,16) WHERE envelope_hash IS NULL"
             )
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(tasks)")}
+        for name, kind in (("trace_payload", "BLOB"), ("trace_sha256", "TEXT"), ("trace_receipt", "TEXT")):
+            if name not in columns:
+                self.db.execute(f"ALTER TABLE tasks ADD COLUMN {name} {kind}")
         self.db.commit()
 
     def close(self):
         self.db.close()
 
-    def enqueue(self, platform_url, owner_id, metadata, raw):
-        if not isinstance(metadata, dict) or set(metadata) != UPLOAD_FIELDS:
+    def enqueue(self, platform_url, owner_id, metadata, raw, *, trace_raw=None):
+        if not isinstance(metadata, dict) or set(metadata) - {"trace_sha256"} != UPLOAD_FIELDS:
             raise BridgeError("invalid_submission_metadata")
         if len(raw) > MAX_CSV_BYTES or len(raw) != metadata.get("size_bytes") or hashlib.sha256(raw).hexdigest() != metadata.get("sha256"):
             raise BridgeError("payload_hash_mismatch")
         if metadata.get("verified") != "true" or metadata.get("completed") != "true":
             raise BridgeError("unverified_submission_refused")
+        trace_hash = None
+        if trace_raw is not None:
+            from .factory_trace_upload import validate_trace
+
+            trace_hash = validate_trace(trace_raw, raw)
+            if metadata.get("trace_sha256", trace_hash) != trace_hash:
+                raise BridgeError("factory_trace_frozen_hash_mismatch")
+            metadata = {**metadata, "trace_sha256": trace_hash}
+        elif "trace_sha256" in metadata:
+            raise BridgeError("factory_trace_payload_required")
         envelope = json.dumps({
             "platform_url": base_url(platform_url, allow_http=True),
             "owner_id": clean_text(owner_id), "metadata": metadata,
         }, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        frozen_bytes = len(raw) + len(trace_raw or b"")
         envelope_hash = hashlib.sha256(envelope.encode()).hexdigest()
         with self.db:
             # Multiple CLI processes must serialize the budget check and insertion.
             self.db.execute("BEGIN IMMEDIATE")
             existing = self.db.execute(
-                "SELECT task_key FROM tasks WHERE envelope_hash=? AND status='pending' ORDER BY rowid LIMIT 1",
+                "SELECT task_key FROM tasks WHERE envelope_hash=? AND status!='sent' ORDER BY rowid LIMIT 1",
                 (envelope_hash,),
             ).fetchone()
             if existing:
                 return existing[0]
             count, size = self.db.execute(
-                "SELECT count(*),coalesce(sum(bytes),0) FROM tasks WHERE status='pending'"
+                "SELECT count(*),coalesce(sum(bytes),0) FROM tasks WHERE status!='sent'"
             ).fetchone()
-            if count >= self.max_pending_count or size + len(raw) > self.max_pending_bytes:
+            if count >= self.max_pending_count or size + frozen_bytes > self.max_pending_bytes:
                 raise BridgeError("outbox_full_existing_evidence_retained")
             # A new explicit submission after a completed transfer is a new attempt.
             # Pending retries retain their nonce/key; rejected archives can be resubmitted.
             key = "factory-result-" + envelope_hash + "-" + uuid4().hex
             self.db.execute(
-                "INSERT INTO tasks(task_key,platform_url,owner_id,metadata,payload,bytes,status,envelope_hash) VALUES(?,?,?,?,?,?,'pending',?)",
+                "INSERT INTO tasks(task_key,platform_url,owner_id,metadata,payload,bytes,status,envelope_hash,trace_payload,trace_sha256) VALUES(?,?,?,?,?,?,'pending',?,?,?)",
                 (key, base_url(platform_url, allow_http=True), owner_id,
-                 json.dumps(metadata, ensure_ascii=False, sort_keys=True), raw, len(raw), envelope_hash),
+                 json.dumps(metadata, ensure_ascii=False, sort_keys=True), raw, frozen_bytes, envelope_hash, trace_raw, trace_hash),
             )
         return key
 
@@ -635,36 +675,87 @@ class Outbox:
         return [dict(zip(("task_key", "status", "attempts", "last_error"), row)) for row in
                 self.db.execute("SELECT task_key,status,attempts,last_error FROM tasks ORDER BY rowid")]
 
-    def drain(self, platform, *, limit=10, source=None):
+    def drain(self, platform, *, limit=10, source=None, task_key=None):
         if platform.user is None:
             raise BridgeError("login_required")
-        acknowledged = []
-        for key, url, owner, metadata, raw in self.db.execute(
-            "SELECT task_key,platform_url,owner_id,metadata,payload FROM tasks WHERE status='pending' ORDER BY rowid LIMIT ?",
-            (limit,),
-        ).fetchall():
-            if url != platform.base_url or owner != str(platform.user["id"]):
+        owner = str(platform.user["id"])
+        if task_key is not None:
+            rows = self.db.execute(
+                "SELECT task_key,platform_url,owner_id,metadata,payload,status,receipt,trace_payload,trace_sha256 FROM tasks WHERE task_key=?",
+                (task_key,),
+            ).fetchall()
+            if not rows:
+                raise BridgeError("outbox_task_not_found")
+            if rows[0][1] != platform.base_url or rows[0][2] != owner:
                 raise BridgeError("outbox_account_or_destination_mismatch")
+        else:
+            # Filter destination/account before limiting. Old queues stay untouched.
+            rows = self.db.execute(
+                "SELECT task_key,platform_url,owner_id,metadata,payload,status,receipt,trace_payload,trace_sha256 FROM tasks "
+                "WHERE status='pending' AND platform_url=? AND owner_id=? ORDER BY rowid",
+                (platform.base_url, owner),
+            ).fetchall()
+        acknowledged = []
+        attempted = 0
+        for key, url, task_owner, metadata, raw, status, saved_receipt, trace_raw, trace_hash in rows:
+            if status == "sent":
+                continue
             metadata = json.loads(metadata)
             if source is not None and metadata["source_id"] != source:
+                if task_key is not None:
+                    raise BridgeError("outbox_source_mismatch")
                 continue
+            if attempted >= limit:
+                break
+            attempted += 1
             try:
-                receipt = platform.upload_result(metadata, raw, key)
-                receipt = validate_receipt(metadata, raw, receipt)
+                if raw is None or len(raw) != metadata["size_bytes"] or hashlib.sha256(raw).hexdigest() != metadata["sha256"]:
+                    raise BridgeError("payload_hash_mismatch")
+                if (trace_raw is None) != (trace_hash is None):
+                    raise BridgeError("factory_trace_frozen_hash_mismatch")
+                if trace_raw is not None:
+                    from .factory_trace_upload import validate_trace, validate_trace_receipt
+
+                    if validate_trace(trace_raw, raw) != trace_hash or metadata.get("trace_sha256") != trace_hash:
+                        raise BridgeError("factory_trace_frozen_hash_mismatch")
+                if saved_receipt is None:
+                    receipt = platform.upload_result(metadata, raw, key)
+                    receipt = validate_receipt(metadata, raw, receipt)
+                    safe = {name: receipt[name] for name in (
+                        "id", "sha256", "status", "revision", "formal_statistics_eligible",
+                    )}
+                    if trace_raw is not None:
+                        # CSV delivery and trace delivery are separate durable stages.
+                        # A lost trace response must never create another CSV archive.
+                        with self.db:
+                            self.db.execute("UPDATE tasks SET receipt=? WHERE task_key=?", (json.dumps(safe), key))
+                else:
+                    safe = json.loads(saved_receipt)
+                    if safe.get("sha256") != metadata["sha256"] or safe.get("formal_statistics_eligible") is not False:
+                        raise BridgeError("archive_receipt_identity_mismatch")
+                    try:
+                        UUID(safe["id"])
+                    except (ValueError, TypeError, KeyError):
+                        raise BridgeError("invalid_archive_receipt") from None
+                trace_receipt = None
+                if trace_raw is not None:
+                    trace_receipt = platform.upload_trace(safe["id"], trace_raw, trace_hash)
+                    trace_receipt = validate_trace_receipt(safe["id"], trace_hash, trace_receipt)
             except BridgeError as exc:
+                blocked = permanent_submission_error(exc)
                 with self.db:
                     self.db.execute(
-                        "UPDATE tasks SET attempts=attempts+1,last_error=? WHERE task_key=?", (exc.code, key),
+                        "UPDATE tasks SET attempts=attempts+1,last_error=?,status=? WHERE task_key=? AND status!='sent'",
+                        (exc.code, "blocked" if blocked else "pending", key),
                     )
-                raise
+                if task_key is not None or not blocked:
+                    raise
+                continue
             # Persist only bounded receipt identity/status; never arbitrary remote payloads.
-            safe = {name: receipt[name] for name in (
-                "id", "sha256", "status", "revision", "formal_statistics_eligible",
-            )}
             with self.db:
                 self.db.execute(
-                    "UPDATE tasks SET status='sent',payload=NULL,bytes=0,attempts=attempts+1,last_error='',receipt=? WHERE task_key=?",
-                    (json.dumps(safe), key),
+                    "UPDATE tasks SET status='sent',payload=NULL,trace_payload=NULL,trace_receipt=?,bytes=0,attempts=attempts+1,last_error='',receipt=? WHERE task_key=?",
+                    (json.dumps(trace_receipt) if trace_receipt else None, json.dumps(safe), key),
                 )
                 self.db.execute("DELETE FROM tasks WHERE status='sent' AND rowid NOT IN (SELECT rowid FROM tasks WHERE status='sent' ORDER BY rowid DESC LIMIT 512)")
             acknowledged.append({"task_key": key, "receipt": safe})
@@ -696,7 +787,8 @@ def parser():
     upload.add_argument("--completed", action="store_true")
     upload.add_argument("--submit", action="store_true")
     upload.add_argument("--reason", required=True)
-    commands.add_parser("retry", help="重试已显式提交的冻结任务，不扫描新文件")
+    retry = commands.add_parser("retry", help="重试已显式提交的冻结任务，不扫描新文件")
+    retry.add_argument("--task-key", help="只重试指定任务；允许人工重试已隔离任务")
     commands.add_parser("status", help="只看本桥接任务状态，不登录、不读设备")
     return result
 
@@ -713,11 +805,15 @@ def run(args):
         return 0
     # Validate local submission before requesting a password or making any network request.
     upload = None
+    trace_raw = None
     if args.command == "submit-results":
         upload = result_upload(
             args.file, source=source, robot_id=args.robot_id, kind=args.source_kind,
             verified=args.verified, completed=args.completed, submit=args.submit, reason=args.reason,
         )
+        from .factory_trace_upload import read_trace
+
+        trace_raw = read_trace(args.file, upload[1])
     if not args.username:
         raise BridgeError("username_required")
     platform = PlatformClient(args.platform_url, allow_http=args.allow_http)
@@ -731,9 +827,11 @@ def run(args):
         try:
             if upload:
                 metadata, raw = upload
-                key = box.enqueue(platform.base_url, str(platform.user["id"]), metadata, raw)
+                key = box.enqueue(platform.base_url, str(platform.user["id"]), metadata, raw, trace_raw=trace_raw)
                 print(json.dumps({"queued": key, "domain": "FACTORY"}))
-            print(json.dumps({"acknowledged": box.drain(platform, source=source)}, ensure_ascii=False))
+            print(json.dumps({"acknowledged": box.drain(
+                platform, source=source, task_key=key if upload else args.task_key,
+            )}, ensure_ascii=False))
         finally:
             box.close()
         return 0

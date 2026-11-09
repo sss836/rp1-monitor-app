@@ -61,7 +61,7 @@ def test_preview_real_factory_store_export_uses_same_31_rows_and_original_simula
         store.save_estop_pairing("SYNTHETIC-SN", "fail")
         row = next(item for item in store.report_rows("SYNTHETIC-SN") if item["row_key"] == "SYS-012")
         store.save_report_edits("SYNTHETIC-SN", [{"row_key": row["row_key"], "source_token": row["source_token"],
-                                                 "fields": {"verdict": "待复核", "notes": "人工备注"}}], station_id="PC-01")
+                                                 "reason": "保留失败待质量复核", "fields": {"verdict": "待复核", "notes": "人工备注"}}], station_id="PC-01")
         path = Path(store.export_result_summary("SYNTHETIC-SN", tmp_path / "export"))
         before = path.read_bytes()
         preview = preview_result_csv(path)

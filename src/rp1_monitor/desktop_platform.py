@@ -71,7 +71,7 @@ _APPROVAL = {"PENDING": "待审核", "APPROVED": "已批准", "REJECTED": "已�
 _STATES = {
     "pending": "待处理", "queued": "待处理", "uploading": "上传中",
     "processing": "解析中", "failed": "待处理 · 失败可重试", "sent": "已送达",
-    "validating": "平台解析 / 校验中",
+    "validating": "平台解析 / 校验中", "blocked": "需核对 · 已隔离（保留原数据）",
     "submitted": "已送审", "complete": "已传输", "COMPLETE": "上传完成",
     "READY": "解析就绪", "WAITING": "等待上传", "QUEUED": "等待解析",
     "PROCESSING": "解析中", "FAILED": "解析失败", "CORRUPT": "校验失败",
@@ -1640,7 +1640,8 @@ class PlatformMonitorWindow(AppMonitorWindow):
         receipt = value.get("receipt") or {}
         task = value.get("task") or {}
         status = _APPROVAL.get(receipt.get("status"), _STATES.get(task.get("status"), task.get("status") or "待处理"))
-        self.platform_notice.setText(f"工厂汇总：{status} · 记录 {receipt.get('id') or task.get('archive_id') or '尚未确认送达'}。提交人取平台会话；不赋予可靠性或MTBF统计资格。")
+        trace_notice = {"none": "未关联追溯清单", "pending": "追溯清单待补传，可在提交任务中重试", "sent": "追溯清单已关联"}.get(task.get("trace_status", "none"), "追溯状态待核对")
+        self.platform_notice.setText(f"工厂汇总：{status} · 记录 {receipt.get('id') or task.get('archive_id') or '尚未确认送达'}。{trace_notice}。提交人取平台会话；不赋予可靠性或MTBF统计资格。")
         if receipt:
             self.factory_verified.setChecked(False)
             self.factory_completed.setChecked(False)
@@ -1933,7 +1934,7 @@ class PlatformMonitorWindow(AppMonitorWindow):
 
     def _tasks_loaded(self, value):
         self._tasks = value.get("items", [])
-        rows_into(self.tasks_table, [("工厂" if row.get("domain") == "FACTORY" else "研发", row.get("filename") or row.get("sha256"), _STATES.get(row.get("status"), row.get("status")), row.get("archive_id") or "尚未确认送达", row.get("last_error") or "") for row in self._tasks])
+        rows_into(self.tasks_table, [("工厂" if row.get("domain") == "FACTORY" else "研发", row.get("filename") or row.get("sha256"), _STATES.get(row.get("status"), row.get("status")), row.get("archive_id") or "尚未确认送达", "；".join(filter(None, (row.get("last_error"), {"none": "未关联追溯清单", "pending": "追溯清单待补传", "sent": "追溯清单已关联"}.get(row.get("trace_status", "none"), "") if row.get("domain") == "FACTORY" else "")))) for row in self._tasks])
         self.platform_notice.setText("已读取当前平台账号的本机提交任务。传输状态不等于审批通过。")
 
     def retry_task(self):

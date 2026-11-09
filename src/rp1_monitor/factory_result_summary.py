@@ -14,6 +14,7 @@ from functools import lru_cache
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
+from . import factory_traceability as trace
 from .board_check_view import board_check_view
 from .factory_board_profile import BoardTestProfile
 from .factory_codec import decode_payload
@@ -36,7 +37,12 @@ def _json(value):
 
 @lru_cache(maxsize=1)
 def _rules():
-    return json.loads((Path(__file__).parent / "data/factory-report-rules.json").read_text(encoding="utf-8"))
+    # Freeze parsing and provenance from the very same bytes for this process.
+    # A rules-file replacement must not change provenance of in-flight results.
+    raw = (Path(__file__).parent / "data/factory-report-rules.json").read_bytes()
+    rules = json.loads(raw)
+    rules["_source_sha256"] = hashlib.sha256(raw).hexdigest()
+    return rules
 
 
 def initialize(store):
@@ -47,6 +53,9 @@ def initialize(store):
         CREATE TABLE IF NOT EXISTS report_settings (
             key TEXT PRIMARY KEY, value TEXT NOT NULL);
     """)
+
+
+    trace.initialize(store.db)
 
 
 def report_settings(store):
@@ -563,16 +572,22 @@ def report_rows(store, sn):
         if dof == 28:
             by_key["SYS-011"].update(verdict="不适用", actual_result="本SN本地机型为28轴，UFO特技不适用。")
         edits = {entry["row_key"]: entry for entry in store.db.execute("SELECT row_key,source_token,fields FROM report_edits WHERE sn=?", (sn,))}
+        pending_transaction = store.db.in_transaction
         for row in rows:
             inputs = row.pop("_inputs")
             token = hashlib.sha256(_json([sn, row["row_key"], dof, row["source_kind"], inputs, row["criterion"], row["criterion_source"]]).encode()).hexdigest()
             row.update(source_token=token, record_id=str(uuid5(NAMESPACE_URL, "rp1-result:" + sn + ":" + row["row_key"] + ":" + token)))
+            trace.remember_source(store.db, sn, dict(row, evidence_inputs=inputs))
+            row["original_verdict"] = row["verdict"]
+            row["edit_token"] = trace.edit_token(store.db, sn, row["row_key"])
             edit = edits.get(row["row_key"])
             if edit and edit["source_token"] == token:
                 row.update(json.loads(edit["fields"]))
                 row["edited"] = True
             if dof == 28 and row["row_key"] == "SYS-011":
                 row["verdict"] = "不适用"
+        if not pending_transaction:
+            store.db.commit()
         return rows
 
 
@@ -587,11 +602,13 @@ def save_report_edits(store, sn, edits, station_id=""):
             store.db.execute("INSERT INTO report_settings VALUES('station_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (station_id.strip(),))
         return []
     sn = store.validate_sn(sn)
-    with store.lock:
+    with store.lock, store.db:
+        # Serialize read/compare/append across separate windows/processes too.
+        store.db.execute("BEGIN IMMEDIATE")
         current = {row["row_key"]: row for row in report_rows(store, sn)}
         validated, seen = [], set()
         for edit in edits:
-            if not isinstance(edit, dict) or set(edit) != {"row_key", "source_token", "fields"}:
+            if not isinstance(edit, dict) or not {"row_key", "source_token", "fields"} <= set(edit) or set(edit) - {"row_key", "source_token", "fields", "reason", "edit_token"}:
                 raise ValueError("结果修改字段无效")
             key = edit["row_key"]
             if not isinstance(key, str) or key not in current or key in seen:
@@ -599,6 +616,8 @@ def save_report_edits(store, sn, edits, station_id=""):
             seen.add(key)
             if edit["source_token"] != current[key]["source_token"]:
                 raise ValueError("本项证据已变化，请重新打开结果后修改")
+            if "edit_token" in edit and edit["edit_token"] != current[key]["edit_token"]:
+                raise ValueError("本项人工结果已变化，请刷新后修改")
             fields = edit["fields"]
             if not isinstance(fields, dict) or fields.keys() - EDITABLE_FIELDS:
                 raise ValueError("仅允许修改结果内容，不能改SN、来源或项目编号")
@@ -609,13 +628,23 @@ def save_report_edits(store, sn, edits, station_id=""):
             if (key == "SYS-011" and current[key]["model"] == "28轴"
                     and fields.get("verdict", "不适用") != "不适用"):
                 raise ValueError("28轴UFO特技不适用，不能填写其他结论")
-            # A partial save preserves the current final values; no edit history is kept.
+            reason = edit.get("reason", "")
+            if not isinstance(reason, str) or len(reason) > 2000:
+                raise ValueError("改判原因必须为不超过2000字的文字")
+            changed_verdict = "verdict" in fields and fields["verdict"] != current[key]["verdict"]
+            if changed_verdict and current[key]["verdict"] in {"通过", "不通过", "中断"} and not reason.strip():
+                raise ValueError("修改已有结论请填写改判原因；正常采集无需填写")
+            # Keep a full append-only before/after audit in the same transaction.
             merged = {field: current[key][field] for field in EDITABLE_FIELDS}
             merged.update(fields)
-            validated.append((sn, key, edit["source_token"], _json(merged)))
+            before = {field: current[key][field] for field in EDITABLE_FIELDS}
+            if merged != before:
+                validated.append((sn, key, edit["source_token"], _json(merged), before, merged, reason.strip()))
         with store.db:
             store.db.execute("INSERT INTO report_settings VALUES('station_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (station_id.strip(),))
-            store.db.executemany("INSERT INTO report_edits VALUES(?,?,?,?) ON CONFLICT(sn,row_key) DO UPDATE SET source_token=excluded.source_token,fields=excluded.fields", validated)
+            for entry in validated:
+                trace.append_edit(store.db, entry[0], entry[1], entry[2], entry[4], entry[5], entry[6])
+            store.db.executemany("INSERT INTO report_edits VALUES(?,?,?,?) ON CONFLICT(sn,row_key) DO UPDATE SET source_token=excluded.source_token,fields=excluded.fields", [entry[:4] for entry in validated])
         return report_rows(store, sn)
 
 
@@ -630,13 +659,22 @@ def export_result_summary(store, sn, output_dir):
     from .factory_store import _sync_directory
 
     sn = store.validate_sn(sn)
-    rows = report_rows(store, sn)
+    with store.lock, store.db:
+        # report_rows can append a newly observed source snapshot. Reserve the
+        # write transaction before reading so another process cannot change
+        # the effective result between CSV rows and their audit manifest.
+        # Release it before serialization/fsync or any transport work.
+        store.db.execute("BEGIN IMMEDIATE")
+        rows = report_rows(store, sn)
+        audit = trace.manifest(store.db, sn, rows, "", _rules()["_source_sha256"])
     output = Path(output_dir).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     # SN is never interpreted as a pathname; every export preserves earlier files.
     path = output / ("SYS-summary-" + hashlib.sha256(sn.encode()).hexdigest()[:12] + "-" + uuid4().hex + ".csv")
     columns = _rules()["columns"]
     published = False
+    sidecar = None
+    sidecar_published = False
     try:
         with tempfile.TemporaryDirectory(prefix=".summary-", dir=output) as temporary:
             staging = Path(temporary) / "summary.csv"
@@ -652,6 +690,16 @@ def export_result_summary(store, sn, output_dir):
                     writer.writerow([_csv_text(values[column["field"]]) for column in columns])
                 stream.flush()
                 os.fsync(stream.fileno())
+            audit["csv_sha256"] = hashlib.sha256(staging.read_bytes()).hexdigest()
+            sidecar = Path(str(path) + ".trace.json")
+            audit_staging = Path(temporary) / "trace.json"
+            with audit_staging.open("x", encoding="utf-8") as stream:
+                os.chmod(audit_staging, 0o600)
+                stream.write(_json(audit))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.link(audit_staging, sidecar)
+            sidecar_published = True
             # link publishes a complete file atomically and refuses to overwrite any earlier export.
             os.link(staging, path)
             published = True
@@ -659,5 +707,7 @@ def export_result_summary(store, sn, output_dir):
     except BaseException:
         if published:
             path.unlink(missing_ok=True)
+        if sidecar_published:
+            sidecar.unlink(missing_ok=True)
         raise
     return str(path)

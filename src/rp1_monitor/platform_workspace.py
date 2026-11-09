@@ -13,7 +13,15 @@ from pathlib import Path
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
-from .factory_bridge import BridgeError, Outbox, private_file, result_upload, source_id, timestamp
+from .factory_bridge import (
+    BridgeError,
+    Outbox,
+    permanent_submission_error,
+    private_file,
+    result_upload,
+    source_id,
+    timestamp,
+)
 from .platform_client import NativePlatformError, PlatformSessionClient
 from .recording_export import (
     MAX_EXPORT_BYTES,
@@ -261,11 +269,15 @@ class NativePlatformService:
         cancelled(self._event)
         box = self._factory_box(owner, metadata["source_id"])
         try:
-            key = box.enqueue(self.client.base_url, owner, metadata, raw)
-            receipts = box.drain(self.client, source=metadata["source_id"])
+            from .factory_trace_upload import read_trace
+
+            key = box.enqueue(self.client.base_url, owner, metadata, raw, trace_raw=read_trace(p["path"], raw))
+            receipts = box.drain(self.client, source=metadata["source_id"], task_key=key)
             receipt = next((item["receipt"] for item in receipts if item["task_key"] == key), None)
+            trace_hash = box.db.execute("SELECT trace_sha256 FROM tasks WHERE task_key=?", (key,)).fetchone()[0]
             return {"task": {"task_id": key, "domain": "FACTORY", "status": "sent" if receipt else "pending", "owner_id": owner,
-                             "filename": metadata["filename"], "sha256": metadata["sha256"], "archive_id": receipt.get("id") if receipt else None}, "receipt": receipt}
+                             "filename": metadata["filename"], "sha256": metadata["sha256"], "archive_id": receipt.get("id") if receipt else None,
+                             "trace_status": ("sent" if receipt else "pending") if trace_hash else "none", "trace_sha256": trace_hash}, "receipt": receipt}
         finally:
             box.close()
 
@@ -357,7 +369,11 @@ class NativePlatformService:
     def _tasks(self):
         owner = self._require()
         with self._db() as db:
-            result = [self._task(row) for row in db.execute("SELECT * FROM tasks WHERE owner_id=? AND url=? ORDER BY created_at DESC LIMIT 512", (owner, self.client.base_url))]
+            result = [self._task(row) for row in db.execute(
+                "SELECT * FROM tasks WHERE owner_id=? AND url=? AND (status!='sent' OR task_id IN "
+                "(SELECT task_id FROM tasks WHERE owner_id=? AND url=? AND status='sent' ORDER BY created_at DESC LIMIT 512)) "
+                "ORDER BY created_at DESC", (owner, self.client.base_url, owner, self.client.base_url),
+            )]
         directory = self.state_dir / "factory" / uid(owner)
         if directory.exists():
             for path in sorted(directory.glob("*/outbox.sqlite"))[:100]:
@@ -367,7 +383,8 @@ class NativePlatformService:
                         meta = json.loads(row[3])
                         receipt = json.loads(row[9]) if row[9] else {}
                         result.append({"task_id": row[0], "domain": "FACTORY", "status": row[6], "owner_id": owner, "source_id": meta["source_id"],
-                                       "filename": meta["filename"], "sha256": meta["sha256"], "archive_id": receipt.get("id"), "last_error": row[8]})
+                                       "filename": meta["filename"], "sha256": meta["sha256"], "archive_id": receipt.get("id"), "last_error": row[8],
+                                       "trace_status": ("sent" if row[13] else "pending") if row[12] else "none", "trace_sha256": row[12]})
                 finally:
                     box.close()
         return result
@@ -483,23 +500,40 @@ class NativePlatformService:
             self._check_submission_evidence(detail, meta)
             self._update(task_id, status="sent", last_error="")
             return {"task": {**self._task(row), "archive_id": archive_id, "status": "sent"}, "archive": detail}
+        except OSError:
+            # Frozen evidence is required for safe retry; never recreate it from
+            # a changed live recording or let one missing file block later tasks.
+            self._update(task_id, status="blocked", last_error="export_evidence_unavailable")
+            raise NativePlatformError("export_evidence_unavailable") from None
         except BridgeError as exc:
-            self._update(task_id, last_error=exc.code)
+            status = "blocked" if permanent_submission_error(exc) else (
+                "pending" if row["status"] == "blocked" else None
+            )
+            self._update(task_id, last_error=exc.code, **({"status": status} if status else {}))
             raise
 
     def _retry(self, task_id=None):
         self._require()
-        items = [item for item in self._tasks() if item["status"] != "sent" and (task_id is None or item["task_id"] == task_id)]
+        items = [item for item in self._tasks() if item["status"] != "sent"
+                 and (item["task_id"] == task_id if task_id is not None else item["status"] != "blocked")]
+        if task_id is not None and not items:
+            # Never silently retry another task when the selection is stale/foreign.
+            if not any(item["task_id"] == task_id for item in self._tasks()):
+                raise NativePlatformError("task_owner_or_destination_mismatch")
         results = []
         for item in items[:10]:
             cancelled(self._event)
-            if item["domain"] == "RESEARCH":
-                results.append(self._process_research(item["task_id"]))
-            else:
-                self._require("can_submit_factory")
-                box = self._factory_box(item["owner_id"], item["source_id"])
-                try:
-                    results.extend(box.drain(self.client, source=item["source_id"]))
-                finally:
-                    box.close()
+            try:
+                if item["domain"] == "RESEARCH":
+                    results.append(self._process_research(item["task_id"]))
+                else:
+                    self._require("can_submit_factory")
+                    box = self._factory_box(item["owner_id"], item["source_id"])
+                    try:
+                        results.extend(box.drain(self.client, source=item["source_id"], task_key=item["task_id"]))
+                    finally:
+                        box.close()
+            except BridgeError as exc:
+                if task_id is not None or not permanent_submission_error(exc):
+                    raise
         return {"items": self._tasks(), "results": results}

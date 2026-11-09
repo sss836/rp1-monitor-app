@@ -285,6 +285,91 @@ class WorkspaceTests(unittest.TestCase):
         self.service.close()
         self.temp.cleanup()
 
+    def test_old_unfinished_task_not_hidden_by_completed_history_limit(self):
+        task_id = self.service._enqueue_research(self.payload)["task_id"]
+        with self.service._db() as db:
+            row = dict(db.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone())
+            for i in range(513):
+                db.execute("INSERT INTO tasks(task_id,owner_id,url,domain,source_recording_id,fingerprint,status,metadata,created_at) "
+                           "VALUES(?,?,?,?,?,?,'sent',?,?)", (str(uuid4()), OWNER, self.service.client.base_url,
+                           "RESEARCH", row["source_recording_id"], str(i), row["metadata"], "2099-01-01T00:00:00+00:00"))
+        tasks = self.service.operation("tasks")["items"]
+        self.assertEqual(len(tasks), 513)
+        self.assertIn(task_id, [task["task_id"] for task in tasks])
+        self.service.operation("retry", {"task_id": task_id})
+        self.assertEqual(self.service.client.detail["submission_status"], "PENDING")
+
+    def test_missing_frozen_evidence_isolated_without_blocking_later_task(self):
+        first = self.service._enqueue_research(self.payload)["task_id"]
+        second = self.service._enqueue_research({**self.payload, "reason": "second"})["task_id"]
+        with self.service._db() as db:
+            row = db.execute("SELECT metadata FROM tasks WHERE task_id=?", (first,)).fetchone()
+            metadata = json.loads(row["metadata"])
+            metadata["path"] = str(Path(self.temp.name) / "missing-frozen.csv")
+            db.execute("UPDATE tasks SET metadata=?,created_at='2099-01-01T00:00:00+00:00' WHERE task_id=?", (canonical(metadata), first))
+        result = self.service.operation("retry")
+        tasks = {t["task_id"]: t for t in result["items"]}
+        self.assertEqual(tasks[first]["status"], "blocked")
+        self.assertEqual(tasks[first]["last_error"], "export_evidence_unavailable")
+        self.assertEqual(tasks[second]["status"], "sent")
+
+    def test_blocked_research_transient_retry_becomes_pending(self):
+        self.service.client.fail_content_once = True
+        with self.assertRaises(NativePlatformError):
+            self.service.operation("research_submit", self.payload)
+        task_id = self.service.operation("tasks")["items"][0]["task_id"]
+        self.service._update(task_id, status="blocked", last_error="archive_processing_failed")
+        with patch.object(self.service.client, "call", side_effect=NativePlatformError("network_error")):
+            with self.assertRaisesRegex(NativePlatformError, "network_error"):
+                self.service.operation("retry", {"task_id": task_id})
+        self.assertEqual(self.service.operation("tasks")["items"][0]["status"], "pending")
+        self.service.operation("retry")
+        self.assertEqual(self.service.operation("tasks")["items"][0]["status"], "sent")
+
+    def test_factory_retry_selected_task_is_exact_and_bulk_skips_blocked(self):
+        from test_factory_bridge import archive_receipt, upload
+
+        client = self.service.client
+        client.user = {"id": OWNER}
+        calls = []
+
+        def send(metadata, raw, key):
+            calls.append(key)
+            return archive_receipt(metadata)
+
+        client.upload_result = send
+        metadata, raw = upload(csv_file(self.temp.name))
+        box = self.service._factory_box(OWNER, "PC-01")
+        try:
+            keys = [box.enqueue(client.base_url, OWNER, {**metadata, "reason": str(i)}, raw) for i in range(12)]
+            box.db.execute("UPDATE tasks SET status='blocked' WHERE task_key=?", (keys[0],))
+            box.db.commit()
+        finally:
+            box.close()
+        self.service.operation("retry", {"task_id": keys[-1]})
+        self.assertEqual(calls, [keys[-1]])
+        self.service.operation("retry")
+        self.assertNotIn(keys[0], calls)
+        self.assertEqual(len(calls), 11)
+        self.service.operation("retry", {"task_id": keys[0]})
+        self.assertEqual(calls[-1], keys[0])
+
+    def test_research_permanent_failure_isolated_and_bulk_continues(self):
+        first = self.service._enqueue_research(self.payload)["task_id"]
+        second = self.service._enqueue_research({**self.payload, "reason": "another"})["task_id"]
+        original = self.service.client.call
+
+        def fail_first(method, path, **kwargs):
+            if kwargs.get("key") == first + ":create":
+                raise NativePlatformError("invalid_submission", 422)
+            return original(method, path, **kwargs)
+
+        self.service.client.call = fail_first
+        self.service.operation("retry")
+        statuses = {t["task_id"]: t["status"] for t in self.service.operation("tasks")["items"]}
+        self.assertEqual(statuses, {first: "blocked", second: "sent"})
+        self.assertEqual(self.service.operation("retry")["results"], [])
+
     def test_frozen_outbox_resume_offset_and_intake(self):
         self.service.client.fail_content_once = True
         with self.assertRaisesRegex(NativePlatformError, "network_error") as error:
