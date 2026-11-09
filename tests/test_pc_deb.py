@@ -67,7 +67,7 @@ def test_package_tree_has_only_pc_source_bundled_wheels_docs_and_launchers(pc_so
     control = (stage / "DEBIAN/control").read_text()
     assert "Package: rp1-monitor-app\n" in control
     assert "Architecture: amd64\n" in control
-    assert "Version: 0.4.4\n" in control
+    assert "Version: 0.4.5\n" in control
     assert "python3 (>= 3.12), python3 (<< 3.13), python3-venv" in control
     assert "libxcb-cursor0" in control and "libnss3" in control
     for path in ("usr/bin/rp1-monitor-app", "DEBIAN/postinst", "DEBIAN/postrm"):

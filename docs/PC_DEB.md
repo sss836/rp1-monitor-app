@@ -8,8 +8,8 @@
 
 ```bash
 .venv/bin/python scripts/build_pc_deb.py \
-  --output /交付目录/rp1-monitor-v0.4.4/build \
-  --version 0.4.4
+  --output /交付目录/rp1-monitor-v0.4.5/build \
+  --version 0.4.5
 ```
 
 默认构建会访问 Python 包源下载依赖。脚本先复用 `build_role_packages.py --role pc` 的允许清单导出电脑源码，随后以 `pip wheel --no-index --no-deps --no-build-isolation` 构建当前应用 wheel，再下载 `[desktop,server,station]` 的完整二进制 wheel 依赖。任何依赖没有匹配的二进制 wheel 时失败，不转为源码编译。
@@ -20,7 +20,7 @@
 
 ```bash
 .venv/bin/python scripts/build_pc_deb.py \
-  --output /交付目录/rp1-monitor-v0.4.4-offline/build \
+  --output /交付目录/rp1-monitor-v0.4.5-offline/build \
   --wheelhouse /实际路径/上次构建的wheelhouse
 ```
 
@@ -30,11 +30,12 @@
 
 ## 安装与启动
 
-先校验下载文件：
+从 0.4.4 升级时，先结束活动监控记录，确认设备处于安全状态后正常关闭旧窗口。若单独运行了旧本机后台，也要按现场维护流程正常退出，重新打开后才会使用新版的多机器人展示接口。保留原状态目录。进入安装包和校验文件所在目录执行：
 
 ```bash
 sha256sum -c SHA256SUMS
-sudo apt install ./rp1-monitor-app_0.4.4_amd64.deb
+sudo apt install ./rp1-monitor-app_0.4.5_amd64.deb
+dpkg-query -W rp1-monitor-app
 ```
 
 deb 自带应用及全部 Python 依赖 wheel，安装脚本仅在 `/opt/rp1-monitor-app/venv` 创建独立环境，以 `pip --no-index` 从包内安装。升级会重新安装包内 wheel，确保实际代码来自此次安装包。安装、升级均不启动或停止服务，不连接机器人，不初始化 PostgreSQL，不改写或删除用户结果。
