@@ -59,6 +59,8 @@ from .app_shell import APP_STYLE, AppMonitorWindow
 from .desktop import GridBackground
 
 _WORKERS = set()
+DEFAULT_PLATFORM_URL = "https://10.43.17.214:8443"
+SITE_PLATFORM_CA = Path(__file__).with_name("data") / "site-platform-ca.crt"
 _CONTEXT_KEYS = (
     "campaign_id", "cycle_id", "segment_id", "asset_id", "configuration_id",
     "test_case_version_id", "station_id",
@@ -565,10 +567,10 @@ class PlatformMonitorWindow(AppMonitorWindow):
         introduction.setMinimumHeight(48)
         form.addRow(introduction)
         self.platform_url_edit = edit("平台地址", "https://平台地址:8443")
-        self.platform_url_edit.setText(os.environ.get("RP1_PLATFORM_URL", ""))
+        self.platform_url_edit.setText(os.environ.get("RP1_PLATFORM_URL", DEFAULT_PLATFORM_URL))
         form.addRow("平台地址", self.platform_url_edit)
         ca_row = QHBoxLayout()
-        self.ca_edit = edit("可信CA文件", "留空使用系统信任；内部证书请选择可信CA文件")
+        self.ca_edit = edit("可信CA文件", "默认站点自动使用内置CA；其他地址留空使用系统信任")
         self.ca_edit.setText(os.environ.get("RP1_PLATFORM_CA", ""))
         ca_row.addWidget(self.ca_edit, 1)
         self.ca_button = button("选择CA", self.choose_ca)
@@ -1195,6 +1197,8 @@ class PlatformMonitorWindow(AppMonitorWindow):
             return
         self._identity_epoch += 1
         ca = self.ca_edit.text().strip()
+        if not ca and url == DEFAULT_PLATFORM_URL and not (os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR")):
+            ca = str(SITE_PLATFORM_CA)
         self._platform_url = url
 
         def operation():

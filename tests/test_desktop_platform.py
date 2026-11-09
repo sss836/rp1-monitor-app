@@ -4,6 +4,7 @@ import csv
 import io
 import os
 import shutil
+import ssl
 import threading
 import time
 from copy import deepcopy
@@ -22,6 +23,8 @@ from PySide6.QtCore import QCoreApplication, QDateTime, QEvent, QPoint, Qt
 from PySide6.QtWidgets import QApplication
 
 from rp1_monitor.desktop_platform import (
+    DEFAULT_PLATFORM_URL,
+    SITE_PLATFORM_CA,
     _WORKERS,
     LazyPlatformService,
     PlatformMonitorWindow,
@@ -103,6 +106,8 @@ def wait_for(app, predicate, timeout=4):
 
 @pytest.fixture
 def ui(app, tmp_path, monkeypatch):
+    for key in ("RP1_PLATFORM_URL", "RP1_PLATFORM_CA", "SSL_CERT_FILE", "SSL_CERT_DIR"):
+        monkeypatch.delenv(key, raising=False)
     service = MockPlatform()
     window = PlatformMonitorWindow("http://127.0.0.1:1", platform_service=service,
                                    factory_directory=tmp_path / "factory")
@@ -129,6 +134,31 @@ def sign_in(app, window, service):
     window.login()
     wait_for(app, lambda: window.platform_worker is None)
     return service
+
+
+@pytest.mark.parametrize("address,ca,system_ca", [
+    (DEFAULT_PLATFORM_URL, "", False),
+    ("https://custom.example:8443", "", False),
+    (DEFAULT_PLATFORM_URL, "/fixture/selected-ca.crt", False),
+    (DEFAULT_PLATFORM_URL, "", True),
+])
+def test_fixed_site_ca_and_explicit_overrides(app, ui, monkeypatch, address, ca, system_ca):
+    window, service = ui
+    assert window.platform_url_edit.text() == DEFAULT_PLATFORM_URL
+    assert not service.calls and window.platform_stack.currentWidget() is window.local_workbench
+    window.platform_url_edit.setText(address)
+    window.ca_edit.setText(ca)
+    if system_ca:
+        monkeypatch.setenv("SSL_CERT_FILE", "/fixture/system-ca.crt")
+    window.username_edit.setText("synthetic-user")
+    window.password_edit.setText("synthetic-password")
+    window.login()
+    wait_for(app, lambda: window.platform_worker is None)
+    expected_ca = ca or (str(SITE_PLATFORM_CA) if address == DEFAULT_PLATFORM_URL and not system_ca else None)
+    assert service.calls[0] == ("configure", {"url": address, "ca_file": expected_ca})
+    if expected_ca == str(SITE_PLATFORM_CA):
+        context = ssl.create_default_context(cafile=expected_ca)
+        assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname
 
 
 def make_result_csv(window, path, *, sn="MOCK-SN-A", simulated=False):

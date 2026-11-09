@@ -9,7 +9,7 @@
 
 ## Ubuntu 安装包与整机工厂测试
 
-`0.4.3` 提供与可靠性大屏共用账号的顶部可选登录栏、独立的研发／工厂归档入口，以及保留原证据的提交重试。平台送审须由人员核实并显式提交；本地采集和记录不依赖登录。配置、两域流程及恢复见[平台接入说明](docs/PLATFORM_NATIVE_INTEGRATION.md)，发布范围见[0.4.3 发布说明](docs/RELEASE_0.4.3.md)。
+`0.4.4` 的顶部可选登录栏默认连接 `https://10.43.17.214:8443`，使用随包提供的站点 CA。研发和工厂归档继续使用平台账号，送审须由人员核实并显式提交。本地采集和记录无需登录。配置、两域流程及恢复见[平台接入说明](docs/PLATFORM_NATIVE_INTEGRATION.md)。
 
 GitHub Releases 提供 Ubuntu 24.04 amd64 的 `.deb`，内置电脑端 Python 依赖。安装后从应用菜单打开“RP1 工厂测试”，或执行 `rp1-monitor-app factory`。安装、数据目录和从源码构建安装包见[deb 安装说明](docs/PC_DEB.md)。
 
