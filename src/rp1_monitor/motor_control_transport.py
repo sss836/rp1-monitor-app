@@ -6,16 +6,19 @@ only callers; the telemetry relay and central web server never invoke this API.
 
 import base64
 import json
+import lzma
 import math
 import queue
+import re
 import shlex
+import struct
 import time
-import zlib
+from datetime import datetime
 from pathlib import Path
 from uuid import UUID
 
 from .manual_calibration_check import validate_report as validate_manual_report
-from .postzero_reader import CONFIGURATIONS
+from .postzero_reader import CONFIGURATIONS, QUERY_TIMEOUT_NS
 from .ssh_transport import parse_ssh_target
 
 PASSWORD_PROMPT = b"RP1_MOTOR_CONTROL_SUDO_PASSWORD:"
@@ -58,13 +61,13 @@ def build_remote_command(dof, session_id):
     # or create a file on the robot. It expands solely in the helper's memory.
     source = helper_source().encode("utf-8")
     if len(source) > 512 * 1024:
-        raise ValueError("内存控制源码超过512KiB")
-    packed = base64.b64encode(zlib.compress(source, level=9)).decode("ascii")
-    bootstrap = ("import base64,zlib\n"
-                 f"exec(compile(zlib.decompress(base64.b64decode({packed!r})), "
+        raise MotorControlError("上位机电机控制源码超过512KiB，尚未连接机器人")
+    packed = base64.b64encode(lzma.compress(source)).decode("ascii")
+    bootstrap = ("import base64,lzma\n"
+                 f"exec(compile(lzma.decompress(base64.b64decode({packed!r})), "
                  "'<rp1-control-memory>', 'exec'))\n")
     if len(bootstrap.encode("utf-8")) > 96 * 1024:
-        raise ValueError("内存控制启动参数过大")
+        raise MotorControlError("上位机电机控制启动参数过大，尚未连接机器人")
     return shlex.join([
         "/usr/bin/sudo", "-k", "-S", "-p", PASSWORD_PROMPT.decode("ascii"), "--",
         "/usr/bin/taskset", "-c", "1-3,7", "/usr/bin/nice", "-n", "10",
@@ -76,6 +79,99 @@ def build_remote_command(dof, session_id):
 def _numbers(values, dof):
     return isinstance(values, list) and len(values) == dof and all(
         type(value) in (int, float) and math.isfinite(value) for value in values)
+
+
+def _encoder_identity(value, dof):
+    index, request_id = value.get("index"), value.get("request_id")
+    try:
+        if type(index) is int and 0 <= index < dof and isinstance(request_id, str) and str(UUID(request_id)) == request_id:
+            return index, request_id
+    except ValueError:
+        pass
+    raise MotorControlError("编码器查询目标或请求编号无效")
+
+
+def _joint_encoder_identity(value):
+    joint, request_id = value.get("joint"), value.get("request_id")
+    try:
+        if (isinstance(joint, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}_joint", joint)
+                and isinstance(request_id, str) and str(UUID(request_id)) == request_id):
+            return joint, request_id
+    except ValueError:
+        pass
+    raise MotorControlError("关节位置查询身份无效")
+
+
+def _validate_encoder_position(event, dof):
+    _encoder_identity(event, dof)
+    motor_id, status = event.get("motor_id"), event.get("status")
+    if (event.get("interface") not in ("can0", "can1", "can2", "can3")
+            or type(motor_id) is not int or not 1 <= motor_id <= 8
+            or status not in ("fresh", "timeout", "invalid", "error")
+            or type(event.get("kernel_rx_timestamp")) is not bool):
+        raise MotorControlError("编码器反馈身份或状态无效")
+    sent, rx, received_at, angle, raw_hex, fault = (
+        event.get(key) for key in ("query_sent_monotonic_ns", "rx_monotonic_ns",
+                                   "received_at", "angle_deg", "raw_hex", "fault")
+    )
+    stamped = event["kernel_rx_timestamp"]
+    try:
+        if status == "error":
+            if sent is not None:
+                raise ValueError
+        elif type(sent) is not int or not 0 < sent < 2**63:
+            raise ValueError
+        if status in ("timeout", "error"):
+            if stamped or any(value is not None for value in (rx, received_at, angle, raw_hex, fault)):
+                raise ValueError
+            return
+        if not isinstance(raw_hex, str) or not re.fullmatch(r"(?:[0-9a-f]{2}){0,72}", raw_hex):
+            raise ValueError
+        if fault is not None and (type(fault) is not int or not 0 <= fault <= 31):
+            raise ValueError
+        if stamped:
+            if (type(rx) is not int or not sent <= rx < 2**63 or rx - sent > QUERY_TIMEOUT_NS
+                    or not isinstance(received_at, str) or len(received_at) > 36):
+                raise ValueError
+            timestamp = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
+            if timestamp.tzinfo is None or timestamp.utcoffset().total_seconds() != 0:
+                raise ValueError
+        elif rx is not None or received_at is not None:
+            raise ValueError
+        if status == "fresh":
+            raw = bytes.fromhex(raw_hex)
+            if (not stamped or fault != 0 or type(angle) not in (float, int) or not math.isfinite(angle)
+                    or len(raw) != 6 or raw[:2] != b"\xa0\x01" or struct.unpack(">f", raw[2:])[0] != angle):
+                raise ValueError
+        elif angle is not None:
+            raise ValueError
+    except (ValueError, OverflowError):
+        raise MotorControlError("编码器反馈与原始帧、接收时间或质量状态不一致") from None
+
+
+def _validate_joint_encoder_positions(event, dof):
+    _, request_id = _joint_encoder_identity(event)
+    samples, position, error = event.get("samples"), event.get("position_rad"), event.get("error")
+    if not isinstance(samples, list) or len(samples) > 2:
+        raise MotorControlError("关节位置反馈的轴角数量无效")
+    indices = set()
+    for sample in samples:
+        if not isinstance(sample, dict):
+            raise MotorControlError("关节位置反馈包含无效轴角")
+        _validate_encoder_position({**sample, "request_id": request_id}, dof)
+        indices.add(sample["index"])
+    if len(indices) != len(samples):
+        raise MotorControlError("关节位置反馈包含重复电机")
+    if position is None:
+        if not isinstance(error, str) or not 0 < len(error) <= 240:
+            raise MotorControlError("关节位置反馈缺少无效原因")
+        return
+    if (error is not None or type(position) not in (int, float) or not -math.pi <= position <= math.pi
+            or not samples or any(sample["status"] != "fresh" for sample in samples)):
+        raise MotorControlError("关节位置缺少有效电机反馈")
+    stamps = [sample["rx_monotonic_ns"] for sample in samples]
+    if max(stamps) - min(stamps) > 100_000_000:
+        raise MotorControlError("闭链电机位置反馈时间差过大")
 
 
 def validate_event(raw, session_id, dof):
@@ -115,6 +211,10 @@ def validate_event(raw, session_id, dof):
                 or type(event.get("progress")) not in (int, float)
                 or not math.isfinite(event["progress"]) or not 0 <= event["progress"] <= 1):
             raise MotorControlError("实时电机反馈缺失或数值无效")
+    elif kind == "encoder_position":
+        _validate_encoder_position(event, dof)
+    elif kind == "joint_encoder_positions":
+        _validate_joint_encoder_positions(event, dof)
     elif kind == "state":
         if event.get("state") not in {"ready", "enabled", "preparing", "prepared", "running", "disabled", "stopping", "fault"}:
             raise MotorControlError("未知电机控制状态")
@@ -315,7 +415,9 @@ def run_motor_session(connection, password, dof, session_id, on_event, commands,
         stdin, stdout, _ = client.exec_command(command, get_pty=False, timeout=5)
         channel = stdout.channel
         buffer, prompt_tail = bytearray(), b""
-        authenticated = metadata = False
+        authenticated = False
+        metadata = pending_encoder = None
+        encoder_observation_ready = False
         heartbeat_at, stopped_at = 0.0, None
         started = time.monotonic()
         stderr_size = 0
@@ -366,13 +468,26 @@ def run_motor_session(connection, password, dof, session_id, on_event, commands,
                     if event["type"] == "metadata":
                         if metadata:
                             raise MotorControlError("控制端重复发送了配置身份")
-                        metadata = True
+                        metadata = event["motors"]
+                        encoder_observation_ready = event.get("encoder_observation_ready") is True
                         # NOPASSWD sudo launches without requesting a password;
                         # helper metadata still proves stdin is ready for control.
                         authenticated = True
                         password = ""
                     elif event["type"] not in {"error", "complete"} and not metadata:
                         raise MotorControlError("控制端未确认机型就返回了执行状态")
+                    if event["type"] == "encoder_position":
+                        index = event["index"]
+                        if (pending_encoder != ("read_encoder", index, event["request_id"])
+                                or any(event[key] != metadata[index][key] for key in ("interface", "motor_id"))):
+                            raise MotorControlError("编码器反馈与本次查询或已核对的电机地址不匹配")
+                        pending_encoder = None
+                    elif event["type"] == "joint_encoder_positions":
+                        if (pending_encoder != ("read_joint_encoders", event["joint"], event["request_id"])
+                                or any(sample[key] != metadata[sample["index"]][key]
+                                       for sample in event["samples"] for key in ("interface", "motor_id"))):
+                            raise MotorControlError("关节位置反馈与查询或已核对的电机地址不匹配")
+                        pending_encoder = None
                     on_event(event)
                     if event["type"] == "complete":
                         result = event
@@ -389,8 +504,18 @@ def run_motor_session(connection, password, dof, session_id, on_event, commands,
                 if value:
                     if value.get("command") not in {"enable", "disable", "run", "stop",
                                                      "prepare_check", "check", "continue_check", "manual_check",
-                                                     "manual_pause", "manual_retest", "manual_skip", "manual_confirm_pin"}:
+                                                     "manual_pause", "manual_retest", "manual_skip", "manual_confirm_pin",
+                                                     "read_encoder", "read_joint_encoders"}:
                         raise MotorControlError("桌面控制命令无效")
+                    if value["command"] == "read_encoder":
+                        if pending_encoder is not None or set(value) != {"command", "index", "request_id"}:
+                            raise MotorControlError("编码器查询参数无效或已有未完成的查询")
+                        pending_encoder = ("read_encoder", *_encoder_identity(value, dof))
+                    elif value["command"] == "read_joint_encoders":
+                        if (not encoder_observation_ready or pending_encoder is not None
+                                or set(value) != {"command", "joint", "request_id"}):
+                            raise MotorControlError("关节位置查询不可用或已有未完成的查询")
+                        pending_encoder = ("read_joint_encoders", *_joint_encoder_identity(value))
                     send(value)
                     if value["command"] == "stop":
                         stopped_at = now

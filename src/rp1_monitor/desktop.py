@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QTableWidget,
@@ -211,6 +212,7 @@ class MonitorWindow(QMainWindow):
         self.catalog = []
         self.buffers = defaultdict(lambda: deque(maxlen=600))
         self.buffer_robot_id = None
+        self.buffer_source_kind = None
         self._buffer_resume = False
         self.curves = {}
         self.last_received = 0.0
@@ -333,10 +335,22 @@ class MonitorWindow(QMainWindow):
         self.ssh_password.setAccessibleName("机器人SSH密码")
         self.ssh_password.setPlaceholderText("仅用于本次认证，不保存密码")
         form.addRow("SSH密码", self.ssh_password)
-        self.ssh_fingerprint = QLabel("首次连接会显示主机指纹，请核对后确认")
+        self.ssh_fingerprint = QLabel("首次连接时显示")
         self.ssh_fingerprint.setWordWrap(True)
         self.ssh_fingerprint.setTextFormat(Qt.TextFormat.PlainText)
+        self.ssh_fingerprint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.ssh_fingerprint.setObjectName("sshFingerprint")
+        self.ssh_fingerprint.setMinimumHeight(42)
+        self.ssh_fingerprint.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         form.addRow("主机指纹", self.ssh_fingerprint)
+        self.ssh_fingerprint_help = QLabel(
+            "用于确认连接的是正确机器人。首次连接时，请与机器人本机显示的 SSH 指纹核对；"
+            "一致后勾选确认。指纹改变时请先核实设备身份。"
+        )
+        self.ssh_fingerprint_help.setWordWrap(True)
+        self.ssh_fingerprint_help.setObjectName("cardCaption")
+        self.ssh_fingerprint_help.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        form.addRow("", self.ssh_fingerprint_help)
         self.ssh_trust = QCheckBox("已核对上方指纹，允许首次连接")
         form.addRow("身份确认", self.ssh_trust)
         self.ssh_target.textChanged.connect(self.clear_station_fingerprint)
@@ -433,13 +447,13 @@ class MonitorWindow(QMainWindow):
         right_layout.addLayout(chart_header)
         pg.setConfigOptions(antialias=False, background="#ffffff", foreground="#576c88")
         self.plot = pg.PlotWidget()
-        self.plot.showGrid(x=True, y=True, alpha=0.15)
+        self.plot.showGrid(x=True, y=True, alpha=0.08)
         self.plot.setLabel("bottom", "相对采集时间", units="s")
         self.plot.addLegend(offset=(12, 10))
         right_layout.addWidget(self.plot, 3)
-        table_title = QLabel("关节反馈")
-        table_title.setObjectName("sectionTitle")
-        right_layout.addWidget(table_title)
+        self.joint_feedback_title = QLabel("关节反馈")
+        self.joint_feedback_title.setObjectName("sectionTitle")
+        right_layout.addWidget(self.joint_feedback_title)
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(
             ["关节索引", "位置 / rad", "速度 / rad/s", "上报力矩 / N·m", "策略目标 / rad"]
@@ -851,13 +865,14 @@ class MonitorWindow(QMainWindow):
         for control in (self.ssh_target, self.ssh_key, self.ssh_port):
             control.setEnabled(not relay)
         self.ssh_key.setEnabled(not relay and not station)
-        for control in (self.ssh_password, self.ssh_fingerprint, self.ssh_trust):
+        for control in (self.ssh_password, self.ssh_fingerprint, self.ssh_fingerprint_help, self.ssh_trust):
             control.setVisible(station)
             control.setEnabled(station)
         for field, visible in ((self.url, relay), (self.ssh_target, not relay),
                                (self.ssh_key, not relay and not station),
                                (self.ssh_port, not relay), (self.ssh_password, station),
                                (self.ssh_fingerprint, station),
+                               (self.ssh_fingerprint_help, station),
                                (self.ssh_trust, station and bool(self.station_fingerprint))):
             field.setVisible(visible)
             label = self.connection_form.labelForField(field)
@@ -882,7 +897,7 @@ class MonitorWindow(QMainWindow):
     def clear_station_fingerprint(self):
         self.station_fingerprint = ""
         self.ssh_trust.setChecked(False)
-        self.ssh_fingerprint.setText("首次连接会显示主机指纹，请核对后确认")
+        self.ssh_fingerprint.setText("首次连接时显示")
         if hasattr(self, "connection_form"):
             self.update_connection_mode()
 
@@ -1176,9 +1191,12 @@ class MonitorWindow(QMainWindow):
                 url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
                 + "/api/v1/telemetry"
             )
-            if self.buffer_robot_id != identity["robot_id"]:
+            if (self.buffer_robot_id, self.buffer_source_kind) != (
+                identity["robot_id"], identity["source_kind"]
+            ):
                 self.buffers.clear()
             self.buffer_robot_id = identity["robot_id"]
+            self.buffer_source_kind = identity["source_kind"]
             self._buffer_resume = True
             if getattr(self, "thermal_dialog", None):
                 self.thermal_dialog.close()
@@ -1377,9 +1395,12 @@ class MonitorWindow(QMainWindow):
             factory.set_frame(frame)
         self.last_received = time.monotonic()
         previous = self.last_frame
-        if self.buffer_robot_id != frame["robot_id"]:
+        if (self.buffer_robot_id, self.buffer_source_kind) != (
+            frame["robot_id"], frame["source_kind"]
+        ):
             self.buffers.clear()
             self.buffer_robot_id = frame["robot_id"]
+            self.buffer_source_kind = frame["source_kind"]
         elif self._buffer_resume or (previous and previous["stream_id"] != frame["stream_id"]):
             for buffer in self.buffers.values():
                 if buffer:
@@ -1389,9 +1410,12 @@ class MonitorWindow(QMainWindow):
                 datetime.fromisoformat(frame["sampled_at"])
                 - datetime.fromisoformat(previous["sampled_at"])
             ).total_seconds()
-            if gap > 0.3:
-                before = datetime.fromisoformat(previous["sampled_at"]).timestamp() + 0.001
-                for buffer in self.buffers.values():
+            before = datetime.fromisoformat(previous["sampled_at"]).timestamp() + 0.001
+            for key, buffer in self.buffers.items():
+                # Slow health values can legitimately arrive less often than motion frames.
+                # Never bridge a full second of absent preview, even for slow metrics.
+                gap_limit = 1.0 if metric_max_age_ms(key) > 1000 else 0.3
+                if buffer and (gap > gap_limit or gap < 0):
                     buffer.append((before, np.nan))
         self.last_frame = frame
         self._buffer_resume = False
@@ -1438,8 +1462,18 @@ class MonitorWindow(QMainWindow):
             else "color:#576c88;"
         )
         timestamp = datetime.fromisoformat(frame["sampled_at"]).timestamp()
-        for key, value in frame["values"].items():
-            self.buffers[key].append((timestamp, value if value is not None else np.nan))
+        values = frame["values"]
+        ages = frame.get("ages_ms", {})
+        connected = frame.get("upload", {}).get("collector_connected", True)
+        for key in self.buffers.keys() | values.keys():
+            value = values.get(key)
+            age = ages.get(key)
+            valid = (
+                connected and isinstance(value, (int, float)) and isfinite(value)
+                and isinstance(age, (int, float)) and isfinite(age)
+                and 0 <= age <= metric_max_age_ms(key)
+            )
+            self.buffers[key].append((timestamp, value if valid else np.nan))
         if [item["key"] for item in frame["catalog"]] != [item["key"] for item in self.catalog]:
             self.catalog = frame["catalog"]
             self.populate_metrics()
@@ -1511,7 +1545,8 @@ class MonitorWindow(QMainWindow):
             if key not in self.curves:
                 self.curves[key] = self.plot.plot(
                     name=item.text(),
-                    pen=pg.mkPen(colors[index % len(colors)], width=1.5),
+                    pen=pg.mkPen(colors[index % len(colors)], width=2.2),
+                    antialias=True,
                     connect="finite",
                 )
             values = list(self.buffers[key])
@@ -1551,6 +1586,16 @@ class MonitorWindow(QMainWindow):
             return
         postzero = getattr(self.joint_inspection_panel, "postzero_dialog", None)
         if postzero and not postzero.shutdown():
+            event.ignore()
+            return
+        joint_angles = getattr(self.joint_inspection_panel, "joint_angle_monitor", None)
+        if joint_angles and not joint_angles.shutdown():
+            QTimer.singleShot(100, self.close)
+            event.ignore()
+            return
+        zero_reference = getattr(self.joint_inspection_panel, "zero_reference_dialog", None)
+        if zero_reference and not zero_reference.shutdown():
+            QTimer.singleShot(100, self.close)
             event.ignore()
             return
         legacy_analysis = getattr(self.joint_inspection_panel, "limit_analysis", None)

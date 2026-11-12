@@ -27,7 +27,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QDesktopServices, QPixmap
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -82,7 +82,7 @@ _STATES = {
 PLATFORM_STYLE = APP_STYLE + """
 QFrame#platformHeader { background:#ffffff; border:1px solid #d4e2f5; border-radius:9px; }
 QFrame#platformLogin { background:#ffffff; border:1px solid #c8d8ef; border-radius:12px; }
-QLabel#platformNotice { color:#7d5206; padding:8px; background:#fff3dd; border-radius:5px; }
+QLabel#platformNotice { color:#526580; padding:4px 8px; background:#edf2f9; border-radius:5px; font-size:12px; }
 QLabel#platformAccount { color:#405774; font-size:12px; }
 QPushButton#domainNav { background:#ffffff; color:#263e61; border:1px solid #c8d8ef; }
 QPushButton#domainNav:checked { background:#dae8ff; color:#234fd1; border-color:#9fb7ed; }
@@ -438,17 +438,14 @@ class PlatformMonitorWindow(AppMonitorWindow):
         self.display_timer.timeout.connect(self._tick_display_presence)
         self.setWindowTitle("RP1 整机测试工作台")
         self.setMinimumSize(1080, 720)
-        self.resize(1440, 920)
+        self.resize(1366, 768)
         self.setStyleSheet(PLATFORM_STYLE)
-        self.local_workbench_root = self.takeCentralWidget()
-        self.local_workbench = QScrollArea()
-        self.local_workbench.setWidgetResizable(True)
-        self.local_workbench.setFrameShape(QFrame.Shape.NoFrame)
-        self.local_workbench.setWidget(self.local_workbench_root)
+        self.local_workbench = self.takeCentralWidget()
         root = GridBackground()
+        root.setProperty("plainBackground", True)
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(16, 12, 16, 14)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 8, 12, 9)
+        layout.setSpacing(7)
         layout.addWidget(self._build_header())
         self.platform_notice = text("本地工作台可直接连接、测试与保存。需要查询或提交平台数据时，再在顶栏登录。", "platformNotice")
         self.platform_notice.setAccessibleName("平台操作状态")
@@ -472,6 +469,7 @@ class PlatformMonitorWindow(AppMonitorWindow):
         self.platform_stack.addWidget(self.workspace)
         self.offline_history = self._build_offline_history()
         self.platform_stack.addWidget(self.offline_history)
+        self.platform_stack.currentChanged.connect(self._maintenance_workbench_visibility_changed)
         layout.addWidget(self.platform_stack, 1)
         self.setCentralWidget(root)
         self.platform_ready = True
@@ -495,26 +493,23 @@ class PlatformMonitorWindow(AppMonitorWindow):
     def _build_header(self):
         frame = QFrame()
         frame.setObjectName("platformHeader")
-        outer = QVBoxLayout(frame)
-        outer.setContentsMargins(12, 8, 12, 8)
-        outer.setSpacing(7)
+        outer = QHBoxLayout(frame)
+        outer.setContentsMargins(8, 5, 8, 5)
+        outer.setSpacing(8)
         account = QHBoxLayout()
         account.setSpacing(8)
-        account.addWidget(text("模式", "fieldLabel"))
-        self.platform_mode = QComboBox()
+        self.platform_mode = QComboBox(frame)
         self.platform_mode.setAccessibleName("工作台模式")
         for label, value in (("本地工作台", "LOCAL"), ("研发平台", "RESEARCH"), ("工厂平台", "FACTORY")):
             self.platform_mode.addItem(label, value)
-        self.platform_mode.setFixedWidth(128)
+        self.platform_mode.hide()
         self.platform_mode.currentIndexChanged.connect(self._mode_selected)
-        account.addWidget(self.platform_mode)
-        account.addWidget(text("账号", "fieldLabel"))
-        self.username_edit = edit("平台用户名", "平台账号（可选）")
-        self.username_edit.setFixedWidth(145)
+        account.addWidget(text("平台账号", "fieldLabel"))
+        self.username_edit = edit("平台用户名", "用户名")
+        self.username_edit.setFixedWidth(112)
         account.addWidget(self.username_edit)
-        account.addWidget(text("密码", "fieldLabel"))
         self.password_edit = edit("平台密码", "平台密码", password=True)
-        self.password_edit.setFixedWidth(145)
+        self.password_edit.setFixedWidth(112)
         self.password_edit.returnPressed.connect(self.login)
         account.addWidget(self.password_edit)
         self.login_button = button("登录", self.login, "primary")
@@ -523,20 +518,13 @@ class PlatformMonitorWindow(AppMonitorWindow):
         account.addWidget(self.logout_button)
         self.account_label = text("未登录（本地可用）", "platformAccount")
         self.account_label.setWordWrap(False)
+        self.account_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.account_label.setMinimumWidth(106)
         account.addWidget(self.account_label, 1)
         self.account_button = button("连接设置", self.open_account)
         account.addWidget(self.account_button)
-        outer.addLayout(account)
         layout = QHBoxLayout()
-        logo = QLabel()
-        pixmap = QPixmap(str(Path(__file__).parent / "web/brand/logo.png"))
-        if pixmap.isNull():
-            logo.setText("ROBO PARTY")
-        else:
-            logo.setPixmap(pixmap.scaled(122, 42, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-        logo.setAccessibleName("RoboParty")
-        layout.addWidget(logo)
-        layout.addWidget(text("RP1 整机测试工作台", "sectionTitle"))
+        layout.setSpacing(5)
         self.local_nav = button("本地工作台", self.open_local_workbench)
         self.local_nav.setCheckable(True)
         layout.addWidget(self.local_nav)
@@ -545,10 +533,10 @@ class PlatformMonitorWindow(AppMonitorWindow):
         for item in (self.research_nav, self.factory_nav):
             item.setCheckable(True)
             layout.addWidget(item)
-        layout.addStretch()
         self.screen_button = button("打开大屏", self.open_bigscreen)
-        layout.addWidget(self.screen_button)
         outer.addLayout(layout)
+        outer.addLayout(account, 1)
+        outer.addWidget(self.screen_button)
         return frame
 
     def _mode_selected(self):
@@ -1020,7 +1008,7 @@ class PlatformMonitorWindow(AppMonitorWindow):
                 expiry = "有效期未返回"
             suffix = " · 须先修改密码" if user.get("must_change_password") else ""
             self.account_label.setText(f"{name} · {role}{suffix}")
-            self.account_label.setToolTip(f"平台会话有效期：{expiry}；本地工作不依赖平台登录。")
+            self.account_label.setToolTip(f"{name} · {role}{suffix}\n平台会话有效期：{expiry}")
         else:
             self.account_label.setText("未登录（本地可用）")
             self.account_label.setToolTip("平台会话默认8小时；本地连接、测试、控制与保存独立可用。")
@@ -1369,11 +1357,15 @@ class PlatformMonitorWindow(AppMonitorWindow):
             self.navigate(index)
         self._update_platform_actions()
 
+    def _maintenance_workbench_visibility_changed(self, index):
+        if index == 0:
+            self.refresh_motor_maintenance()
+        else:
+            self.clear_motor_maintenance_session()
+
     def navigate(self, index):
         super().navigate(index)
         if getattr(self, "platform_ready", False):
-            self.local_workbench_root.setProperty("plainBackground", index == 9)
-            self.local_workbench_root.update()
             self.platform_stack.setCurrentWidget(self.local_workbench)
             self._update_platform_actions()
 
@@ -1388,7 +1380,7 @@ class PlatformMonitorWindow(AppMonitorWindow):
             self.platform_notice.setText("平台地址无效，请在平台账号页核对HTTPS地址。")
             return
         QDesktopServices.openUrl(QUrl(url))
-        self.platform_notice.setText("已请求系统浏览器打开所选平台。浏览器须独立登录；链接不包含原生会话凭据。")
+        self.statusBar().showMessage("已请求浏览器打开所选平台。请在浏览器中独立登录。", 6000)
 
     def _source_changed(self, *_args):
         self._source_epoch += 1
@@ -2040,6 +2032,8 @@ class PlatformMonitorWindow(AppMonitorWindow):
         self.platform_notice.setText("显示电脑已有结果；本地测试人员文字不等于平台登录身份。")
 
     def closeEvent(self, event):
+        if self.defer_motor_maintenance_close(event):
+            return
         self._platform_closing = True
         self._stop_display_presence()
         if self.platform_worker is not None and self.platform_worker.isRunning():

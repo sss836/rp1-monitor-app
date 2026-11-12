@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
@@ -51,6 +52,14 @@ class OperationWorker(QThread):
 
     def run(self):
         try:
+            if self.action == "bms_recovery":
+                from .bms_recovery import request_recovery
+
+                try:
+                    self.done.emit(request_recovery(*self.body))
+                except ValueError as error:
+                    self.failed.emit(str(error))
+                return
             local = self.action in {"doctor", "export", "board_status", "board_run"}
             connection = (
                 self.body[1].get("connection", {})
@@ -144,22 +153,27 @@ class OperationsPanel(QWidget):
         header = QFrame()
         header.setObjectName("chatHeader")
         top = QHBoxLayout(header)
-        top.setContentsMargins(22, 18, 22, 18)
+        top.setContentsMargins(15, 10, 15, 10)
         mark = text_label("RP", "assistantMark")
-        mark.setFixedSize(42, 42)
+        mark.setFixedSize(34, 34)
         mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
         top.addWidget(mark)
         titles = QVBoxLayout()
         titles.setSpacing(3)
         titles.addWidget(text_label("诊断对话", "chatTitle"))
-        titles.addWidget(text_label("每一次判断，都有据可查", "chatMuted"))
+        titles.addWidget(text_label("查看当前机器人的观测与证据", "chatMuted"))
         top.addLayout(titles, 1)
         self.model_settings = QPushButton("AI 连接设置")
         self.model_settings.setObjectName("modelSettings")
         self.model_settings.setAccessibleName("AI 连接与模型设置")
         self.model_settings.setToolTip("配置中央服务、模型服务商、模型 ID 和 API Key")
-        self.model_settings.setMinimumHeight(44)
+        self.model_settings.setMinimumHeight(34)
         top.addWidget(self.model_settings)
+        context_toggle = QPushButton("上下文")
+        context_toggle.setObjectName("chatQuiet")
+        context_toggle.setCheckable(True)
+        context_toggle.setChecked(True)
+        top.addWidget(context_toggle)
         self.clear = QPushButton("新对话  +")
         self.clear.setObjectName("chatQuiet")
         self.clear.clicked.connect(self.new_conversation)
@@ -179,21 +193,19 @@ class OperationsPanel(QWidget):
         )
         content = QWidget()
         self.thread = QVBoxLayout(content)
-        self.thread.setContentsMargins(26, 24, 26, 24)
-        self.thread.setSpacing(18)
+        self.thread.setContentsMargins(17, 13, 17, 13)
+        self.thread.setSpacing(10)
         self.welcome = QWidget()
         welcome = QVBoxLayout(self.welcome)
-        welcome.setContentsMargins(4, 22, 4, 18)
-        welcome.setSpacing(13)
-        welcome.addWidget(text_label("RP1 / DIAGNOSTIC ASSISTANT", "chatEyebrow"))
-        welcome.addWidget(text_label("一起看懂机器人状态", "welcomeTitle"))
+        welcome.setContentsMargins(0, 8, 0, 6)
+        welcome.setSpacing(7)
+        welcome.addWidget(text_label("从当前问题开始", "contextTitle"))
         welcome.addWidget(
             text_label(
-                "从监测缺口到接入排查，把设备观测整理成清楚的结论。\n选择一个问题，或直接在下方开始对话。",
+                "选择常见问题，或在下方输入需要排查的现象。",
                 "welcomeCopy",
             )
         )
-        welcome.addSpacing(12)
         for title, question in (
             ("01   看看当前监测还缺什么    →", "为什么这台机器的健康监测不完整？"),
             ("02   帮我核对温度数据来源    →", "当前温度数据有哪些来源与限制？"),
@@ -241,7 +253,8 @@ class OperationsPanel(QWidget):
 
         context = QFrame()
         context.setObjectName("chatContext")
-        context.setFixedWidth(262)
+        context.setFixedWidth(250)
+        context_toggle.toggled.connect(context.setVisible)
         context_layout = QVBoxLayout(context)
         context_layout.setContentsMargins(0, 0, 0, 0)
         side_scroll = QScrollArea()
@@ -249,8 +262,8 @@ class OperationsPanel(QWidget):
         side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         side_widget = QWidget()
         side = QVBoxLayout(side_widget)
-        side.setContentsMargins(17, 20, 17, 18)
-        side.setSpacing(12)
+        side.setContentsMargins(13, 12, 13, 12)
+        side.setSpacing(8)
         side.addWidget(text_label("当前上下文", "contextTitle"))
         self.robot = text_label("等待连接", "contextRobot")
         side.addWidget(self.robot)
@@ -682,6 +695,8 @@ class BoardDiagnosticsPanel(QWidget):
         self.enabled = False
         self.running = False
         self.reports = {}
+        self.native_context = None
+        self._native_bms_report_id = None
         self._pending_run = None
         self._cooldown_until = 0.0
         self.factory_profile = default_board_profile().model_dump(mode="json")
@@ -711,10 +726,8 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
 """
         )
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 20, 22, 20)
-        layout.setSpacing(12)
-        layout.addWidget(text_label("ROBO PI / HARDWARE CHECKS", "chatEyebrow"))
-        layout.addWidget(text_label("硬件自检", "boardTitle"))
+        layout.setContentsMargins(13, 10, 13, 10)
+        layout.setSpacing(7)
         layout.addWidget(
             text_label(
                 "按内置主控标准显示逐项结果；异常项给出原因和处理建议，原始证据可按需展开。",
@@ -723,28 +736,28 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
         )
         self.summary = text_label("未检查 · 结果未知", "boardSummary")
         self.summary.setAccessibleName("各项硬件自检结果汇总")
-        layout.addWidget(self.summary)
-        standards = QHBoxLayout()
-        self.profile_note = text_label(self.factory_profile["name"], "chatMuted")
-        standards.addWidget(self.profile_note, 1)
-        self.profile_button = QPushButton("设置主控测试标准")
-        self.profile_button.setMinimumHeight(40)
-        self.profile_button.clicked.connect(self.edit_board_profile)
-        standards.addWidget(self.profile_button)
-        layout.addLayout(standards)
         archive = QHBoxLayout()
+        archive.addWidget(text_label("归档 SN", "contextTitle"))
         self.factory_sn = QLineEdit()
         self.factory_sn.setPlaceholderText("输入整机SN，关联已经完成的自检")
         self.factory_sn.setAccessibleName("硬件自检归档SN")
         archive.addWidget(self.factory_sn, 1)
-        self.factory_sync = QPushButton("将当前自检结果保存到此SN")
+        self.factory_sync = QPushButton("保存结果到此 SN")
+        self.factory_sync.setObjectName("contextAction")
         archive.addWidget(self.factory_sync)
+        self.profile_note = text_label(self.factory_profile["name"], "chatMuted")
+        archive.addWidget(self.profile_note, 1)
+        self.profile_button = QPushButton("测试标准")
+        self.profile_button.setObjectName("contextAction")
+        self.profile_button.clicked.connect(self.edit_board_profile)
+        archive.addWidget(self.profile_button)
         layout.addLayout(archive)
         self.factory_save_note = text_label(
             "未关联工厂SN。已有结果可直接保存，无需重测；会保留各项原来的时间和结论。",
             "chatMuted",
         )
         layout.addWidget(self.factory_save_note)
+        layout.addWidget(self.summary)
         actions = QHBoxLayout()
         actions.setSpacing(10)
         self.select = QComboBox()
@@ -760,12 +773,12 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
         self.run = QPushButton("运行所选单项")
         for button, action in ((self.refresh, "board_status"), (self.run, "board_run")):
             button.setObjectName("contextAction")
-            button.setMinimumHeight(40)
+            button.setMinimumHeight(33)
             button.clicked.connect(lambda checked=False, a=action: self.request(a))
             actions.addWidget(button)
         self.run_all = QPushButton("一键执行17项基础自检")
         self.run_all.setObjectName("contextAction")
-        self.run_all.setMinimumHeight(40)
+        self.run_all.setMinimumHeight(33)
         self.run_all.clicked.connect(self.start_batch)
         actions.addWidget(self.run_all)
         layout.addLayout(actions)
@@ -887,6 +900,7 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
             self.robot_id = robot_id
             self.source_kind = source_kind
             self.reports.clear()
+            self._native_bms_report_id = None
             self.round_reports = None
             self.output.clear()
             self._cooldown_until = 0.0
@@ -947,6 +961,9 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
                     )
         validated = []
         for identity, report in incoming:
+            if (identity == "BMS_RECOVERY" and self._native_bms_report_id
+                    and report.get("report_id") != self._native_bms_report_id):
+                continue
             if (
                 report.get("result") not in RESULT_LABELS
                 or report.get("robot_id", self.robot_id) != self.robot_id
@@ -1255,7 +1272,34 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
             if action == "board_run"
             else None
         )
-        worker = OperationWorker(self.source_url(), action, body=body)
+        native_bms = (body and body["plugin_id"] == "BMS_RECOVERY" and self.source_kind == "ros2"
+                      and self.native_context is not None)
+        if native_bms:
+            generation, sn = self.generation, self.factory_sn.text().strip()
+            context = self.native_context()
+            if (not context.get("connected") or context.get("robot_id") != self.robot_id
+                    or not all(context.get(key) for key in ("relay_url", "station_url", "station_token_file"))):
+                message = "请先在设备设置通过SSH连接本次BMS检查的机器人。"
+                if batch:
+                    self.stop_batch(message)
+                self.status.setText(message)
+                return
+            password, ok = QInputDialog.getText(
+                self, "授权 BMS 重启恢复测试",
+                f"机器人 {self.robot_id} · SN {sn or '未填写'}\n请在维护窗口输入本次sudo密码。确认后重启 bms.service 并观察数据恢复。",
+                QLineEdit.EchoMode.Password,
+            )
+            if (not ok or not password or self.generation != generation
+                    or self.factory_sn.text().strip() != sn or self.native_context() != context
+                    or not self.connected or self.busy or (batch and not self.batch_active)):
+                message = "BMS重启授权未完成，本次未执行。"
+                if batch and self.batch_active:
+                    self.stop_batch(message)
+                self.status.setText(message)
+                return
+            worker = OperationWorker(self.source_url(), "bms_recovery", body=(context, password))
+        else:
+            worker = OperationWorker(self.source_url(), action, body=body)
         if body:
             self._pending_run = {"token": str(uuid4()), "plugin_id": body["plugin_id"]}
             self.run_requested.emit({
@@ -1273,6 +1317,20 @@ QTableWidget#boardChecks:focus { border:1px solid #2b59e8; }
 
         def complete(result):
             if not current():
+                return
+            if native_bms:
+                pending, self._pending_run = self._pending_run, None
+                head = result.head()
+                self._native_bms_report_id = head["report_id"]
+                self._merge_reports({"checks": [{"id": "BMS_RECOVERY", "latest": head}]})
+                self._render_table()
+                self._selection_changed()
+                self.status.setText(result.message)
+                if pending:
+                    self.report_ready.emit({"token": pending["token"], "robot_id": self.robot_id,
+                                            "source_kind": "ros2", "reports": {"BMS_RECOVERY": head}})
+                if batch:
+                    self.batch_current = None
                 return
             if action == "board_run":
                 if batch and not result.get("job_id"):

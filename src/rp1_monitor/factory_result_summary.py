@@ -18,6 +18,7 @@ from . import factory_traceability as trace
 from .board_check_view import board_check_view
 from .factory_board_profile import BoardTestProfile
 from .factory_codec import decode_payload
+from .factory_store import hot_swap_soc_summary
 from .models import metric_spec
 
 EDITABLE_FIELDS = frozenset({"test_name", "started_at", "ended_at", "operator", "actual_result",
@@ -25,7 +26,19 @@ EDITABLE_FIELDS = frozenset({"test_name", "started_at", "ended_at", "operator", 
 VERDICTS = frozenset({"未测试", "通过", "不通过", "待复核", "中断", "不适用"})
 _STATUS = {"pass": "通过", "fail": "不通过", "incomplete": "待复核"}
 _MOTOR_NAME = re.compile(r"^[0-9a-f-]{36}-[0-9a-f-]{36}\.json$")
-_PROFILE_KEYS = {"RP003": ("ethernet_interfaces",), "RP011": ("usb_devices",),
+_MOTOR_FIRMWARE_NAME = re.compile(r"^motor-firmware-[0-9a-f-]{36}\.json$")
+# Original rule values are used only to recognize existing, unchanged evidence edits.
+_LEGACY_MOTION_RULES = {'SYS-009': ('每段记录严格大于7200秒，保留关键统计、低频趋势、有界异常快照及原始时间/单位/缺失原因；时长满足不自动证明动作已执行或性能合格。性能验收判据待补充，结论由人员依据实测填写。',
+             'docs/FACTORY_MODE.md；2026-11-04快照'),
+ 'SYS-010': ('walking和running两种原始类型分别保存，每种每段均须严格大于7200秒；保留各自结果、证据及复测历史。性能验收判据待补充；不能因有任一种记录就自动判项目通过。',
+             'docs/WHOLE_ROBOT_TEST_IDS.md；2026-11-04快照；docs/FACTORY_MODE.md；2026-11-04快照'),
+ 'SYS-010/running': ('每段记录严格大于7200秒，保留关键统计、低频趋势、有界异常快照及原始时间/单位/缺失原因；时长满足不自动证明动作已执行或性能合格。性能验收判据待补充，结论由人员依据实测填写。',
+                     'docs/FACTORY_MODE.md；2026-11-04快照'),
+ 'SYS-010/walking': ('每段记录严格大于7200秒，保留关键统计、低频趋势、有界异常快照及原始时间/单位/缺失原因；时长满足不自动证明动作已执行或性能合格。性能验收判据待补充，结论由人员依据实测填写。',
+                     'docs/FACTORY_MODE.md；2026-11-04快照'),
+ 'SYS-011': ('24轴由人员在机器人端手动选择UFO，每段记录严格大于7200秒，保留实际结果及证据；性能验收判据待补充。28轴不适用，须依据实际机型记录不适用，不能记通过。',
+             'docs/WHOLE_ROBOT_TEST_IDS.md；2026-11-04快照；docs/FACTORY_MODE.md；2026-11-04快照')}
+_PROFILE_KEYS = {"RP002": ("image_identity",), "RP003": ("ethernet_interfaces",), "RP011": ("usb_devices",),
                  "RP022": ("bms_firmware_versions",),
                  "RP029": ("serial_ports", "follow_bms_serial"),
                  "IMU_FIRMWARE": ("imu_firmware_versions",)}
@@ -149,33 +162,74 @@ def _motor_rule(motors):
     return "\n本次驱动期望量程：\n" + "\n".join("、".join(addresses) + "：" + text for text, addresses in groups.items())
 
 
-def _calibration_summary(report):
+def _calibration_summary(report, *, encoder=False):
     rows = report["results"]
     counts = Counter(item["status"] for item in rows)
     unfinished = len(rows) - counts["passed"] - counts["failed"]
-    lines = [f"逐关节结果：通过{counts['passed']}项；失败{counts['failed']}项；未完成{unfinished}项（跳过{counts['skipped']}项）。"]
+    passed, failed = ("角度达标", "不合格") if encoder else ("通过", "失败")
+    lines = [f"逐关节结果：{passed}{counts['passed']}项；{failed}{counts['failed']}项；未完成{unfinished}项（跳过{counts['skipped']}项）。"]
+
+    def degrees(value, *, signed=False):
+        if encoder and type(value) in (int, float) and math.isfinite(value):
+            return format(value, "+.2f" if signed else ".2f")
+        return _display(value)
+
     for item in rows:
         attempt = next((entry for entry in item.get("attempts", []) if entry.get("attempt_id") == item.get("effective_attempt_id")), {})
         reference = attempt.get("reference_deg", item.get("reference_deg"))
         zero = attempt.get("check_mode", item.get("check_mode")) in {"pin_zero", "center_zero"}
-        angle = attempt.get("current_angle_deg" if zero else "peak_angle_deg")
+        angle = attempt.get("current_angle_deg" if zero or (encoder and item["status"] != "failed") else "peak_angle_deg")
         deviation = (angle - reference if type(angle) in (int, float) and type(reference) in (int, float)
                      and math.isfinite(angle) and math.isfinite(reference) else None)
-        status = {"passed": "通过", "failed": "失败", "skipped": "跳过", "active": "检查中", "pending": "未测"}.get(item["status"], "未知")
+        status = {"passed": passed, "failed": failed, "skipped": "跳过", "active": "检查中", "pending": "未测"}.get(item["status"], "未知")
+        if encoder and item["status"] == "failed" and attempt.get("reason") == "operator_target_not_reached":
+            status = "不合格（未达目标）"
         direction = {"upper": "上限", "lower": "下限", "center": "零位"}.get(item.get("direction"), "方向未知")
-        line = f"{item['joint']}（{direction}）：{status}；有效参考 {_display(reference)}°；"
-        if zero:
+        line = f"{item['joint']}（{direction}）：{status}；有效参考 {degrees(reference)}°；"
+        if encoder:
+            line += f"实测 {degrees(angle)}°；偏差 {degrees(deviation, signed=True)}°"
+        elif zero:
             line += f"当前角度 {_display(angle)}°；相对零位偏差 {_display(deviation)}°"
-            low, high, elapsed = (attempt.get(key) for key in ("pin_window_min_deg", "pin_window_max_deg", "stable_elapsed_s"))
-            if low is not None or high is not None:
-                line += f"；零位窗口 {_display(low)}° ～ {_display(high)}°"
-            if elapsed is not None:
-                line += f"；原记录稳定时长 {_display(elapsed)}秒"
         else:
             line += f"峰值 {_display(angle)}°；峰值偏差 {_display(deviation)}°"
+        if zero:
+            low, high, elapsed = (attempt.get(key) for key in ("pin_window_min_deg", "pin_window_max_deg", "stable_elapsed_s"))
+            if low is not None or high is not None:
+                line += f"；零位窗口 {degrees(low)}° ～ {degrees(high)}°"
+            if elapsed is not None:
+                line += f"；原记录稳定时长 {_display(elapsed)}秒"
         lines.append(line + "。")
     if report.get("interruption_reason"):
         lines.append("中断原因：" + str(report["interruption_reason"]))
+    return "\n".join(lines)
+
+
+def _zero_reference_summary(record):
+    report = record["report"]
+    rows = report["results"]
+    counts = Counter(row["status"] for row in rows)
+    unfinished = len(rows) - counts["passed"] - counts["failed"] - counts["skipped"]
+    limits = report["limits"]
+    lines = [f"标零位复查 · {record['robot_id']} · {record['saved_at']}。",
+             f"达标 {counts['passed']}/{len(rows)}，不达标 {counts['failed']}，跳过 {counts['skipped']}，未完成 {unfinished}。",
+             f"原始编码器参考 0°，容差 ±{limits['raw_tolerance_deg']:g}°，要求 {limits['required_samples']} 次有效采样。"]
+    if record.get("end_reason"):
+        lines.append(f"停止原因 {record['end_reason']}。")
+    lines.append("复查记录作为本项证据，原有行程检查和人工结论独立保存。")
+
+    def degrees(value):
+        return f"{value:+.2f}°" if type(value) in (int, float) and math.isfinite(value) else "未知"
+
+    status = {"passed": "达标", "failed": "不达标", "skipped": "跳过", "pending": "未测",
+              "awaiting_confirmation": "待确认", "collecting": "未完成", "incomplete": "未完成"}
+    for row in rows:
+        sample = row["samples"][-1] if row["samples"] else {}
+        raw = "、".join(f"{motor['interface']}/{motor['motor_id']} {degrees(value)}"
+                      for motor, value in zip(row["motors"], sample.get("raw_angles_deg", [])))
+        stamps = "、".join(sample.get("raw_received_at", []))
+        detail = f"；原始角 {raw}；接收时间 {stamps}" if raw else ""
+        lines.append(f"{row['joint']} · {status[row['status']]} · 逻辑参考 {degrees(row['logical_reference_deg'])}"
+                     f" · 实测 {degrees(row.get('logical_measured_deg'))} · 偏差 {degrees(row.get('logical_delta_deg'))}{detail}")
     return "\n".join(lines)
 
 
@@ -212,12 +266,14 @@ def _motion_description(segments, summaries):
                     label = key
                 unit = values.get("unit") or ""
                 lines.append(f"{label}：最小 {_display(values.get('minimum'))}，最大 {_display(values.get('maximum'))}，均值 {_display(values.get('mean'))} {unit}；有效 {_display(values.get('valid'))}次，缺失 {_display(values.get('missing'))}次；最大有效间隔 {_display(values.get('maximum_valid_gap_seconds'))}秒。")
-    lines.append("时长满足不证明动作执行或性能合格，须人员填写结论。")
+    lines.append("记录时长不证明动作执行或性能合格，须人员填写结论。")
     return "\n".join(lines)
 
 
 def _board_rule(row, head, frozen, profile):
     details = head.get("details") or {}
+    if row["source_id"] == "RP002" and frozen and profile.get("image_identity"):
+        row["criterion"] = "镜像版本、修订、UUID及构建身份符合本次冻结工厂基准。"
     original = {key: details[key] for key in ("limit_c", "required", "expected", "mismatches",
                 "min_speed_mbps", "minimum_speed_mbps") if key in details}
     if original:
@@ -278,38 +334,153 @@ def _board_rows(store, rows, board):
 
 def _motor_attachments(store, sn):
     """Read only bounded, native parameter-report attachments, never arbitrary logs."""
+    receipt = next(_motor_receipts(store, sn, _MOTOR_NAME, {"check", "update", "rewrite"}), None)
+    return [receipt] if receipt else []
+
+
+def _motor_receipts(store, sn, pattern, operations):
     metadata = store.db.execute("SELECT payload FROM attachments WHERE sn=? AND item=1 ORDER BY rowid DESC", (sn,))
     for entry in metadata:
         attachment = json.loads(entry[0])
-        if not _MOTOR_NAME.fullmatch(attachment.get("name", "")):
+        if not pattern.fullmatch(attachment.get("name", "")):
             continue
         path = store.attachments / attachment["attachment_id"]
         try:
             # Native receipts are bounded to 512 KiB; requested before-images may double that.
             if attachment["bytes"] > 2 * 1024**2:
-                raise ValueError("参数附件超出摘要读取上限")
+                raise ValueError("电机附件超出摘要读取上限")
             # Hash only this small JSON, never a recording or a user-supplied large file.
             descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             try:
                 info = os.fstat(descriptor)
                 if (not stat.S_ISREG(info.st_mode) or info.st_size != attachment["bytes"]
                         or info.st_size > 2 * 1024**2):
-                    raise ValueError("参数附件字节数不符")
+                    raise ValueError("电机附件字节数不符")
                 with os.fdopen(descriptor, "rb", closefd=False) as stream:
                     raw = stream.read(2 * 1024**2 + 1)
                 if hashlib.sha256(raw).hexdigest() != attachment["sha256"]:
-                    raise ValueError("参数附件校验失败")
+                    raise ValueError("电机附件校验失败")
                 body = json.loads(raw)
             finally:
                 os.close(descriptor)
             if (not isinstance(body, dict) or body.get("sn") != sn
                     or not isinstance(body.get("request"), dict) or not isinstance(body.get("result"), dict)
-                    or body["request"].get("operation") not in {"check", "update"}):
-                return [(attachment, body if isinstance(body, dict) else {}, "参数附件结构或SN归属不匹配")]
-            return [(attachment, body, "")]
+                    or not isinstance(body["request"].get("operation"), str)
+                    or body["request"]["operation"] not in operations):
+                yield attachment, body if isinstance(body, dict) else {}, "电机附件结构或SN归属不匹配"
+            else:
+                yield attachment, body, ""
         except (OSError, ValueError) as error:
-            return [(attachment, {}, str(error))]
-    return []
+            yield attachment, {}, str(error)
+
+
+def _firmware_version(reading):
+    if not isinstance(reading, dict) or reading.get("source") not in ("firmware_string", "numeric"):
+        return None
+    value = reading.get("version")
+    return value if isinstance(value, str) and 0 < len(value) <= 96 and value.isprintable() else None
+
+
+def _firmware_rows(result, dof):
+    rows = result.get("rows")
+    if not isinstance(rows, list) or len(rows) > dof or any(
+        not isinstance(row, dict) or not isinstance(row.get("address"), str)
+        or not re.fullmatch(r"can[0-3]/[1-7]", row["address"]) for row in rows
+    ):
+        return []
+    return rows if len({row["address"] for row in rows}) == len(rows) else []
+
+
+def _motor_firmware_row(store, sn, row, legacy, binding, dof, base_rule):
+    from .motor_firmware_remote import validate_request
+
+    if binding and binding["source_kind"] != "ros2":
+        return
+    check = update = before_update = None
+    for attachment, body, error in _motor_receipts(store, sn, _MOTOR_FIRMWARE_NAME, {"check", "update"}):
+        if error:
+            continue
+        request, result = body["request"], body["result"]
+        identity = {key: request.get(key) for key in ("request_id", "robot_id", "dof")}
+        try:
+            validate_request(dict(identity, operation="check"))
+        except (TypeError, ValueError):
+            continue
+        if request["dof"] != dof or (binding and binding["robot_id"] != request["robot_id"]):
+            continue
+        matching_result = all(result.get(key) == value for key, value in identity.items())
+        motors = _firmware_rows(result, dof) if matching_result else []
+        if request["operation"] == "check" and not check and motors and result.get("state") == "completed":
+            check = (attachment, body, motors)
+        elif request["operation"] == "update":
+            if not update:
+                update = (attachment, body, motors)
+            if (result.get("state") == "requested"
+                    and update[1]["request"]["request_id"] == request["request_id"]):
+                before_update = (attachment, result.get("before"))
+        if check and update and before_update:
+            break
+
+    previous_check = (legacy[0][0]["created_at"] if legacy and row["source_kind"] == "ros2"
+                      and legacy[0][1].get("result", {}).get("state") == "checked" else "")
+    if check and check[0]["created_at"] >= previous_check:
+        attachment, body, motors = check
+        versions = [_firmware_version(motor.get("before")) for motor in motors]
+        readings = [f"{motor['address']}：{version or '未知'}"
+                    + ("（数字回执）" if version and motor["before"]["source"] == "numeric" else "")
+                    for motor, version in zip(motors, versions)]
+        row.update(base_rule, source_kind="ros2", verdict="待复核",
+                   actual_result=f"固件读取 {sum(bool(value) for value in versions)}/{dof} 台 · 保存时间 {attachment['created_at']}。\n"
+                   + "；".join(readings),
+                   evidence=str(store.attachments / attachment["attachment_id"]) if any(versions) else "",
+                   _inputs=[attachment["sha256"], body])
+        _stamp(row, body["result"])
+        profile = body.get("board_test_profile")
+        if profile:
+            try:
+                profile = BoardTestProfile.model_validate(profile)
+            except ValueError:
+                row["actual_result"] += "\n本附件冻结标准格式无效，待复核。"
+            else:
+                allowed = profile.motor_firmware_versions
+                if allowed:
+                    row["criterion"] += "\n本次冻结电机允许固件版本：" + _json(allowed)
+                    row["criterion_source"] += "；本附件冻结主控标准：" + profile.name
+                    if any(value and value not in allowed for value in versions):
+                        row["verdict"] = "不通过"
+                    elif len(versions) == dof and all(value in allowed for value in versions):
+                        row["verdict"] = "通过"
+        previous_check = attachment["created_at"]
+
+    if update:
+        attachment, body, motors = update
+        result = body["result"]
+        if attachment["created_at"] > previous_check:
+            row["verdict"] = "待复核"
+            row["actual_result"] += "\n更新后请重新读取整机固件，再确认结论。"
+        detail = _display(result.get("detail")) if result.get("detail") else ""
+        state = {"requested": "已保存刷写前快照", "completed": "刷写流程回执已返回",
+                 "blocked": "刷写未执行", "unknown": "刷写结果待核对"}.get(str(result.get("state")), "结果待核对")
+        if not motors and before_update and isinstance(before_update[1], dict):
+            targets = body["request"].get("targets")
+            if isinstance(targets, list):
+                selected = {(target.get("interface"), target.get("motor_id")) for target in targets
+                            if isinstance(target, dict) and isinstance(target.get("interface"), str)
+                            and type(target.get("motor_id")) is int}
+                motors = [dict(motor, after=None) for motor in _firmware_rows(before_update[1], dof)
+                          if (motor["address"].split("/")[0], int(motor["address"][-1])) in selected]
+        readings = [f"{motor['address']}：{_firmware_version(motor.get('before')) or '未知'} → "
+                    f"{_firmware_version(motor.get('after')) or '未知'}"
+                    + (f"（{_display(motor['detail'])}）" if motor.get("detail") else "")
+                    for motor in motors]
+        row["actual_result"] += "\n" + "\n".join(filter(None, [
+            f"固件维护：{state} · 保存时间 {attachment['created_at']}。", detail, "；".join(readings),
+        ]))
+        row["evidence"] = "\n".join(filter(None, (row["evidence"], str(store.attachments / attachment["attachment_id"]))))
+        row["_inputs"].append([attachment["sha256"], body])
+        if before_update and before_update[0] != attachment:
+            row["evidence"] += "\n" + str(store.attachments / before_update[0]["attachment_id"])
+            row["_inputs"].append(before_update[0]["sha256"])
 
 
 def _motor_rows(store, by_key, reports, binding, dof):
@@ -377,9 +548,33 @@ def _motor_rows(store, by_key, reports, binding, dof):
             else:
                 row["actual_result"] += "\n允许版本清单未提供，版本读取不自动判合规。"
         else:
+            standard = result.get("parameter_standard")
+            if isinstance(standard, str) and re.fullmatch(r"roboparty_motors@[0-9a-f]{40}", standard):
+                row["criterion"] = ("按实物机型逐台核对KP/KD/POS/SPD/TOR编码范围与本次冻结的官网基准。"
+                                    "更新前核对已安装驱动，保存原值并逐项读回。")
+                row["criterion_source"] = ("官网电机驱动：" + standard
+                                           + "；本次配置SHA256：" + str(result.get("configuration_sha256") or "未知")
+                                           + "；本次驱动二进制SHA256：" + str(result.get("binary_sha256") or "未知"))
+                row["actual_result"] = ("官网量程基准 " + standard.split("@", 1)[1][:7]
+                                        + "。\n" + row["actual_result"])
+                if result.get("parameter_write_allowed") is False:
+                    row["actual_result"] += "\n已安装驱动量程与官网基准不一致，本次仅可读取。"
             row["criterion"] += _motor_rule(motors)
             if any(value.get("matches") is False for motor in motors for value in motor.get("parameters", {}).values()):
                 row["verdict"] = "不通过"
+            extended_standard = result.get("extended_parameter_standard")
+            if isinstance(extended_standard, str) and extended_standard:
+                extended = [value for motor in motors
+                            for readings in (motor.get("extended_parameters"),) if isinstance(readings, dict)
+                            for value in readings.values() if isinstance(value, dict)]
+                different = sum(value.get("matches") is False for value in extended)
+                unknown = sum(value.get("matches") is None for value in extended)
+                row["criterion"] += "\n按扩展参数脚本基准核对 Kt、CUR、CAN_TIMEOUT 和对应型号的 Pn。"
+                row["criterion_source"] += "；扩展参数基准：" + extended_standard
+                row["actual_result"] = (f"扩展参数差异 {different} 项，未知 {unknown} 项。\n"
+                                        + row["actual_result"])
+                if different:
+                    row["verdict"] = "不通过"
             row["actual_result"] += "\nMIT量程一致仅表示编码范围核对结果，整项结论待人员复核。"
         if not complete:
             row["actual_result"] += f"\n覆盖 {len(motors)}/{dof} 台，完整性待复核。"
@@ -463,14 +658,12 @@ def _motion_row(store, row, segments, summaries, conclusion, *, stunt=False):
             row["_inputs"] = [[{key: value for key, value in record.items() if key != "imported_at"}
                                for record in measured], relevant]
             return
-        enough = all(summaries[segment["segment_id"]]["duration_seconds"] is not None
-                     and summaries[segment["segment_id"]]["duration_seconds"] > 7200 for segment in segments)
         if relevant["status"] == "fail":
             row["verdict"] = "不通过"
-        elif relevant["status"] == "pass" and enough and all(segment["state"] == "sealed" for segment in segments):
+        elif relevant["status"] == "pass" and all(segment["state"] == "sealed" for segment in segments):
             row["verdict"] = "通过"
         elif relevant["status"] == "pass":
-            row["actual_result"] += "\n已有人工通过结论，但记录时长或完整性尚不满足，汇总待复核。"
+            row["actual_result"] += "\n已有人工通过结论，但记录完整性尚待复核。"
     row["_inputs"] = [[{key: value for key, value in record.items() if key != "imported_at"}
                        for record in measured], relevant]
 
@@ -482,9 +675,12 @@ def report_rows(store, sn):
         functions, pairing = store.functional_checks(sn), store.estop_pairing(sn)
         lights, confirmations = store.light_observations(sn), store.calibration_confirmations(sn)
         calibration, soc = store.calibration_check(sn), store.soc_observations(sn)
+        angle_check = store.angle_calibration_check(sn)
+        zero_check = store.zero_reference_check(sn)
         segments = store.list_segments(sn)
         model = store.db.execute("SELECT dof FROM sn_models WHERE sn=?", (sn,)).fetchone()
-        dof = model["dof"] if model else calibration["report"]["dof"] if calibration else 24
+        check = calibration or angle_check or zero_check
+        dof = model["dof"] if model else check["report"]["dof"] if check else 24
         identity = board or (segments[0] if segments else soc[0] if soc else None)
         binding = {key: identity[key] for key in ("robot_id", "source_kind")} if identity else None
         summaries = {segment["segment_id"]: _motion_summary(store, segment) for segment in segments}
@@ -500,7 +696,11 @@ def report_rows(store, sn):
             rows.append(row)
         by_key = {row["row_key"]: row for row in rows}
         _board_rows(store, rows, board)
-        _motor_rows(store, by_key, _motor_attachments(store, sn), binding, dof)
+        firmware_row = by_key["SYS-003"]
+        firmware_rule = {key: firmware_row[key] for key in ("criterion", "criterion_source", "notes")}
+        motor_reports = _motor_attachments(store, sn)
+        _motor_rows(store, by_key, motor_reports, binding, dof)
+        _motor_firmware_row(store, sn, firmware_row, motor_reports, binding, dof, firmware_rule)
         if lights:
             head, row = lights[-1], by_key["SYS-002"]
             row.update(source_kind=_human_source(binding), verdict="通过" if head["lit"] else "不通过",
@@ -517,9 +717,10 @@ def report_rows(store, sn):
                        + "\n流程完成不等于通过，未提供逐轴验收条件保持待复核。",
                        evidence=_reference(store, "results", (head or {}).get("result_id", "")),
                        _inputs=[confirmations[-1] if confirmations else None, head])
-        if calibration or conclusions.get(3):
+        if calibration or angle_check or conclusions.get(3):
             row, head = by_key["SYS-006"], conclusions.get(3)
-            row.update(source_kind=_human_source(binding), verdict=_STATUS.get((head or {}).get("status"), "待复核"),
+            source_kind = _human_source(binding) if calibration or head else angle_check["source_kind"]
+            row.update(source_kind=source_kind, verdict=_STATUS.get((head or {}).get("status"), "待复核"),
                        actual_result=_manual_summary(head, label="标定检查人工结论", time_key="created_at"),
                        evidence=_reference(store, "calibration_checks", (calibration or {}).get("run_id", "")),
                        _inputs=[calibration, head])
@@ -536,6 +737,22 @@ def report_rows(store, sn):
                 elif statuses != {"passed"} and row["verdict"] == "通过":
                     row["verdict"] = "待复核"
                 row["notes"] += " 原报告来源：" + str(calibration.get("source_kind") or "未知") + "；保存时刻：" + str(calibration.get("saved_at") or "未知") + "。"
+            if angle_check:
+                saved_at = angle_check.get("saved_at") or "未知"
+                row["actual_result"] += (
+                    f"\n\n只读编码器角度检查 · 机器人 {angle_check['robot_id']} · 保存时间 {saved_at}。\n"
+                    + _calibration_summary(angle_check["report"], encoder=True))
+                row["notes"] += " 只读角度观测作为逐关节证据，整项验收结论由人员确认。"
+                evidence = [row["evidence"]] if calibration else []
+                if not calibration and head:
+                    evidence.append(_reference(store, "results", head["result_id"]))
+                evidence.append(_reference(store, "calibration_checks", angle_check["run_id"]))
+                row["evidence"] = "\n".join(evidence)
+                row["_inputs"].append(angle_check)
+        if zero_check:
+            row = by_key["SYS-006"]
+            row["zero_reference_summary"] = _zero_reference_summary(zero_check)
+            row["zero_reference_evidence"] = _reference(store, "calibration_checks", zero_check["run_id"])
         for kind, check in functions.items():
             head = check["latest"]
             related_soc = soc if kind == "battery_hot_swap" else []
@@ -552,6 +769,8 @@ def report_rows(store, sn):
             if related_soc:
                 row["evidence"] += "\n" + "\n".join(str(store.attachments / entry["attachment_id"]) for entry in related_soc)
                 row["notes"] += " SOC变化仅为辅助证据，不证明已换电、主控不断电或通过。"
+            if kind == "battery_hot_swap":
+                row["soc_summary"] = hot_swap_soc_summary(related_soc, (head or {}).get("soc_observation_ids", []))
         if pairing["latest"]:
             head, row = pairing["latest"], by_key["SYS-012"]
             row.update(source_kind=_human_source(binding), verdict=_STATUS[head["status"]],
@@ -581,9 +800,21 @@ def report_rows(store, sn):
             row["original_verdict"] = row["verdict"]
             row["edit_token"] = trace.edit_token(store.db, sn, row["row_key"])
             edit = edits.get(row["row_key"])
-            if edit and edit["source_token"] == token:
-                row.update(json.loads(edit["fields"]))
-                row["edited"] = True
+            if edit:
+                legacy = _LEGACY_MOTION_RULES.get(row["row_key"])
+                legacy_token = (hashlib.sha256(_json([sn, row["row_key"], dof, row["source_kind"],
+                    inputs, *legacy]).encode()).hexdigest() if legacy else None)
+                if edit["source_token"] in {token, legacy_token}:
+                    fields = json.loads(edit["fields"])
+                    # Carry forward human edits only when the original evidence is identical.
+                    if legacy and edit["source_token"] == legacy_token:
+                        for field, old_value in zip(("criterion", "criterion_source"), legacy):
+                            if fields.get(field) == old_value:
+                                fields[field] = row[field]
+                    row.update(fields)
+                    row["edited"] = True
+                    if row["row_key"] in _LEGACY_MOTION_RULES and not row["source_kind"]:
+                        row["source_kind"] = _human_source(binding)
             if dof == 28 and row["row_key"] == "SYS-011":
                 row["verdict"] = "不适用"
         if not pending_transaction:
@@ -625,6 +856,10 @@ def save_report_edits(store, sn, edits, station_id=""):
                 raise ValueError("结果内容必须为文字")
             if "verdict" in fields and fields["verdict"] not in VERDICTS:
                 raise ValueError("是否通过只能为未测试、通过、不通过、待复核、中断或不适用")
+            if (key == "SYS-009" and fields.get("verdict") == "通过"
+                    and current[key]["verdict"] != "通过"
+                    and not store.item_duration_satisfied(sn, 4)):
+                raise ValueError("站立记录尚未达到2小时或未正常结束，不能新标记通过；已有结论和历史保留")
             if (key == "SYS-011" and current[key]["model"] == "28轴"
                     and fields.get("verdict", "不适用") != "不适用"):
                 raise ValueError("28轴UFO特技不适用，不能填写其他结论")
@@ -666,6 +901,12 @@ def export_result_summary(store, sn, output_dir):
         # Release it before serialization/fsync or any transport work.
         store.db.execute("BEGIN IMMEDIATE")
         rows = report_rows(store, sn)
+        for row in rows:
+            if row.get("soc_summary"):
+                row["actual_result"] = row["soc_summary"] + "\n\n" + row["actual_result"]
+            if row.get("zero_reference_summary"):
+                row["actual_result"] = row["zero_reference_summary"] + "\n\n" + row["actual_result"]
+                row["evidence"] = "\n".join(filter(None, (row["evidence"], row["zero_reference_evidence"])))
         audit = trace.manifest(store.db, sn, rows, "", _rules()["_source_sha256"])
     output = Path(output_dir).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)

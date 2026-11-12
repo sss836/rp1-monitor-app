@@ -8,6 +8,16 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .board_check_view import BoardCheckView, board_check_view
 
+IMAGE_IDENTITY_203 = {
+    "BOARD": "robopi2",
+    "VENDOR": "roboparty-os",
+    "KERNEL_TARGET": "current",
+    "VERSION": "26.11.0-trunk-2.0.3",
+    "REVISION": "26.11.0-trunk-2.0.3",
+    "IMAGE_UUID": "e8713364-c43f-4b1b-b816-3ebf2939d39c",
+    "BUILD_REPOSITORY_COMMIT": "4b8460569-dirty",
+}
+
 
 class USBRequirement(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -31,6 +41,7 @@ class BoardTestProfile(BaseModel):
     bms_firmware_versions: list[str] = Field(default_factory=list, max_length=32)
     motor_firmware_versions: list[str] = Field(default_factory=list, max_length=32)
     imu_firmware_versions: list[str] = Field(default_factory=list, max_length=32)
+    image_identity: dict[str, str] = Field(default_factory=lambda: dict(IMAGE_IDENTITY_203))
 
     @field_validator("ethernet_interfaces", "serial_ports", "bms_firmware_versions", "motor_firmware_versions", "imu_firmware_versions")
     @classmethod
@@ -41,6 +52,10 @@ class BoardTestProfile(BaseModel):
 
     @model_validator(mode="after")
     def valid_can(self):
+        if (self.image_identity.keys() != IMAGE_IDENTITY_203.keys()
+                or any(not value.strip() or len(value) > 100 or any(ord(c) < 32 for c in value)
+                       for value in self.image_identity.values())):
+            raise ValueError("镜像身份基准必须包含完整有效字段")
         if any(not name or len(name) > 32 or not name.replace("_", "").isalnum() or mtu not in (16, 72) for name, mtu in self.can_interfaces.items()):
             raise ValueError("CAN接口名称无效，MTU应为16或72")
         if any(name not in self.can_interfaces or not 0 < value <= 10000000 for name, value in self.can_bitrates.items()):
@@ -82,6 +97,20 @@ def factory_board_view(identity, report, profile, reports=None):
 def _factory_board_view(identity, report, profile, reports=None):
     """Apply explicit inventory criteria, preserving acquisition errors and raw data."""
     native = board_check_view(identity, report)
+    if identity == "RP002" and report and report.get("result") in {"pass", "fail", "needs_review"}:
+        details = report.get("details") or {}
+        if report.get("result") == "fail" and not details.get("mismatches"):
+            return native
+        snapshot = details.get("snapshot") or {}
+        readings, failures, missing = [], [], []
+        for key, expected in profile.image_identity.items():
+            actual = snapshot.get(key)
+            readings.append(f"{key}：实际 {actual or '未知'}；工厂基准 {expected}")
+            if not isinstance(actual, str) or not actual.strip():
+                missing.append(f"镜像未提供 {key}")
+            elif actual != expected:
+                failures.append(f"镜像 {key} 与工厂基准不同")
+        return _outcome(readings, failures, missing, f"镜像身份符合工厂基准 {profile.image_identity['REVISION']}。")
     if not report or report.get("result") not in {"pass", "needs_review"}:
         return native
     details, reports = report.get("details") or {}, reports or {}

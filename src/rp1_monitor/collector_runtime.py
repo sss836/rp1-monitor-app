@@ -32,7 +32,8 @@ MAX_BUNDLE = 256 * 1024**2
 CONFIG_KEYS = {"robot_id", "ros_setup", "dds_profile", "rmw_implementation",
                "fastdds_xml", "ros_domain_id", "tui_executor"}
 SCRIPTS = {"scripts/start-robot.sh", "scripts/start-robot-background.sh",
-           "scripts/observer-fastdds-profile.xml"}
+           "scripts/observer-fastdds-profile.xml", "scripts/calibration_runtime.py",
+           "scripts/calibration_preflight.py", "scripts/update_deploy.sh"}
 
 
 def _json(path):

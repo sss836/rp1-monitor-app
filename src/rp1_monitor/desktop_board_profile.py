@@ -27,6 +27,7 @@ class BoardProfileDialog(QDialog):
         note.setWordWrap(True)
         layout.addWidget(note)
         form = QFormLayout()
+        form.addRow("RP002 镜像基准", QLabel(self.profile.image_identity["REVISION"]))
         self.ethernet = QLineEdit("、".join(self.profile.ethernet_interfaces))
         form.addRow("必需网口（多个用逗号分隔）", self.ethernet)
         self.serial = QLineEdit("、".join(self.profile.serial_ports))

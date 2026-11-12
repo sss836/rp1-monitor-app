@@ -8,7 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QLocale, Qt, QTimer, Signal
+from PySide6.QtGui import QDoubleValidator
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -30,9 +31,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .desktop_angle_check import AngleObservations, EncoderAngleCheck
 from .desktop_motor_control import MotorControlDialog, MotorControlWorker, _binding
 from .desktop_urdf_guide import UrdfJointGuide
-from .manual_calibration_check import validate_report
+from .manual_calibration_check import MAX_ENCODER_FRAME_GAP_S, validate_report
 
 _LABELS = {'hip': '髋', 'knee': '膝', 'ankle': '踝', 'waist': '腰',
            'shoulder': '肩', 'elbow': '肘', 'wrist': '腕'}
@@ -40,6 +42,7 @@ _STATUSES = {'pending': '未测', 'active': '检查中', 'passed': '合格', 'fa
              'skipped': '已跳过', 'interrupted': '已中断'}
 _PHASES = {'ready': '等待手动摆动', 'collecting': '正在采集', 'paused': '已暂停',
            'failed': '本关节不合格，暂停后可重测', 'complete': '本轮检查结束'}
+_NO_CURRENT_ANGLE_COLUMN = object()
 
 
 def _label(text=''):
@@ -68,13 +71,29 @@ class ManualCalibrationDialog(QDialog):
     check_saved = Signal(object)
     launch_context = MotorControlDialog.launch_context
 
-    def __init__(self, calibration_context, connection_context, parent=None, *, directory=None):
+    def __init__(self, calibration_context, connection_context, parent=None, *, directory=None, observed_pose=None):
         super().__init__(parent)
         self.current_context, self.connection_context = calibration_context, connection_context
         initial = calibration_context()
         self.initial_binding = _binding(connection_context())
         self.initial_identity = tuple(initial.get(k) for k in ('robot_id', 'source_kind', 'stream_id'))
         self.initial_configuration = initial.get('configuration_binding')
+        self.angles = AngleObservations(observed_pose, self.initial_identity) if observed_pose else None
+        self.angle_sn = ''
+        self.angle_view = False
+        self.angle_index = 0
+        self.encoder_query = None
+        self.auto_check = None
+        self.auto_mode = False
+        self.auto_query = None
+        self.auto_sent_at = None
+        self._skip_target = None
+        self._unreached_target = None
+        self._angle_save_path = None
+        self._angle_report_pending = None
+        self.auto_latest = None
+        self.auto_last_stamp = None
+        self.auto_error = ''
         self.worker = self.session_id = self.metadata = None
         self.state = 'disconnected'
         self._invalidated = self._close_requested = self._completed = False
@@ -119,6 +138,10 @@ class ManualCalibrationDialog(QDialog):
         self.save_error_banner.setStyleSheet('background:#fff0f0;color:#982e35;padding:9px;border:1px solid #dfb5b9;')
         self.save_error_banner.hide()
         outer.addWidget(self.save_error_banner)
+        self.readiness = _label()
+        self.readiness.setAccessibleName('逐关节检查就绪状态')
+        self.readiness.setStyleSheet('background:white;padding:9px;border:1px solid #bdcce4;')
+        outer.addWidget(self.readiness)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         body = QWidget()
@@ -132,7 +155,7 @@ class ManualCalibrationDialog(QDialog):
         layout.addWidget(self.setup_toggle)
         layout.addWidget(self.setup_panel)
         self.setup_toggle.toggled.connect(self.setup_panel.setVisible)
-        setup_layout.addWidget(_label('先支撑固定机器人并退出其他运控/标零工具。连接只读核对；使能后由人操作，程序不自动运动。腰部插销和左右髋 pitch 在零位±2°保持5秒；其余关节在参考±3°内且稳定。力矩仅辅助记录。'))
+        setup_layout.addWidget(_label('先支撑固定机器人并退出其他运控或标零工具。连接成功后可逐项检查角度。需要电机辅助时，请先核对映射并确认现场条件。'))
         bar = QHBoxLayout()
         self.dof = QComboBox()
         self.dof.addItem('请选择机型', None)
@@ -144,7 +167,7 @@ class ManualCalibrationDialog(QDialog):
         self.password.setEchoMode(QLineEdit.EchoMode.Password)
         self.password.setPlaceholderText('本次 SSH / sudo 密码，不保存')
         self.password.setAccessibleName('本次连接密码')
-        self.connect_button = QPushButton('连接控制会话')
+        self.connect_button = QPushButton('连接并核对')
         self.disconnect_button = QPushButton('断开连接')
         bar.addWidget(self.dof)
         bar.addWidget(self.password, 1)
@@ -183,13 +206,19 @@ class ManualCalibrationDialog(QDialog):
         self.pause_button = QPushButton('暂停检查')
         self.retest_button = QPushButton('重测选中关节（保留历史）')
         self.skip_button = QPushButton('跳过当前关节，记未完成')
+        self.unreached_button = QPushButton('记录未达目标并继续')
+        self.unreached_button.setToolTip('确认已经尝试摆到目标角度。记录本次最接近目标的实测值为不合格。')
+        self.unreached_button.hide()
+        self.continue_failed_button = QPushButton('记录不合格并继续')
+        self.continue_failed_button.hide()
         self.pin_confirm_button = QPushButton('销钉已插好，开始检查')
         self.pin_confirm_button.hide()
         for button in (self.enable_button, self.disable_button, self.start_button):
             actions.addWidget(button)
         layout.addLayout(actions)
         review_actions = QHBoxLayout()
-        for button in (self.pause_button, self.retest_button, self.skip_button):
+        for button in (self.pause_button, self.retest_button, self.skip_button, self.unreached_button,
+                       self.continue_failed_button):
             review_actions.addWidget(button)
         review_actions.addWidget(self.pin_confirm_button)
         layout.addLayout(review_actions)
@@ -205,7 +234,46 @@ class ManualCalibrationDialog(QDialog):
         self.conditions.setStyleSheet('background:white;padding:12px;border:1px solid #bdcce4;')
         for widget in (self.current_joint, self.reference, self.values, self.conditions):
             measurement.addWidget(widget)
-        measurement.addWidget(_label('关节角度用于判定，力矩仅辅助记录；结果自动保存在电脑。'))
+        self.powered_measurement_note = _label('关节角度用于判定，力矩仅辅助记录；结果自动保存在电脑。')
+        measurement.addWidget(self.powered_measurement_note)
+        self.angle_mode_button = QPushButton('单次读取与人工记录')
+        self.angle_mode_button.clicked.connect(self.toggle_angle_mode)
+        self.angle_mode_button.hide()
+        measurement.addWidget(self.angle_mode_button)
+        self.angle_panel = QWidget()
+        angle_layout = QVBoxLayout(self.angle_panel)
+        angle_layout.setContentsMargins(0, 0, 0, 0)
+        self.angle_input = QLineEdit()
+        self.angle_input.setAccessibleName('人工实测角度')
+        validator = QDoubleValidator(-360, 360, 3, self.angle_input)
+        locale = QLocale.c()
+        locale.setNumberOptions(QLocale.NumberOption.RejectGroupSeparator)
+        validator.setLocale(locale)
+        validator.setNotation(QDoubleValidator.Notation.StandardNotation)
+        self.angle_input.setValidator(validator)
+        self.angle_input.setPlaceholderText('填写量角工具实测值')
+        angle_form = QFormLayout()
+        angle_form.addRow('人工实测 °', self.angle_input)
+        encoder_controls = QHBoxLayout()
+        self.encoder_motor = QComboBox()
+        self.encoder_motor.setAccessibleName('选择电机总线和 ID')
+        self.encoder_read = QPushButton('读取轴角')
+        self.encoder_read.setToolTip('查询所选电机的编码器位置')
+        encoder_controls.addWidget(self.encoder_motor, 1)
+        encoder_controls.addWidget(self.encoder_read)
+        angle_form.addRow('电机轴角', encoder_controls)
+        self.encoder_value = _label('选择总线和 ID 后读取。')
+        angle_form.addRow('', self.encoder_value)
+        angle_layout.addLayout(angle_form)
+        angle_actions = QHBoxLayout()
+        self.angle_previous = QPushButton('上一项')
+        self.angle_next = QPushButton('下一项')
+        self.angle_record = QPushButton('记录角度并继续')
+        for button in (self.angle_previous, self.angle_next, self.angle_record):
+            angle_actions.addWidget(button)
+        angle_layout.addLayout(angle_actions)
+        self.angle_panel.hide()
+        measurement.addWidget(self.angle_panel)
         measurement.addStretch()
         details.addLayout(measurement, 2)
         layout.addLayout(details)
@@ -219,13 +287,19 @@ class ManualCalibrationDialog(QDialog):
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.setMinimumHeight(200)
         layout.addWidget(self.table)
-        layout.addWidget(_label('腰部侧摆先插好销钉并确认；腰部和左右髋 pitch 在零位±2°内保持5秒。其他关节检查所选单侧±3°。暂停后可重测，历史保留。'))
+        self.powered_review_note = _label('腰部侧摆先插好销钉并确认；腰部和左右髋 pitch 在零位±2°内保持5秒。其他关节检查所选单侧±3°。暂停后可重测，历史保留。')
+        layout.addWidget(self.powered_review_note)
         self.diagnostics = _label()
         layout.addWidget(self.diagnostics)
         self.save_status = _label('收到检查报告后自动保存到本机；拔线不删除已收记录。')
         layout.addWidget(self.save_status)
+        save_actions = QHBoxLayout()
+        self.save_to_results_button = QPushButton('保存到 SYS-006 查看结果')
+        self.save_to_results_button.hide()
+        save_actions.addWidget(self.save_to_results_button)
         self.export_button = QPushButton('另存本轮 JSON')
-        layout.addWidget(self.export_button)
+        save_actions.addWidget(self.export_button)
+        layout.addLayout(save_actions)
         scroll.setWidget(body)
         outer.addWidget(scroll, 1)
         self.status = _label('尚未连接；未发送电机指令。')
@@ -241,16 +315,31 @@ class ManualCalibrationDialog(QDialog):
         self.start_button.clicked.connect(self.start_check)
         self.pause_button.clicked.connect(self.pause_check)
         self.retest_button.clicked.connect(self.retest_selected)
+        self.skip_button.pressed.connect(self.remember_skip_target)
         self.skip_button.clicked.connect(self.skip_current)
+        self.unreached_button.pressed.connect(self.remember_unreached_target)
+        self.unreached_button.clicked.connect(self.record_unreached_angle)
+        self.continue_failed_button.clicked.connect(self.continue_failed_angle)
         self.pin_confirm_button.clicked.connect(self.confirm_pin)
         self.stop_button.clicked.connect(self.stop_and_disable)
+        self.save_to_results_button.clicked.connect(self.save_angles_to_results)
         self.export_button.clicked.connect(self.export_report)
+        self.angle_input.textChanged.connect(self.refresh)
+        self.angle_previous.clicked.connect(lambda: self.move_angle(-1))
+        self.angle_next.clicked.connect(lambda: self.move_angle(1))
+        self.angle_record.clicked.connect(self.capture_angle)
+        self.encoder_motor.currentIndexChanged.connect(self.reset_encoder_display)
+        self.encoder_read.clicked.connect(self.read_encoder)
         self.dof.currentIndexChanged.connect(self.load_plan)
         for signal in (self.password.textChanged, self.site_ready.toggled, self.damping.valueChanged):
             signal.connect(self.refresh)
+        self.site_ready.toggled.connect(self.angle_site_changed)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(250)
+        self.auto_timer = QTimer(self)
+        self.auto_timer.timeout.connect(self.poll_automatic_angle)
+        self.auto_timer.setInterval(300)
         for button in self.findChildren(QPushButton):
             button.setAutoDefault(False)
         self.load_plan()
@@ -276,17 +365,24 @@ class ManualCalibrationDialog(QDialog):
             self.show_current(None, 0)
         self.refresh()
 
-    def set_row(self, index, row, status, attempt, count):
+    def set_row(self, index, row, status, attempt, count, *, current_angle=_NO_CURRENT_ANGLE_COLUMN, pending_record=False):
         peak = (attempt or {}).get('peak_angle_deg')
         ref = row.get('reference_deg', math.degrees(row.get('requested_rad', 0)))
         delta = peak - ref if type(peak) in (int, float) else None
         side = {'lower': '下限', 'upper': '上限', 'center': '插销零位' if row.get('check_mode') == 'pin_zero' else '零位'}.get(row['direction'], '未知')
-        values = (joint_title(row['joint']) + ' · ' + side,
-                  _number(ref), _number(peak), _number(delta, signed=True), _STATUSES.get(status, status), str(count))
+        angles = (_number(peak) + ('（待记）' if pending_record else ''), _number(delta, signed=True))
+        if current_angle is not _NO_CURRENT_ANGLE_COLUMN:
+            angles = (_number(current_angle), *angles)
+        values = (joint_title(row['joint']) + ' · ' + side, _number(ref), *angles, _STATUSES.get(status, status), str(count))
         for col, value in enumerate(values):
-            item = QTableWidgetItem(value)
-            item.setToolTip(row['joint'])
-            self.table.setItem(index, col, item)
+            item = self.table.item(index, col)
+            if item is None:
+                item = QTableWidgetItem(value)
+                self.table.setItem(index, col, item)
+            elif item.text() != value:
+                item.setText(value)
+            if item.toolTip() != row['joint']:
+                item.setToolTip(row['joint'])
 
     def show_current(self, current, index):
         row = self.plan['outcomes'][index] if type(index) is int and 0 <= index < len(self.plan['outcomes']) else None
@@ -342,48 +438,414 @@ class ManualCalibrationDialog(QDialog):
     def active(self):
         return self.worker is not None and self.worker.isRunning()
 
+    def angle_ready(self):
+        return (self.angles is not None and self.active() and self.metadata is not None
+                and self.state == 'ready' and self.plan is not None
+                and not (self._failure_reason or self._pending or self._completed
+                         or self.worker.cancel_event.is_set()))
+
+    def show_angle_joint(self):
+        row = self.plan['outcomes'][self.angle_index]
+        self.guide.set_outcome(row)
+        self.current_joint.setText(f'{self.angle_index + 1}/{len(self.plan["outcomes"])} · {joint_title(row["joint"])}')
+        side = {'lower': '下限', 'upper': '上限', 'center': '零位'}[row['direction']]
+        self.reference.setText(f'{row["joint"]}\n{side}参考 {math.degrees(row["requested_rad"]):+.2f}°')
+        self.reference.setToolTip('')
+        self.angle_input.clear()
+
+    def move_angle(self, step):
+        self.angle_index = max(0, min(self.angle_index + step, len(self.plan['outcomes']) - 1))
+        self.show_angle_joint()
+        self.refresh()
+
+    def set_six_check_columns(self, labels):
+        if self.table.columnCount() != 6:
+            self.table.setColumnCount(6)
+            for column in (1, 3):
+                self.table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.Interactive)
+            for column in (2, 3, 4):
+                self.table.horizontalHeaderItem(column).setToolTip('')
+        self.table.setHorizontalHeaderLabels(labels)
+
+    def show_angle_rows(self):
+        count = len(self.plan['outcomes'])
+        self.set_six_check_columns(['关节 / 所选单侧', '参考 °', '实测 °', '偏差 °', '记录', '次数'])
+        self.table.setRowCount(count)
+        recorded = {}
+        for measurement in self.angles.records:
+            joint = measurement['joint']
+            recorded[joint] = (measurement, recorded.get(joint, (None, 0))[1] + 1)
+        for index, row in enumerate(self.plan['outcomes']):
+            latest, attempts = recorded.get(row['joint'], (None, 0))
+            self.set_row(index, row, '已记录角度' if latest else 'pending',
+                         {'peak_angle_deg': self.angles.degrees(latest)} if latest else None, attempts)
+        self.progress.setRange(0, count)
+        self.progress.setValue(len(recorded))
+        self.progress.setFormat(f'{len(recorded)}/{count} 已记录角度')
+
+    def refresh_angle(self, available):
+        if self.auto_mode:
+            if self.auto_latest is not None and time.monotonic() - self.auto_latest[2] > MAX_ENCODER_FRAME_GAP_S:
+                self.clear_automatic_feedback('等待新的编码器反馈')
+            return
+        row = self.plan['outcomes'][self.angle_index]
+        measurement = self.angles.reading(self.dof.currentData(), row['joint']) if available else None
+        value = self.angles.degrees(measurement) if measurement else None
+        self.values.setText(f'采集端角度 {_number(value, "°", True)}'
+                            + (f' · 偏差 {value - math.degrees(row["requested_rad"]):+.2f}°' if measurement
+                               else ' · 可单独读取下方电机轴角'))
+        self.angle_input.setEnabled(available)
+        self.angle_previous.setEnabled(self.angle_index > 0)
+        has_next = self.angle_index + 1 < len(self.plan['outcomes'])
+        self.angle_next.setEnabled(has_next)
+        self.angle_record.setText('记录角度并继续' if has_next else '记录角度')
+        manual = self.angle_input.text().strip()
+        self.angle_record.setEnabled(available and (
+            self.angle_input.hasAcceptableInput() if manual else measurement is not None))
+        self.encoder_motor.setEnabled(available and self.encoder_query is None and self.auto_query is None)
+        self.encoder_read.setEnabled(available and self.encoder_query is None and self.auto_query is None
+                                     and self.encoder_motor.currentData() is not None)
+
+    def toggle_angle_mode(self):
+        self.auto_mode = not self.auto_mode
+        self.angle_panel.setVisible(not self.auto_mode)
+        self.angle_mode_button.setText('单次读取与人工记录' if self.auto_mode else '继续自动角度检查')
+        self.auto_check.clear_site_confirmation()
+        self.clear_automatic_feedback('', discard_inflight=True)
+        if self.auto_mode:
+            self.auto_timer.start()
+            self.poll_automatic_angle()
+        else:
+            self.auto_timer.stop()
+            self.conditions.setText('可读取电机轴角，或录入量角工具的实测角度。')
+            self.show_angle_rows()
+            self.show_angle_joint()
+        self.refresh()
+
+    def poll_automatic_angle(self):
+        if not self.auto_mode or not self.angle_ready() or self.auto_query or self.encoder_query:
+            return
+        report = self.auto_check.report()
+        index = report['current_index']
+        if index is None or report['paused']:
+            return
+        joint = self.plan['outcomes'][index]['joint']
+        request_id = str(uuid4())
+        try:
+            if self.send({'command': 'read_joint_encoders', 'joint': joint, 'request_id': request_id}):
+                self.auto_query = (request_id, joint)
+                self.auto_sent_at = time.monotonic()
+        except ValueError as error:
+            self.invalidate(str(error))
+
+    def angle_site_changed(self, checked):
+        if self.auto_check is not None and not checked:
+            self.auto_check.clear_site_confirmation()
+            self.clear_automatic_feedback('', discard_inflight=True)
+
+    def clear_automatic_feedback(self, reason, *, discard_inflight=False):
+        if discard_inflight:
+            # Drain the reply before sending another request, but drop its measurement.
+            self.auto_sent_at = None
+        self.auto_latest = None
+        self.auto_error = reason
+        if self.auto_check is not None:
+            self.auto_check.invalidate()
+        if self.auto_mode:
+            self.render_automatic_angle()
+
+    def receive_automatic_angle(self, event):
+        if self.auto_query != (event['request_id'], event['joint']):
+            return
+        sent_at = self.auto_sent_at
+        self.auto_query = self.auto_sent_at = None
+        if sent_at is None or not self.auto_mode or not self.angle_ready():
+            return
+        try:
+            self.launch_context()
+        except ValueError as error:
+            self.invalidate(str(error))
+            return
+        if time.monotonic() - sent_at > .65:
+            self.clear_automatic_feedback('反馈已过期，等待新的编码器读数。')
+            return
+        before = self.auto_check.report()
+        index = before['current_index']
+        if index is None or self.plan['outcomes'][index]['joint'] != event['joint'] or before['paused']:
+            return
+        if event['position_rad'] is None:
+            self.clear_automatic_feedback(event['error'])
+            return
+        samples = event['samples']
+        stamp = min(sample['rx_monotonic_ns'] for sample in samples)
+        if self.auto_last_stamp is not None and stamp <= self.auto_last_stamp:
+            self.clear_automatic_feedback('反馈时间没有更新，等待新样本。')
+            return
+        self.auto_last_stamp = stamp
+        self.auto_latest = (event['joint'], event['position_rad'], time.monotonic())
+        self.auto_error = ''
+        if self.site_ready.isChecked():
+            report = self.auto_check.feed(event['joint'], event['position_rad'], stamp, {'samples': samples})
+            if report['current_index'] != index:
+                self.auto_latest = None
+                self.status.setText(f'{joint_title(event["joint"])}角度达标，继续检查。'
+                                    if report['current_index'] is not None else '本轮角度检查已完成。')
+                if report['current_index'] is None:
+                    self.persist_automatic_angles()
+        else:
+            self.auto_check.invalidate()
+        self.render_automatic_angle()
+
+    def render_automatic_angle(self):
+        report = self.auto_check.report()
+        current, index = report['current'], report['current_index']
+        failed = report['phase'] == 'failed'
+        current_angle = None
+        if not failed and current and self.auto_latest and self.auto_latest[0] == current['joint']:
+            current_angle = math.degrees(self.auto_latest[1])
+        pending_angle = self.auto_check.engine.target_not_reached_angle()
+        count = len(report['results'])
+        if self.table.columnCount() != 7:
+            self.table.setColumnCount(7)
+            self.table.setHorizontalHeaderLabels(['关节 / 所选单侧', '参考 °', '当前角度 °', '记录角度 °',
+                                                  '记录偏差 °', '角度检查', '次数'])
+            for column in (1, 3, 6):
+                self.table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+            self.table.horizontalHeaderItem(2).setToolTip('当前关节最新有效的编码器读数。')
+            self.table.horizontalHeaderItem(3).setToolTip('达标或超限时采用的实测角度。待记为本次最接近目标的角度，确认未达目标后保存。')
+            self.table.horizontalHeaderItem(4).setToolTip('记录角度减去参考角度。')
+        self.table.setRowCount(count)
+        for row in report['results']:
+            attempts = row['attempts']
+            attempt = attempts[-1] if attempts else None
+            is_current = row['index'] == index
+            pending_record = is_current and pending_angle is not None
+            recorded = pending_angle if pending_record else None
+            if row['status'] == 'failed':
+                recorded = attempt['peak_angle_deg']
+            elif row['status'] == 'passed':
+                recorded = attempt['current_angle_deg']
+            label = {'passed': '角度达标', 'failed': '角度超限'}.get(row['status'], row['status'])
+            if row['status'] == 'failed' and 'failure_confirmation' in attempt:
+                label = '未达目标' if attempt.get('reason') == 'operator_target_not_reached' else '不合格'
+            self.set_row(row['index'], row, label, {'peak_angle_deg': recorded}, len(attempts),
+                         current_angle=current_angle if is_current else None, pending_record=pending_record)
+        done = sum(row['status'] == 'passed' for row in report['results'])
+        self.progress.setRange(0, count)
+        self.progress.setValue(done)
+        self.progress.setFormat(f'{done}/{count} 角度达标')
+        if index is None:
+            self.show_current(None, None)
+            failed_count = sum(row['status'] == 'failed' for row in report['results'])
+            skipped_count = sum(row['status'] == 'skipped' for row in report['results'])
+            self.conditions.setText(f'本轮已结束。达标 {done} 项，不合格 {failed_count} 项，跳过 {skipped_count} 项。')
+            return
+        if self.angle_index != index or not self.current_joint.text().startswith(f'{index + 1}/'):
+            self.angle_index = index
+            self.show_angle_joint()
+        row = self.plan['outcomes'][index]
+        ref = math.degrees(row['requested_rad'])
+        angle = current['peak_angle_deg'] if failed else current_angle
+        label = '超限时实测角度' if failed else '当前角度'
+        self.values.setText(f'{label} {_number(angle, "°", True)}'
+                            + (f' · 偏差 {angle - ref:+.2f}°' if angle is not None else ''))
+        if failed:
+            note = '本项角度超限。可记录不合格并继续，或选中该关节重测。'
+        elif self.auto_error:
+            note = self.auto_error
+        elif not self.site_ready.isChecked():
+            note = '正在刷新角度。请在「连接与参数」核对现场条件和关节对应关系，随后自动判定。'
+        elif row.get('pin_confirm_required') and (current or {}).get('pin_confirmed_at_s') is None:
+            note = '插好腰部定位销后，点击「销钉已插好，开始检查」。'
+        elif report['paused']:
+            note = '角度检查已暂停。'
+        else:
+            hold = row.get('pin_hold_s') or report['options']['hold_s']
+            note = f'编码器角度按当前 deploy 配置换算 · 连续稳定 {(current or {}).get("stable_elapsed_s", 0):.2f} / {hold:.2f} 秒'
+            if pending_angle is not None:
+                note += f' · 本次最接近目标 {pending_angle:+.2f}°'
+        self.conditions.setText(note)
+
+    def reset_encoder_display(self):
+        self.encoder_value.setToolTip('')
+        self.encoder_value.setText('选择总线和 ID 后读取。' if self.encoder_motor.currentData() is None else '等待读取。')
+        self.refresh()
+
+    def populate_encoder_motors(self):
+        selected = self.encoder_motor.currentData()
+        self.encoder_motor.blockSignals(True)
+        self.encoder_motor.clear()
+        self.encoder_motor.addItem('选择总线 / ID', None)
+        for motor in self.metadata['motors']:
+            self.encoder_motor.addItem(f'{motor["interface"]} / ID {motor["motor_id"]}', motor['index'])
+        self.encoder_motor.setCurrentIndex(max(0, self.encoder_motor.findData(selected)))
+        self.encoder_motor.blockSignals(False)
+        self.reset_encoder_display()
+
+    def read_encoder(self):
+        self.refresh()
+        if not self.angle_view or self.auto_mode or not self.encoder_read.isEnabled():
+            return
+        index = self.encoder_motor.currentData()
+        request_id = str(uuid4())
+        if self.send({'command': 'read_encoder', 'index': index, 'request_id': request_id}):
+            self.encoder_query = (request_id, index)
+            self.encoder_value.setText('正在读取编码器…')
+            self.refresh()
+
+    def receive_encoder(self, event):
+        if (not self.angle_view or self.metadata is None
+                or self.encoder_query != (event['request_id'], event['index'])):
+            return
+        self.encoder_query = None
+        motor = self.metadata['motors'][event['index']]
+        if (event['interface'], event['motor_id']) != (motor['interface'], motor['motor_id']):
+            self.encoder_value.setText('返回的总线或电机 ID 与所选地址不符。')
+            return
+        if event['status'] == 'fresh':
+            evidence = {key: value for key, value in event.items() if key not in ('type', 'source_kind', 'session_id')}
+            self.angles.encoder_samples.append({'source': 'lro_position_query', **evidence})
+            received = datetime.fromisoformat(event['received_at'].replace('Z', '+00:00')).astimezone()
+            self.encoder_value.setText(f'实测轴角 {event["angle_deg"]:+.2f}° · {received:%H:%M:%S}')
+            self.encoder_value.setToolTip(event['received_at'])
+        else:
+            reason = event.get('message') or {'timeout': '电机未应答', 'fault': '电机返回异常状态'}.get(
+                event['status'], '未收到有效位置')
+            self.encoder_value.setText(f'轴角未知 · {reason}')
+
+    def capture_angle(self):
+        self.refresh()
+        if self.auto_mode or not self.angle_record.isEnabled():
+            return
+        row = self.plan['outcomes'][self.angle_index]
+        manual = self.angle_input.text().strip()
+        measurement = ({'source': 'manual_angle_gauge', 'position_deg': float(manual)} if manual
+                       else self.angles.reading(self.dof.currentData(), row['joint']))
+        if measurement is None:
+            self.refresh()
+            return
+        record = self.angles.capture(row, measurement)
+        self.show_angle_rows()
+        self.status.setText(f'已记录{joint_title(row["joint"])}，偏差 {record["difference_deg"]:+.2f}°。')
+        self.move_angle(1)
+
     def refresh(self, *_):
         active = self.active()
+        connection_error = ''
         try:
             self.launch_context()
             valid = True
         except ValueError as error:
             valid = False
+            connection_error = str(error)
             if active and not self._invalidated:
-                self.invalidate(str(error))
+                self.invalidate(connection_error)
+        metadata = self.metadata or {}
+        mapping_ready = metadata.get('calibration_check_ready') is True
+        angle_ready = valid and self.angle_ready()
+        mapping_reason = (metadata.get('calibration_check_reason') or '未收到关节映射核对结果。') if not mapping_ready else ''
         enabled = active and self.state == 'enabled' and not self._pending
         manual_active = self._manual_live and self.report is not None
         interrupted = bool(self.report and self.report.get('interruption_reason'))
         self.connect_button.setEnabled(valid and not active and bool(self.password.text()))
         self.disconnect_button.setEnabled(active and self.state != 'stopping')
-        self.enable_button.setEnabled(valid and active and self.metadata is not None and self.state in ('ready', 'disabled')
-                                      and self.site_ready.isChecked() and not self._pending)
+        self.enable_button.setEnabled(valid and active and mapping_ready and self.state in ('ready', 'disabled')
+                                      and self.site_ready.isChecked() and not (self._pending or self.angle_view))
+        self.enable_button.setToolTip(mapping_reason)
         self.enable_button.setText(f'使能 · Kd {self.damping.value():.2f}')
         self.disable_button.setEnabled(enabled)
-        self.start_button.setEnabled(valid and enabled and self.site_ready.isChecked() and self.reference_ready.isChecked()
-                                     and (self.metadata or {}).get('calibration_check_ready') is True
-                                     and (not manual_active or self.report.get('phase') == 'complete') and not self._awaiting_manual)
-        self.pause_button.setEnabled(valid and enabled and manual_active and not interrupted
-                                    and self.report.get('phase') not in ('complete', 'failed'))
-        self.pause_button.setText('继续人工检查' if self.report and self.report.get('paused') else '暂停检查')
-        self.retest_button.setEnabled(valid and enabled and manual_active and not interrupted
-                                     and (self.report.get('paused') is True or self.report.get('phase') == 'complete'))
-        self.skip_button.setEnabled(valid and enabled and manual_active and not interrupted and self.report.get('current_index') is not None)
-        current = self.report.get('current') if self.report else None
-        pin_active = bool(current and current.get('check_mode') == 'pin_zero' and current.get('status') == 'active')
-        self.pin_confirm_button.setVisible(pin_active)
-        self.pin_confirm_button.setEnabled(valid and enabled and manual_active and not interrupted and pin_active
-                                           and not self.report.get('paused') and current.get('pin_confirmed_at_s') is None
-                                           and not self._pin_confirmation_pending)
+        self.start_button.setEnabled((angle_ready and not self.angle_view) or (
+            valid and enabled and self.site_ready.isChecked() and self.reference_ready.isChecked() and mapping_ready
+            and (not manual_active or self.report.get('phase') == 'complete') and not self._awaiting_manual))
+        next_step = ''
+        if not self._failure_reason and not self._completed:
+            if connection_error:
+                next_step = connection_error
+            elif not active:
+                next_step = '点击“连接并核对”，自动检查机器人版本和关节映射。'
+            elif self.state == 'connecting' or self.metadata is None:
+                next_step = '正在核对机器人版本和关节映射。'
+            elif angle_ready:
+                next_step = '' if self.angle_view else '连接核对完成。点击“开始人工逐关节检查”查看并记录角度。'
+            elif not mapping_ready:
+                next_step = f'电机使能待核对。{mapping_reason}'
+            elif self.enable_button.isEnabled():
+                next_step = '版本核对通过。点击“使能”。'
+            elif self.state in ('ready', 'disabled') and not self._pending:
+                next_step = '版本核对通过。请在“连接与参数”中确认现场条件。'
+            elif self.start_button.isEnabled():
+                next_step = '已使能。点击“开始人工逐关节检查”。'
+        if self.readiness.text() != next_step:
+            self.readiness.setText(next_step)
+        self.readiness.setVisible(bool(next_step))
+        for button in (self.enable_button, self.disable_button, self.start_button):
+            button.setVisible(not self.angle_view)
+        for button in (self.pause_button, self.retest_button):
+            button.setVisible(self.auto_mode or not self.angle_view)
+        auto_failed = False
+        endpoint = can_record_unreached = False
+        if self.auto_mode:
+            scan = self.auto_check.report()
+            current = scan['current'] or {}
+            current_open = scan['current_index'] is not None
+            paused = scan['paused']
+            auto_failed = scan['phase'] == 'failed'
+            endpoint = current.get('status') == 'active' and current.get('direction') in ('lower', 'upper')
+            fresh = (self.auto_latest is not None and self.auto_latest[0] == current.get('joint')
+                     and time.monotonic() - self.auto_latest[2] <= MAX_ENCODER_FRAME_GAP_S)
+            can_record_unreached = (endpoint and angle_ready and self.site_ready.isChecked() and fresh
+                                    and self.auto_check.can_mark_target_not_reached())
+            self.pause_button.setEnabled(angle_ready and current_open and not auto_failed)
+            self.skip_button.setEnabled(angle_ready and current_open and not auto_failed)
+            self.retest_button.setEnabled(angle_ready and (paused or scan['phase'] == 'complete'))
+            pin_pending = (current.get('pin_confirm_required') is True
+                           and current.get('pin_confirmed_at_s') is None)
+            self.pin_confirm_button.setVisible(pin_pending)
+            self.pin_confirm_button.setEnabled(angle_ready and self.site_ready.isChecked() and pin_pending
+                                               and not paused and not self.auto_check.pin_confirmation_pending)
+        else:
+            report = self.report or {}
+            paused = report.get('paused') is True
+            manual_ready = valid and enabled and manual_active and not interrupted
+            phase = report.get('phase')
+            self.pause_button.setEnabled(manual_ready and phase not in ('complete', 'failed'))
+            self.retest_button.setEnabled(manual_ready and (paused or phase == 'complete'))
+            self.skip_button.setEnabled(manual_ready and report.get('current_index') is not None)
+            current = report.get('current') or {}
+            pin_active = current.get('check_mode') == 'pin_zero' and current.get('status') == 'active'
+            self.pin_confirm_button.setVisible(pin_active)
+            self.pin_confirm_button.setEnabled(manual_ready and pin_active and not paused
+                                               and current.get('pin_confirmed_at_s') is None
+                                               and not self._pin_confirmation_pending)
+        self.skip_button.setVisible(not self.angle_view or (self.auto_mode and not auto_failed))
+        self.unreached_button.setVisible(endpoint)
+        self.unreached_button.setEnabled(can_record_unreached)
+        self.continue_failed_button.setVisible(auto_failed)
+        self.continue_failed_button.setEnabled(angle_ready and auto_failed)
+        self.pause_button.setText('继续人工检查' if paused else '暂停检查')
         self.stop_button.setEnabled(active)
-        self.export_button.setEnabled(self.report is not None)
+        self.stop_button.setText('结束检查并断开' if self.angle_view else '停止并失能')
+        self.export_button.setText('导出角度记录…' if self.angle_view else '另存本轮 JSON')
+        automatic = self.auto_check if self.angle_view else None
+        self.save_to_results_button.setVisible(automatic is not None)
+        self.save_to_results_button.setEnabled(bool(self.angle_sn and automatic and automatic.evidence_count
+                                                   and not self._angle_report_pending))
+        self.save_to_results_button.setToolTip(f'归档到本轮开始时选定的 SN：{self.angle_sn}' if self.angle_sn else
+                                             '从整机测试选好 SN 后进入 SYS-006 标定检查。')
+        self.export_button.setEnabled(bool(self.angles.records or self.angles.encoder_samples
+                                          or (automatic and automatic.evidence_count))
+                                      if self.angle_view else self.report is not None)
+        if self.angle_view:
+            self.refresh_angle(angle_ready)
         self.damping.setEnabled(not self._pending and (not active or self.state in ('ready', 'disabled')))
-        self.dof.setEnabled(not active and self.report is None)
-        editable = (not manual_active or self.report.get('phase') == 'complete') and not self._awaiting_manual
+        self.dof.setEnabled(not active and self.report is None and automatic is None
+                            and not (self.angles and self.angles.records))
+        editable = ((not manual_active or self.report.get('phase') == 'complete')
+                    and not self._awaiting_manual and not (self.angle_view and self.auto_check is not None))
         self.hold_s.setEnabled(editable)
         self.position_span.setEnabled(editable)
         self.setup_toggle.setText(f'连接与参数 · Kd {self.damping.value():.2f} · 稳定 {self.hold_s.value():g}s / {self.position_span.value():g}°（点击展开/收起）')
-        if self.report is not None and not self._manual_live and not self.current_joint.text().startswith('上轮记录'):
+        if self.report is not None and not self.angle_view and not self._manual_live and not self.current_joint.text().startswith('上轮记录'):
             self.current_joint.setText('上轮记录 · ' + self.current_joint.text())
         if active and manual_active and not self._failure_reason and time.monotonic()-self._last_report_at > 1:
             self.status.setText('电脑已超过1秒未收到新报告，当前为最后记录；不推断继续合格。')
@@ -396,6 +858,22 @@ class ManualCalibrationDialog(QDialog):
         if not self.connect_button.isEnabled():
             return
         connection = self.launch_context()
+        self.encoder_query = None
+        self.auto_query = None
+        if self.angle_view:
+            self.angle_view = False
+            self.auto_mode = False
+            self.auto_timer.stop()
+            self.angle_mode_button.hide()
+            self.angle_panel.hide()
+            self.powered_measurement_note.show()
+            self.powered_review_note.show()
+            self.set_six_check_columns(['关节 / 所选单侧', '参考 °', '实测峰值 °', '偏差 °', '结果', '轮次'])
+            if self.report is None:
+                self.load_plan()
+                self.progress.reset()
+            else:
+                self.show_powered_report(self.report)
         if self.worker is not None:
             self.worker.deleteLater()
         self.session_id = str(uuid4())
@@ -441,6 +919,37 @@ class ManualCalibrationDialog(QDialog):
         self.refresh()
         if not self.start_button.isEnabled():
             return
+        if self.angle_ready():
+            self.angle_view = True
+            self._angle_save_path = None
+            self.angle_index = min(self.angle_index, len(self.plan['outcomes']) - 1)
+            self.auto_check = (EncoderAngleCheck(self.plan, hold_s=self.hold_s.value(),
+                                                 position_span_deg=self.position_span.value())
+                               if self.metadata.get('encoder_observation_ready') is True else None)
+            self.auto_mode = self.auto_check is not None
+            self.check_started.emit({'kind': 'angle_observations', 'robot_id': self.initial_identity[0],
+                                     'source_kind': self.initial_identity[1]})
+            self.auto_latest, self.auto_last_stamp, self.auto_error = None, None, ''
+            self.setup_toggle.setChecked(self.auto_mode and not self.site_ready.isChecked())
+            self.angle_panel.show()
+            self.angle_panel.setVisible(not self.auto_mode)
+            self.angle_mode_button.setVisible(self.auto_mode)
+            self.angle_mode_button.setText('单次读取与人工记录')
+            self.powered_measurement_note.hide()
+            self.powered_review_note.hide()
+            self.conditions.setText('采集角度和人工实测值可用于角度复核。')
+            self.save_status.setText(f'本轮报告归档 SN：{self.angle_sn}。' if self.auto_mode and self.angle_sn else
+                                     '需要留档时点击“导出角度记录”。')
+            self.show_angle_rows()
+            self.show_angle_joint()
+            self.populate_encoder_motors()
+            self.status.setText('正在逐项检查角度。')
+            if self.auto_mode:
+                self.render_automatic_angle()
+                self.auto_timer.start()
+                self.poll_automatic_angle()
+            self.refresh()
+            return
         self.persist(force=True)
         self._factory_saved_signature = None
         self.check_started.emit({'robot_id': self.initial_identity[0], 'source_kind': self.initial_identity[1]})
@@ -455,21 +964,83 @@ class ManualCalibrationDialog(QDialog):
     def pause_check(self):
         self.refresh()
         if self.pause_button.isEnabled():
+            if self.auto_mode:
+                self.auto_check.pin_confirmation_pending = False
+                self.auto_check.engine.pause(not self.auto_check.report()['paused'])
+                self.clear_automatic_feedback('', discard_inflight=True)
+                self.refresh()
+                return
             self.send({'command': 'manual_pause', 'paused': not self.report.get('paused', False)})
 
     def retest_selected(self):
         self.refresh()
         index = self.table.currentRow()
         if self.retest_button.isEnabled() and 0 <= index < len(self.plan['outcomes']):
+            if self.auto_mode:
+                self.auto_check.retest(index)
+                self.clear_automatic_feedback('', discard_inflight=True)
+                self.refresh()
+                return
             self.send({'command': 'manual_retest', 'index': index})
 
+    def remember_skip_target(self):
+        self._skip_target = self.auto_check.report()['current_index'] if self.auto_mode else None
+
     def skip_current(self):
+        target, self._skip_target = self._skip_target, None
         self.refresh()
         if self.skip_button.isEnabled():
+            if self.auto_mode:
+                if target is not None and self.auto_check.report()['current_index'] != target:
+                    return
+                report = self.auto_check.skip()
+                self.clear_automatic_feedback('', discard_inflight=True)
+                if report['current_index'] is None:
+                    self.persist_automatic_angles()
+                self.refresh()
+                return
             self.send({'command': 'manual_skip'})
+
+    def continue_failed_angle(self):
+        self.refresh()
+        if not self.continue_failed_button.isEnabled():
+            return
+        joint = self.auto_check.report()['current']['joint']
+        report = self.auto_check.engine.continue_failed()
+        self.finish_angle_failure(joint, report, '不合格')
+
+    def remember_unreached_target(self):
+        current = self.auto_check.report()['current'] if self.auto_mode else None
+        self._unreached_target = (current['index'], current['attempt_id']) if current else None
+
+    def record_unreached_angle(self):
+        target, self._unreached_target = self._unreached_target, None
+        self.refresh()
+        if not self.unreached_button.isEnabled():
+            return
+        current = self.auto_check.report()['current']
+        if target != (current['index'], current['attempt_id']):
+            return
+        report = self.auto_check.mark_target_not_reached()
+        self.finish_angle_failure(current['joint'], report, '不合格（未达目标）')
+
+    def finish_angle_failure(self, joint, report, result):
+        self.clear_automatic_feedback('', discard_inflight=True)
+        self._angle_save_path = self.directory / f'angles-{self.session_id}.json'
+        self.persist_automatic_angles()
+        next_step = '本轮检查已结束。' if report['current_index'] is None else '继续检查。'
+        self.status.setText(f'{joint_title(joint)}已记录{result}。{next_step}')
+        self.refresh()
 
     def confirm_pin(self):
         self.refresh()
+        if self.auto_mode:
+            if self.pin_confirm_button.isEnabled():
+                self.auto_check.confirm_pin()
+                self.auto_sent_at = None
+                self.status.setText('已确认销钉，等待下一帧开始计时。')
+                self.refresh()
+            return
         if self.pin_confirm_button.isEnabled() and self.send({'command': 'manual_confirm_pin'}):
             self._pin_confirmation_pending = True
             self.status.setText('已确认销钉，等待确认后的新角度反馈。')
@@ -483,6 +1054,12 @@ class ManualCalibrationDialog(QDialog):
 
     def stop_and_disable(self):
         if self.active():
+            if self.angle_view:
+                self.worker.stop()
+                self.state, self._pending = 'stopping', True
+                self.status.setText('正在结束角度检查连接。')
+                self.refresh()
+                return
             self._terminal_reason = '用户请求停止并失能，报告仅覆盖最后收到的数据'
             self.persist(force=True)
             self.worker.stop()
@@ -524,6 +1101,10 @@ class ManualCalibrationDialog(QDialog):
                 self._manual_live = False
                 self._awaiting_manual = False
                 self.status.setText('控制会话就绪，尚未使能。' if self.state == 'ready' else '已请求失能；物理状态请现场确认。')
+        elif kind == 'encoder_position':
+            self.receive_encoder(event)
+        elif kind == 'joint_encoder_positions':
+            self.receive_automatic_angle(event)
         elif kind == 'enable_diagnostics':
             lines = [str(event.get('message') or '使能确认失败；请查看具体总线/ID与原始反馈。')]
             for row in event.get('motors', []):
@@ -569,16 +1150,7 @@ class ManualCalibrationDialog(QDialog):
             self.run_id, self.report = run_id, report
             self.last_event = json.loads(json.dumps(event, allow_nan=False))
             self._enabled_kd = event.get('damping_kd', self._enabled_kd)
-            for index, row in enumerate(report['results']):
-                attempts = row.get('attempts') or []
-                attempt = next((a for a in reversed(attempts) if a.get('attempt_id') == row.get('effective_attempt_id')), None)
-                self.set_row(index, row, row['status'], attempt, len(attempts))
-            self.show_current(report.get('current'), report.get('current_index'))
-            count = len(self.plan['outcomes'])
-            self.progress.setRange(0, count)
-            done = sum(row['status'] in ('passed', 'failed', 'skipped') for row in report['results'])
-            self.progress.setValue(done)
-            self.progress.setFormat(f'{done}/{count} 已记录')
+            self.show_powered_report(report)
             self.status.setText(_PHASES.get(report.get('phase'), str(report.get('phase'))))
             if not self._failure_reason:
                 if report.get('phase') == 'failed':
@@ -597,10 +1169,25 @@ class ManualCalibrationDialog(QDialog):
             self.on_error(event.get('message') or '控制端报告异常')
         elif kind == 'complete':
             self._completed = True
-            self._terminal_reason = event.get('reason') or '控制会话结束'
-            self.persist(force=True)
-            self.status.setText('控制会话结束；' + ('已向SDK提交失能指令，物理停止请现场确认。' if event.get('disable_sent') else '未收到完整失能执行回执，请现场确认。'))
+            if self.angle_view:
+                self.status.setText('角度检查连接已结束。')
+            else:
+                self._terminal_reason = event.get('reason') or '控制会话结束'
+                self.persist(force=True)
+                self.status.setText('控制会话结束；' + ('已向SDK提交失能指令，物理停止请现场确认。' if event.get('disable_sent') else '未收到完整失能执行回执，请现场确认。'))
         self.refresh()
+
+    def show_powered_report(self, report):
+        for index, row in enumerate(report['results']):
+            attempts = row.get('attempts') or []
+            attempt = next((a for a in reversed(attempts) if a.get('attempt_id') == row.get('effective_attempt_id')), None)
+            self.set_row(index, row, row['status'], attempt, len(attempts))
+        self.show_current(report.get('current'), report.get('current_index'))
+        count = len(self.plan['outcomes'])
+        self.progress.setRange(0, count)
+        done = sum(row['status'] in ('passed', 'failed', 'skipped') for row in report['results'])
+        self.progress.setValue(done)
+        self.progress.setFormat(f'{done}/{count} 已记录')
 
     def payload(self):
         return {'schema_version': 1, 'run_id': self.run_id, 'robot_id': self.initial_identity[0],
@@ -654,7 +1241,51 @@ class ManualCalibrationDialog(QDialog):
                 self._factory_saved_signature = signature
                 self.check_saved.emit({'path': str(path), 'robot_id': self.initial_identity[0], 'run_id': self.run_id})
 
+    def persist_automatic_angles(self):
+        path = self._angle_save_path
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.angles.export(path, self.angle_sn, self.dof.currentData(),
+                               automatic=self.auto_check, run_id=self.session_id)
+        except (OSError, ValueError) as error:
+            self.save_status.setText(f'角度记录保存失败，可另行导出。{error}')
+        else:
+            self.save_status.setText(f'本轮角度记录已保存到电脑：{path}')
+
+    def save_angles_to_results(self):
+        if not self.save_to_results_button.isEnabled():
+            return
+        data = self.angles.payload(self.angle_sn, self.dof.currentData(),
+                                   automatic=self.auto_check, run_id=self.session_id)
+        self._angle_report_pending = self.session_id
+        self.save_status.setText(f'正在保存本轮角度记录到 SN：{self.angle_sn}。')
+        self.refresh()
+        self.check_saved.emit(data)
+
+    def angle_report_finished(self, run_id, message):
+        if self._angle_report_pending != run_id:
+            return
+        self._angle_report_pending = None
+        if self.session_id == run_id:
+            self.save_status.setText(message)
+        self.refresh()
+
     def export_report(self):
+        if self.angle_view:
+            path, _ = QFileDialog.getSaveFileName(self, '导出角度记录', 'angle-observations.json', 'JSON (*.json)')
+            if path:
+                try:
+                    self.angles.export(path, self.angle_sn, self.dof.currentData(),
+                                       automatic=self.auto_check, run_id=self.session_id)
+                except (OSError, ValueError) as error:
+                    self.save_status.setText(f'导出角度记录失败：{error}')
+                else:
+                    automatic_count = self.auto_check.evidence_count if self.auto_check else 0
+                    count = len(self.angles.records) + len(self.angles.encoder_samples) + automatic_count
+                    self.save_status.setText(f'已导出 {count} 条角度记录：{path}')
+            return
         if self.report is None:
             return
         path, _ = QFileDialog.getSaveFileName(self, '另存人工检查结果', 'manual-calibration-check.json', 'JSON (*.json)')
@@ -680,10 +1311,21 @@ class ManualCalibrationDialog(QDialog):
         self.refresh()
 
     def session_finished(self):
+        self.encoder_query = None
+        self.auto_query = None
+        self.auto_timer.stop()
+        if self.auto_mode:
+            self.auto_latest = None
+            self.auto_error = '角度检查连接已断开。'
+            self.render_automatic_angle()
+        self.persist_automatic_angles()
         if not self._completed:
-            self._terminal_reason = self._terminal_reason or '连接已断开，未收到完整结束回执；报告只覆盖最后收到的数据'
-            self.persist(force=True)
-            self.status.setText(self._terminal_reason + '；请现场确认失能。')
+            if self.angle_view:
+                self.status.setText('角度检查连接已断开，仍可导出已有记录。')
+            else:
+                self._terminal_reason = self._terminal_reason or '连接已断开，未收到完整结束回执；报告只覆盖最后收到的数据'
+                self.persist(force=True)
+                self.status.setText(self._terminal_reason + '；请现场确认失能。')
         self.state, self._pending = 'disconnected', False
         self._manual_live = self._awaiting_manual = False
         self.metadata = None

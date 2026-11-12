@@ -1,7 +1,5 @@
 """Factory case navigation, reusing the panel's existing tools and records."""
 
-import time
-
 from PySide6.QtCore import QSignalBlocker, QSize, Qt
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
@@ -55,28 +53,31 @@ _SHORT_NAMES = {
 }
 _DESCRIPTIONS = {
     "SYS-001": "打开现有硬件自检工具。17项检查逐项归档到当前SN。",
-    "SYS-002": "按原流程点亮灯板，在这里记录现场实际观察。",
-    "SYS-003": "使用现有电机检查工具读取固件版本，结果保存到当前SN。",
-    "SYS-004": "先检查实际与期望编码范围，再选择需要更新的电机。",
+    "SYS-002": "通过当前实机的后台连接点亮灯板，再记录现场观察。",
+    "SYS-003": "在电机维护页读取固件版本，记录保存到当前SN。",
+    "SYS-004": "核对官网 MIT 量程和参数脚本的扩展项，选择电机后可确认更新差异。",
     "SYS-012": "现场完成远程急停开关对频后，直接记录是否通过。",
     "SYS-005": "保留现有标零工具，完成操作后返回当前SN确认流程状态。",
-    "SYS-006": "使用现有标定检查工具，逐关节结果自动关联开始时选定的SN。",
+    "SYS-006": "按官网配置复查标零位，或打开原有对侧行程检查。结果保存到当前SN。",
     "SYS-007": "由人员操作独立急停遥控器，完成后确认现场测试结果。",
-    "SYS-008": "开始换电并监听SOC，保存变化截图，再确认主控与通信状态。",
-    "SYS-009": "记录站立测试的数据与关键证据，策略由人员在机器人端手动启动。",
-    "SYS-010": "行走、跑步分别记录，保留各自的原始类型与测试时长。",
-    "SYS-011": "24轴使用UFO特技，策略由人员在机器人端手动启动。",
+    "SYS-008": "开始监听SOC，标记第一块电池、小电池和第二块电池，再确认主控与通信状态。",
+    "SYS-009": "站立记录达到2小时；策略由人员在机器人端手动启动。",
+    "SYS-010": "行走、跑步无两小时时长要求，保留各自原始类型与人工结论。",
+    "SYS-011": "24轴使用UFO特技，无两小时时长要求；策略由人员在机器人端手动启动。",
 }
 _HELP = {
     "SYS-001": "在硬件自检页点击“一键执行17项基础自检”。原14项、IMU连续数据、IMU固件版本、BMS重启恢复依次运行，中文逐项结果自动保存。已经完成的自检也可在原工具中关联当前SN。",
-    "SYS-002": "上位机只记录实际观察，不发送灯板控制命令。灯板已亮并不代表其他硬件项目通过。",
-    "SYS-003": "固件版本按实际读取值记录；没有定义允许版本时，不自动判定固件合规。固件与参数共用现有检查窗口。",
-    "SYS-004": "仅更新人员选择且有差异的KP、KD、POS、SPD、TOR编码范围。更新前保存原值，逐项读回；不改ID、零位、CAN超时或其他Pn，不使能、不发送动作。操作前停止deploy、标零及其他电机工具。",
+    "SYS-002": "核对SN与当前连接后点击测试。上位机发送固定RGB点灯命令，收到成功回执后由人员确认灯板实际是否亮起。",
+    "SYS-003": "固件版本按实际读取值记录；没有定义允许版本时，由现场人员确认测试结论。",
+    "SYS-004": "操作前停止 deploy、标零及其他电机工具。更新按型号限定的 KP、KD、POS、SPD、TOR、Kt、CUR、CAN_TIMEOUT 和脚本列出的 Pn 差异，先保存原值，逐项读回。",
     "SYS-012": "本页只保存人员点击的通过／不通过结论，不发送对频、急停或电源命令。",
     "SYS-005": "前往“角度与标定”中的现有标零流程。工具使用设备设置中的主界面连接，跳转只定位入口，不自动执行。返回后确认完成或中断；逐电机写零结果仍需后续标定检查。",
-    "SYS-006": "工具使用设备设置中的主界面连接，跳转不自动执行。腰部插销确认、髋pitch零位及其他关节检查按现有流程进行。逐关节结果在报告中查看；跳过、未测不算合格。也可导入已有检查JSON。",
+    "SYS-006": "标零位复查记录原始编码器角和按官网配置换算的逻辑角。对侧行程检查沿用原参考和操作流程。打开窗口后由人员发起读取，可在当前SN的「查看结果」查看逐关节依据。",
     "SYS-007": "独立急停按钮切断电机电源，主控应保持供电；电机反馈中断不能混同主控掉电。本页只记录人工结论，不发送急停或电源命令；本项不单独要求两小时。",
     "SYS-008": "要求主控全程不断电、无重启，换电后供电、BMS通信及运行正常。允许全程连接网线；SOC变化不能自动证明已换电或通过。缺失、过期不补零，断流标未知；缺少SOC仍可记录人工结论。",
+    "SYS-009": "站立记录达到2小时（7200秒）满足时长要求；结论由人员依据实际测试填写。",
+    "SYS-010": "行走、跑步无两小时时长要求；保留各自原始类型和现场人工结论。",
+    "SYS-011": "特技无两小时时长要求；24轴使用UFO，28轴不适用。现场结论由人员填写。",
 }
 
 
@@ -96,7 +97,6 @@ class FactoryWorkbench(QWidget):
         self.case_items = {}
         self.case_pages = {}
         self.status_labels = {}
-        self.connection_labels = {}
         self.feedback_labels = {}
         self.evidence_labels = {}
         self.motor_confirmation_buttons = {}
@@ -104,6 +104,7 @@ class FactoryWorkbench(QWidget):
         self.motion_slots = {}
         self.catalog = {row["code"]: row for row in test_catalog(host.model.currentData())}
         host.tool_buttons = {}
+        host.motion_export_buttons = []
         host.motion_record_box = record
         record.setParent(self)
         record.hide()
@@ -120,8 +121,14 @@ class FactoryWorkbench(QWidget):
         for button in record.findChildren(QPushButton):
             button.setObjectName("workbenchQuiet")
         host.start_button.setObjectName("workbenchPrimary")
+        host.read_button.setObjectName("workbenchPrimary")
         host.motion_notice.setTextFormat(Qt.TextFormat.PlainText)
-        host.remote_table.setMinimumHeight(160)
+        host.remote_table.setMinimumHeight(96)
+        host.remote_table.setMaximumHeight(132)
+        host.remote_table.verticalHeader().hide()
+        remote_header = host.remote_table.horizontalHeader()
+        remote_header.setStretchLastSection(False)
+        remote_header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -131,7 +138,7 @@ class FactoryWorkbench(QWidget):
         navigation = QFrame()
         navigation.setObjectName("workbenchPane")
         nav_layout = QVBoxLayout(navigation)
-        nav_layout.setContentsMargins(14, 16, 14, 12)
+        nav_layout.setContentsMargins(10, 10, 10, 8)
         nav_layout.addWidget(_label("测试清单", "workbenchSection"))
         self.tree = QTreeWidget()
         self.tree.setObjectName("workbenchTree")
@@ -161,7 +168,7 @@ class FactoryWorkbench(QWidget):
             font = QFont()
             font.setBold(True)
             section.setFont(0, font)
-            section.setSizeHint(0, QSize(0, 42))
+            section.setSizeHint(0, QSize(0, 30))
             self.tree.addTopLevelItem(section)
             for row in self.catalog.values():
                 if row["category"] != category:
@@ -169,7 +176,7 @@ class FactoryWorkbench(QWidget):
                 code = row["code"]
                 item = QTreeWidgetItem([f"{code}  {_SHORT_NAMES.get(code, row['name'])}", "未测"])
                 item.setData(0, Qt.ItemDataRole.UserRole, code)
-                item.setSizeHint(0, QSize(0, 43))
+                item.setSizeHint(0, QSize(0, 32))
                 section.addChild(item)
                 self.case_items[code] = item
                 self._build_page(row)
@@ -211,28 +218,42 @@ class FactoryWorkbench(QWidget):
         top.addWidget(badge)
         self.status_labels[code] = badge
         body.addLayout(top)
-        body.addWidget(_label(row["name"], "workbenchTitle"))
+        title = _label(row["name"], "workbenchTitle")
+        if row["category"] == "MOTION":
+            title_row = QHBoxLayout()
+            title_row.addWidget(title, 1)
+            export_button = self._button(title_row, "导出报告 CSV", lambda: host.result_summary.export())
+            export_button.setEnabled(False)
+            host.motion_export_buttons.append(export_button)
+            body.addLayout(title_row)
+        else:
+            body.addWidget(title)
         body.addWidget(_label(_DESCRIPTIONS[code], "workbenchMuted"))
         actions = QHBoxLayout()
         actions.setSpacing(10)
-        if code in ("SYS-001", "SYS-005", "SYS-006"):
+        if code == "SYS-006":
+            for target, caption in (("zero_reference_check", "标零位复查"), ("calibration_check", "对侧行程检查")):
+                host.tool_buttons[target] = self._button(actions, caption,
+                    lambda _checked=False, route=target, item=row["item"]: host.tool_requested.emit(route, item),
+                    primary=target == "zero_reference_check")
+        elif code in ("SYS-001", "SYS-005"):
             target, caption = {
                 "SYS-001": ("board", "前往基础自检（17项）"),
                 "SYS-005": ("calibration", "前往标定"),
-                "SYS-006": ("calibration_check", "前往标定检查"),
             }[code]
             host.tool_buttons[target] = self._button(actions, caption,
                 lambda _checked=False, route=target, item=row["item"]: host.tool_requested.emit(route, item), primary=True)
         elif code in ("SYS-003", "SYS-004"):
+            section = "firmware" if code == "SYS-003" else "parameters"
             button = self._button(actions,
-                "查看电机固件版本…" if code == "SYS-003" else "SYS-004 · 电机参数检查 / 更新…",
-                host.open_motor_parameters, primary=True)
+                "前往电机固件维护" if section == "firmware" else "前往电机参数检查 / 更新",
+                lambda _checked=False, section=section: host.open_motor_parameters(section), primary=True)
             if code == "SYS-004":
                 host.parameter_button = button
             else:
                 host.firmware_button = button
         elif code == "SYS-002":
-            host.light_confirm_button = self._button(actions, "SYS-002 · 确认灯板是否亮灯", host.confirm_light, primary=True)
+            host.light_confirm_button = self._button(actions, "SYS-002 · 测试灯板", host.test_light, primary=True)
         elif code in ("SYS-007", "SYS-008"):
             key = "remote_estop" if code == "SYS-007" else "battery_hot_swap"
             button = host.functional_buttons[key]
@@ -244,14 +265,10 @@ class FactoryWorkbench(QWidget):
         if row["category"] != "MOTION":
             actions.addStretch()
             body.addLayout(actions)
-        body.addWidget(_label("01 前往测试工具  →  02 在工具内执行  →  03 返回当前SN查看结果"
-            if code in ("SYS-001", "SYS-003", "SYS-004", "SYS-005", "SYS-006")
-            else "01 现场执行测试  →  02 记录实际结果  →  03 查看与导出报告"
-            if row["category"] != "MOTION" else "01 开始记录  →  02 机器人端手动启动策略  →  03 读取与保存数据", "workbenchHint"))
+            body.addWidget(_label("01 前往测试工具  →  02 在工具内执行  →  03 返回当前SN查看结果"
+                if code in ("SYS-001", "SYS-003", "SYS-004", "SYS-005", "SYS-006")
+                else "01 现场执行测试  →  02 记录实际结果  →  03 查看与导出报告", "workbenchHint"))
         if row["category"] == "MOTION":
-            connection = _label("未连接机器人", "workbenchConnection")
-            self.connection_labels[code] = connection
-            body.addWidget(connection)
             if code == "SYS-011":
                 self.stunt_notice = _label("", "workbenchMuted")
                 body.addWidget(self.stunt_notice)
@@ -343,8 +360,10 @@ class FactoryWorkbench(QWidget):
             with QSignalBlocker(host.test_type):
                 host.test_type.setCurrentIndex(host.test_type.findData(desired))
             self.motion_slots[code].addWidget(host.motion_record_box)
-            host.motion_record_box.show()
+            host.motion_type_options.setVisible(code == "SYS-010")
+            host.motion_record_heading.setText(f"本轮{row['name']}记录")
             host.motion_result_button.setText(f"保存{row['name']}测试结果")
+            host.motion_record_box.show()
         self._notice_changed(host.notice.text())
         self.update_model_controls()
         return True
@@ -376,7 +395,8 @@ class FactoryWorkbench(QWidget):
         supported = host.model.currentData() != 28
         self.stunt_notice.setText("24轴使用UFO特技。" if supported else "28轴不适用UFO特技，无需开始记录；已有历史结果仍可查看。")
         enabled = not self._busy and not host.busy and not host.closing
-        host.start_button.setEnabled(enabled and not (self.current_code == "SYS-011" and not supported))
+        if getattr(host, "workbench", None) is self:
+            host.update_motion_controls()
         for button in host.estop_pairing_buttons.values():
             button.setEnabled(enabled and bool(host.sn))
         self._update_confirmation_controls()
@@ -406,7 +426,6 @@ class FactoryWorkbench(QWidget):
             self._report_signature = None
         signature = (self.host.sn, self.host.model.currentData())
         if self._report_signature == signature:
-            self._refresh_connection()
             return
         self._report_signature = signature
         by_code = {row.get("case_code"): row for row in self._rows
@@ -432,6 +451,8 @@ class FactoryWorkbench(QWidget):
                 self.motor_confirmation_labels[code].setText(f"已保存人工结论：{verdict}。" if confirmed else "人工复核：尚未确认。")
             if code in self.evidence_labels:
                 summary = str(row.get("actual_result") or "尚未记录结果。")
+                if row.get("soc_summary"):
+                    summary = row["soc_summary"] + "\n" + summary
                 if not self.host.sn:
                     summary = "请先打开或新建SN，测试结果将保存到该样品。"
                 elif simulated:
@@ -441,28 +462,6 @@ class FactoryWorkbench(QWidget):
                     summary = summary[:260].rstrip() + "… 完整结果在报告中查看。"
                 self.evidence_labels[code].setText(summary)
         self._update_confirmation_controls()
-        self._refresh_connection()
-
-    def _refresh_connection(self):
-        frame = self.host.live_frame
-        received = self.host.live_frame_received
-        if frame is None or received is None:
-            text = "未连接机器人 · 请在设备设置中连接"
-        else:
-            age = time.monotonic() - received
-            robot = getattr(frame, "robot_id", "") if not isinstance(frame, dict) else frame.get("robot_id", "")
-            source = getattr(frame, "source_kind", "") if not isinstance(frame, dict) else frame.get("source_kind", "")
-            upload = getattr(frame, "upload", {}) if not isinstance(frame, dict) else frame.get("upload", {})
-            connected = upload.get("collector_connected") if isinstance(upload, dict) else getattr(upload, "collector_connected", None)
-            if age > 3 or connected is False:
-                text = f"{robot or '机器人'} · 数据已过期，请核对连接"
-            elif source == "simulated":
-                text = f"{robot or '模拟来源'} · SIMULATED 模拟数据，非实机验收"
-            else:
-                text = f"{robot or '机器人'} · 正在接收数据 · ROS2来源仍待实机验收"
-        for label in self.connection_labels.values():
-            if label.text() != text:
-                label.setText(text)
 
 
 _STYLE = """
@@ -476,7 +475,6 @@ QWidget#factoryWorkbench QLabel#workbenchSection { color:#314967;font-weight:600
 QWidget#factoryWorkbench QLabel#workbenchEyebrow { color:#4168d6;font-weight:600;font-size:13px; }
 QWidget#factoryWorkbench QLabel#workbenchMuted { color:#687e9b; }
 QWidget#factoryWorkbench QLabel#workbenchHint { color:#4d6d98;background:#edf3ff;border:1px solid #dbe6fa;border-radius:6px;padding:12px; }
-QWidget#factoryWorkbench QLabel#workbenchConnection { color:#627a96;font-size:12px; }
 QWidget#factoryWorkbench QLabel#workbenchFeedback { color:#3c608b;background:#f3f7fd;border:1px solid #dbe5f4;border-radius:5px;padding:9px; }
 QWidget#factoryWorkbench QLabel#workbenchHelp { color:#617791;padding:5px 12px; }
 QWidget#factoryWorkbench QPushButton#workbenchQuiet { background:white;color:#3f5e87;border:1px solid #cbd8ec;border-radius:5px;padding:7px 14px;font-weight:500; }
@@ -484,7 +482,15 @@ QWidget#factoryWorkbench QPushButton#workbenchQuiet:hover { background:#f0f5fd; 
 QWidget#factoryWorkbench QPushButton#workbenchPrimary { background:#3559e6;color:white;border:1px solid #3559e6;border-radius:5px;padding:7px 16px;font-weight:600; }
 QWidget#factoryWorkbench QPushButton#workbenchPrimary:hover { background:#294bce; }
 QWidget#factoryWorkbench QPushButton:disabled { background:#edf1f7;color:#97a4b6;border-color:#d7e0ed; }
+QWidget#factoryWorkbench QPushButton#workbenchPrimary:disabled, QWidget#factoryWorkbench QPushButton#workbenchQuiet:disabled { background:#edf1f7;color:#62758d;border-color:#d7e0ed; }
 QWidget#factoryWorkbench QPushButton#workbenchDisclosure { background:#f7f9fd;color:#5b7392;border:1px solid #dce5f1;border-radius:5px;text-align:left;padding:10px 13px;font-weight:500; }
 QWidget#factoryWorkbench QGroupBox#workbenchRecord { border:none;background:transparent;margin:0;padding:0; }
+QWidget#factoryWorkbench QWidget#factoryMotionIdentity { background:#f5f8fd;border:1px solid #d7e1ef;border-radius:6px; }
+QWidget#factoryWorkbench QWidget#factoryMotionCard { background:white;border:1px solid #d7e1ef;border-radius:8px; }
+QWidget#factoryWorkbench QLabel#factoryMotionCaption { color:#526b8b;font-size:12px; }
+QWidget#factoryWorkbench QLabel#factoryMotionIdentityValue, QWidget#factoryWorkbench QLabel#factoryMotionConnection { color:#314967;font-weight:600; }
+QWidget#factoryWorkbench QLabel#factoryMotionHeading { color:#172c49;font-size:16px;font-weight:700; }
+QWidget#factoryWorkbench QLabel#factoryMotionValue { color:#172c49;font-size:20px;font-weight:700; }
+QWidget#factoryWorkbench QLabel#factoryMotionState { color:#315782;background:#edf3ff;border-radius:5px;padding:4px 8px;font-weight:600; }
 QWidget#factoryWorkbench QSplitter::handle { background:transparent;width:6px; }
 """

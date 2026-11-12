@@ -178,7 +178,11 @@ def _readings(identity, details):
             active = {"active": "已启动", "inactive": "未启动", "failed": "启动失败"}.get(details["ActiveState"], str(details["ActiveState"]))
             lines.append(f"BMS 服务：{active}；进程状态：{_show(details.get('SubState'))}")
         if "recent_data_lines" in details:
-            lines.append(f"本次启动最近 30 秒保留的数据日志：{len(details['recent_data_lines'])} 条。")
+            seconds = details.get("observation_seconds")
+            window = f"本次 {seconds:g} 秒观察期内" if type(seconds) in (int, float) and seconds > 0 else "本次启动最近 30 秒"
+            lines.append(f"{window}保留的数据日志：{len(details['recent_data_lines'])} 条。")
+        if details.get("failure_lines"):
+            lines.append(f"本次观察期内保留的读失败或断开日志：{len(details['failure_lines'])} 条。")
     elif identity == "RP022":
         for key, label in (("software_version", "固件版本"), ("hardware_version", "硬件版本")):
             if key in details:

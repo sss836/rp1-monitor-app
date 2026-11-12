@@ -150,6 +150,15 @@ class ResultSummaryPanel(QWidget):
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         self.identity_label = _label("请先打开整机SN，再选择项目。")
         form.addRow(self.identity_label)
+        self.soc_summary = _label()
+        self.soc_summary.setAccessibleName("本次热换电SOC读数")
+        self.soc_summary.hide()
+        form.addRow(self.soc_summary)
+        self.zero_reference_summary = QPlainTextEdit(readOnly=True)
+        self.zero_reference_summary.setAccessibleName("标零位复查记录")
+        self.zero_reference_summary.setMaximumHeight(200)
+        self.zero_reference_summary.hide()
+        form.addRow(self.zero_reference_summary)
         self.fields = {}
         for key, title in (
             ("test_name", "测试名称"), ("criterion", "测试规则 / 判据"),
@@ -293,6 +302,13 @@ class ResultSummaryPanel(QWidget):
             )
         else:
             self.identity_label.setText("请先打开整机SN，再选择项目。")
+        self.soc_summary.setText(row.get("soc_summary", ""))
+        self.soc_summary.setVisible(bool(self.soc_summary.text()))
+        zero_summary = row.get("zero_reference_summary", "")
+        if zero_summary:
+            zero_summary += "\n\n本机证据 " + row["zero_reference_evidence"]
+        self.zero_reference_summary.setPlainText(zero_summary)
+        self.zero_reference_summary.setVisible(bool(zero_summary))
         verdict = self.fields["verdict"]
         verdict.clear()
         verdict.addItems(["不适用"] if self._not_applicable(row) else VERDICTS)

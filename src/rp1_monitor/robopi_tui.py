@@ -39,6 +39,8 @@ PASSIVE_PLUGINS = {
 # TUI 1.1.2 adds USB serial evidence in RP013 1.1; its schema remains 3.
 PLUGIN_VERSIONS = {identity: ("1.0",) for identity in PASSIVE_PLUGINS}
 PLUGIN_VERSIONS["RP013"] = ("1.0", "1.1")
+# TUI 1.1.5 RP021 observes new journal rows for 5s without opening the BMS port.
+PLUGIN_VERSIONS["RP021"] = ("1.0", "1.1")
 PLUGIN_GROUPS = {
     **dict.fromkeys(("RP001", "RP002", "RP005", "RP034"), "主机与版本"),
     **dict.fromkeys(("RP003", "RP007", "RP008"), "通信与 IMU"),

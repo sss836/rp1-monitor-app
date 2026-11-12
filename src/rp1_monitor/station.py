@@ -1,4 +1,4 @@
-"""PC SSH/relay, recordings, and native motor parameter maintenance."""
+"""PC SSH/relay, recordings, and fixed native maintenance actions."""
 
 import fcntl
 import hmac
@@ -70,11 +70,27 @@ class DisconnectRequest(BaseModel):
     robot_id: RobotId | None = None
 
 
-class MotorParameterRequest(BaseModel):
+class NativeRobotRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     robot_id: RobotId
     relay_url: str = Field(min_length=10, max_length=256)
+
+
+class MotorParameterRequest(NativeRobotRequest):
     request: dict = Field(max_length=12)
+    sudo_password: SecretStr = Field(min_length=1, max_length=4096)
+
+
+class MotorFirmwareRequest(NativeRobotRequest):
+    request: dict = Field(max_length=8)
+    sudo_password: SecretStr = Field(min_length=1, max_length=4096)
+
+
+class LightTestRequest(NativeRobotRequest):
+    sudo_password: SecretStr | None = Field(default=None, min_length=1, max_length=4096)
+
+
+class BmsRecoveryRequest(NativeRobotRequest):
     sudo_password: SecretStr = Field(min_length=1, max_length=4096)
 
 
@@ -272,7 +288,7 @@ class StationManager:
         if connection is None:
             return
         if not connection.deploy_lock.acquire(blocking=False):
-            raise ValueError("电机维护尚未结束，不能中断其SSH连接；请等待操作回执")
+            raise ValueError("机器人操作尚未结束，不能中断其SSH连接；请等待操作回执")
         try:
             self._close_connection(connection)
         finally:
@@ -296,19 +312,19 @@ class StationManager:
             if self.selected_robot_id == robot_id:
                 self.selected_robot_id = next(reversed(self.connections), None)
 
-    def _deploy_connection(self, robot_id, relay_url):
+    def _authenticated_connection(self, robot_id, relay_url):
         connection = self.connections.get(robot_id)
         if (not connection or connection.relay_url != relay_url or connection.identity.get("source_kind") != "ros2"
                 or not connection.tunnel or not connection.tunnel.transport.is_active()
                 or parse_ssh_target(connection.target)[0] != "robo"):
-            raise ValueError("所选机器人没有对应的已认证SSH连接，未发送启动命令")
+            raise ValueError("所选实机没有匹配的已认证SSH连接，请在设备设置重新连接")
         return connection
 
     def deploy_connection(self, robot_id, relay_url):
         from .factory_client import FactoryClient
 
         with self.state_lock:
-            connection = self._deploy_connection(robot_id, relay_url)
+            connection = self._authenticated_connection(robot_id, relay_url)
             tunnel, target = connection.tunnel, connection.target
         identity = FactoryClient(tunnel.url).probe()
         if identity.get("robot_id") != robot_id or identity.get("source_kind") != "ros2":
@@ -328,12 +344,97 @@ class StationManager:
         if request["robot_id"] != query.robot_id:
             raise ValueError("参数请求机器人身份不匹配")
         with self.state_lock:
-            connection = self._deploy_connection(query.robot_id, query.relay_url)
+            connection = self._authenticated_connection(query.robot_id, query.relay_url)
             if not connection.deploy_lock.acquire(blocking=False):
                 raise ValueError("已有电机维护任务进行中，请等待结果")
         try:
             context = dict(robot_id=query.robot_id, target=connection.target, tunnel=connection.tunnel)
             return perform(context, query.sudo_password.get_secret_value(), request)
+        finally:
+            connection.deploy_lock.release()
+
+    def motor_firmware(self, query):
+        from .motor_firmware import perform
+        from .motor_firmware_remote import validate_request
+
+        request = validate_request(query.request)
+        if request["robot_id"] != query.robot_id:
+            raise ValueError("固件请求机器人身份不匹配")
+        with self.state_lock:
+            connection = self._authenticated_connection(query.robot_id, query.relay_url)
+            if not connection.deploy_lock.acquire(blocking=False):
+                raise ValueError("已有电机维护任务进行中，请等待结果")
+        try:
+            context = dict(robot_id=query.robot_id, target=connection.target, tunnel=connection.tunnel)
+            return perform(context, query.sudo_password.get_secret_value(), request)
+        finally:
+            connection.deploy_lock.release()
+
+    def light_test(self, query):
+        from .factory_client import FactoryClient
+
+        password = query.sudo_password.get_secret_value() if query.sudo_password else None
+        if password and any(char in password for char in "\r\n"):
+            raise ValueError("请输入单行sudo密码")
+        light_command = "/usr/bin/robopi-ws2812 solid 80 80 80"
+        command = (
+            "LC_ALL=C sudo -S -p RP1_LIGHT_SUDO: -- " if password else "LC_ALL=C sudo -n -- "
+        ) + light_command
+        with self.state_lock:
+            connection = self._authenticated_connection(query.robot_id, query.relay_url)
+            if not connection.deploy_lock.acquire(blocking=False):
+                raise ValueError("已有机器人操作进行中，请等待结果")
+        try:
+            tunnel = connection.tunnel
+            identity = FactoryClient(tunnel.url, timeout=5).probe()
+            if (identity.get("robot_id"), identity.get("source_kind")) != (query.robot_id, "ros2"):
+                raise ValueError("采集身份已变化，未发送点灯命令")
+            channel = tunnel.transport.open_session(timeout=5)
+            deadline = time.monotonic() + 8
+            timeout = threading.Timer(8, channel.close)
+            timeout.daemon = True
+            timeout.start()
+            try:
+                channel.set_combine_stderr(True)
+                channel.exec_command(command)
+                if password:
+                    channel.sendall((password + "\n").encode())
+                    channel.shutdown_write()
+                output = bytearray()
+                while time.monotonic() < deadline:
+                    if channel.recv_ready():
+                        output.extend(channel.recv(4096))
+                        if len(output) > 16 * 1024:
+                            raise ValueError("点灯回执超过上限，请检查灯板工具")
+                    elif channel.exit_status_ready():
+                        break
+                    else:
+                        time.sleep(0.02)
+                if not channel.exit_status_ready() or time.monotonic() >= deadline:
+                    raise ValueError("点灯命令回执超时，请检查灯板和SSH连接")
+                code = channel.recv_exit_status()
+                if code == -1:
+                    raise ValueError("点灯命令回执中断，请检查SSH连接")
+                if code != 0:
+                    if not password and b"sudo: a password is required" in output.splitlines():
+                        return {"robot_id": query.robot_id, "status": "password_required"}
+                    raise ValueError(f"点灯命令失败（退出码 {code}），请核对sudo权限和灯板驱动")
+            finally:
+                timeout.cancel()
+                channel.close()
+            return {"robot_id": query.robot_id, "status": "command_sent"}
+        finally:
+            connection.deploy_lock.release()
+
+    def bms_recovery(self, query):
+        from .bms_recovery import run_recovery
+
+        with self.state_lock:
+            connection = self._authenticated_connection(query.robot_id, query.relay_url)
+            if not connection.deploy_lock.acquire(blocking=False):
+                raise ValueError("已有机器人维护任务进行中，请等待回执。")
+        try:
+            return run_recovery(connection.tunnel, query.robot_id, query.sudo_password.get_secret_value())
         finally:
             connection.deploy_lock.release()
 
@@ -555,6 +656,33 @@ def create_station_app(directory, port=DEFAULT_PORT, *, tunnel_factory=None):
             raise HTTPException(409, str(error)) from None
         except Exception:
             raise HTTPException(503, "参数操作回执未确认，请重新读取实际值；不会自动重复写入") from None
+
+    @app.post("/api/v1/station/motor-firmware", dependencies=[Depends(reader)])
+    def motor_firmware(query: MotorFirmwareRequest):
+        try:
+            return manager.motor_firmware(query)
+        except (ValueError, OSError) as error:
+            raise HTTPException(409, str(error)) from None
+        except Exception:
+            raise HTTPException(503, "固件操作回执未确认，请现场核对电机版本后再决定下一步") from None
+
+    @app.post("/api/v1/station/light-test", dependencies=[Depends(reader)])
+    def light_test(query: LightTestRequest):
+        try:
+            return manager.light_test(query)
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from None
+        except Exception:
+            raise HTTPException(503, "未收到点灯回执，请核对机器人连接后再试") from None
+
+    @app.post("/api/v1/station/bms-recovery", dependencies=[Depends(reader)])
+    def bms_recovery(query: BmsRecoveryRequest):
+        try:
+            return manager.bms_recovery(query)
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from None
+        except Exception:
+            raise HTTPException(503, "BMS重启回执未确认，请先读取状态，勿直接重复重启。") from None
 
     @app.post("/api/v1/station/deploy-launches", dependencies=[Depends(reader)])
     def deploy_launch_disabled():

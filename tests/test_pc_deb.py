@@ -1,9 +1,12 @@
 """Inspect PC packaging without building a deb, downloading wheels or installing it."""
 
+import hashlib
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -208,3 +211,29 @@ def test_build_refuses_to_overwrite_any_existing_output_before_running_commands(
     with pytest.raises(ValueError, match="already exists"):
         builder.build(output)
     assert keep.read_text() == "unchanged"
+
+
+def test_pc_bundle_reuses_verified_wheels_and_packages_current_calibration_tools(pc_source, tmp_path):
+    source_tools = {name: file_at(pc_source, path, f"# current tool {name}\n").read_bytes()
+                    for name, path in builder.COLLECTOR_CALIBRATION_TOOLS.items()}
+    original_files = {"wheelhouse/pip-fixture.whl": b"offline wheel",
+                      "scripts/calibration_runtime.py": b"# earlier helper\n"}
+    old = tmp_path / "old-collector.zip"
+    manifest = {"schema": 1, "package": "rp1-monitor-robot", "version": "0.4.1",
+                "python": [3, 12], "machine": "aarch64",
+                "files": {name: hashlib.sha256(data).hexdigest() for name, data in original_files.items()}}
+    with zipfile.ZipFile(old, "x") as archive:
+        for name, data in original_files.items():
+            archive.writestr(name, data)
+        archive.writestr("manifest.json", json.dumps(manifest))
+    original = old.read_bytes()
+    packed = builder.collector_bundle_for_build(tmp_path, source=pc_source, supplied=old)
+    assert packed != old and old.read_bytes() == original
+    with zipfile.ZipFile(packed) as archive:
+        digests = json.loads(archive.read("manifest.json"))["files"]
+        assert set(archive.namelist()) == {*digests, "manifest.json"}
+        assert archive.read("wheelhouse/pip-fixture.whl") == original_files["wheelhouse/pip-fixture.whl"]
+        for name, data in source_tools.items():
+            assert archive.read(name) == data
+            assert digests[name] == hashlib.sha256(data).hexdigest()
+    assert builder.collector_bundle_for_build(tmp_path, source=pc_source, supplied=packed) == packed

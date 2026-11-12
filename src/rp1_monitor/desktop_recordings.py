@@ -13,12 +13,14 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QCoreApplication, QDateTime, Qt, QThread, QTimer, QTimeZone, Signal, Slot
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QComboBox,
     QDateTimeEdit,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGridLayout,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -26,6 +28,9 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QPushButton,
     QScrollArea,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -120,6 +125,8 @@ class RecordingWorker(QThread):
 
 
 class RecordingsPanel(QWidget):
+    recording_status = Signal(str)
+
     def __init__(self, station):
         super().__init__()
         self.station = station
@@ -141,17 +148,63 @@ class RecordingsPanel(QWidget):
         if app is not None and not app.property("rp1_recordings_shutdown"):
             app.aboutToQuit.connect(finish_workers)
             app.setProperty("rp1_recordings_shutdown", True)
-        layout = QHBoxLayout(self)
-        controls = QWidget()
-        controls.setObjectName("healthCard")
-        left = QVBoxLayout(controls)
-        left.addWidget(QLabel("监控记录 · 独立于正式测试 / 审批 / MTBF"))
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(7)
         self.configure_database = QPushButton("配置长期历史库")
         self.configure_database.clicked.connect(self.choose_postgres_file)
-        left.addWidget(self.configure_database)
-        database_note = QLabel("仅导入已准备好的私有PostgreSQL连接文件，后台重启后生效；不建库、不执行数据库迁移006。已有配置需按文档人工变更。")
-        database_note.setWordWrap(True)
-        left.addWidget(database_note)
+        self.database_status = QLabel("导入已准备好的私有 PostgreSQL 连接文件，正常重启电脑后台后生效。")
+        self.database_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.database_status.setWordWrap(True)
+        self.database_status.setObjectName("subtitle")
+        self.service_status = QLabel("等待读取后台记录状态。")
+        self.service_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.service_status.setWordWrap(True)
+        self.service_status.setObjectName("sectionTitle")
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.service_status, 1)
+        self.status = QLabel()
+        self.status.setTextFormat(Qt.TextFormat.PlainText)
+        self.status.setWordWrap(True)
+        self.status.setObjectName("subtitle")
+        status_row.addWidget(self.status, 1)
+        layout.addLayout(status_row)
+        self.views = QTabWidget()
+        self.views.setAccessibleName("监控记录视图")
+        layout.addWidget(self.views, 1)
+
+        history = QWidget()
+        self.views.addTab(history, "历史曲线")
+        self.controls_scroll = QScrollArea()
+        self.controls_scroll.setWidgetResizable(True)
+        self.views.addTab(self.controls_scroll, "新建 / 当前记录")
+        self.new_record = QPushButton("新建长期记录")
+        self.new_record.clicked.connect(lambda: self.views.setCurrentIndex(1))
+        self.views.setCornerWidget(self.new_record)
+        self.views.currentChanged.connect(lambda index: self.new_record.setVisible(index == 0))
+
+        controls = QWidget()
+        new_layout = QVBoxLayout(controls)
+        new_layout.setContentsMargins(12, 10, 12, 10)
+        new_layout.setSpacing(8)
+        action_row = QHBoxLayout()
+        action_row.addStretch()
+        self.start = QPushButton("开始长期记录")
+        self.stop = QPushButton("结束本次记录")
+        self.stop.setObjectName("secondary")
+        self.start.setEnabled(False)
+        self.stop.setEnabled(False)
+        self.start.clicked.connect(self.start_recording)
+        self.stop.clicked.connect(self.stop_recording)
+        action_row.addWidget(self.start)
+        action_row.addWidget(self.stop)
+        new_layout.addLayout(action_row)
+        fields = QHBoxLayout()
+        left = QVBoxLayout()
+        right_metrics = QVBoxLayout()
+        fields.addLayout(left, 2)
+        fields.addLayout(right_metrics, 3)
+        new_layout.addLayout(fields, 1)
         form = QFormLayout()
         self.robot_selector = QComboBox()
         self.robot_selector.setAccessibleName("监控记录机器人")
@@ -181,67 +234,64 @@ class RecordingsPanel(QWidget):
         self.source = QLabel("采集身份待连接；记录标签不会修改机器人身份。")
         self.source.setWordWrap(True)
         left.addWidget(self.source)
-        left.addWidget(QLabel("长期保存指标 · 多选（缺失项保存为空值）"))
+        left.addStretch()
+        right_metrics.addWidget(QLabel("长期保存指标 · 多选（缺失项保存为空值）"))
         self.search = QLineEdit()
         self.search.setPlaceholderText("搜索温度、力矩、关节编号…")
         self.search.textChanged.connect(self.filter_metrics)
-        left.addWidget(self.search)
+        right_metrics.addWidget(self.search)
         presets = QGridLayout()
         self.presets = []
         for i, (title, quantity) in enumerate((("温度", "temperature"), ("力矩", "torque"), ("SOC", "soc"), ("关节电压", "voltage"), ("电池电流", "current"))):
             b = QPushButton(title)
+            b.setObjectName("secondary")
             b.clicked.connect(lambda checked=False, q=quantity: self.preset(q))
             self.presets.append(b)
-            presets.addWidget(b, i // 3, i % 3)
-        left.addLayout(presets)
+            presets.addWidget(b, 0, i)
+        right_metrics.addLayout(presets)
         self.save_metrics = QListWidget()
-        self.save_metrics.setMinimumHeight(200)
-        left.addWidget(self.save_metrics, 1)
-        row = QHBoxLayout()
-        self.start = QPushButton("开始长期记录")
-        self.stop = QPushButton("结束本次记录")
-        self.start.setEnabled(False)
-        self.stop.setEnabled(False)
-        self.start.clicked.connect(self.start_recording)
-        self.stop.clicked.connect(self.stop_recording)
-        row.addWidget(self.start)
-        row.addWidget(self.stop)
-        left.addLayout(row)
+        self.save_metrics.setMinimumHeight(135)
+        right_metrics.addWidget(self.save_metrics, 1)
         note = QLabel("1 Hz=每秒一次；0.1 Hz=每10秒一次。频率控制电脑端记录，最高10 Hz受预览限速约束，不会提高机器人来源频率；同一源样本可能重复，原始时间与缺失保留。关闭窗口后电脑后台继续记录；无需改动机器人运控。")
         note.setWordWrap(True)
-        left.addWidget(note)
-        self.controls_scroll = QScrollArea()
-        self.controls_scroll.setWidgetResizable(True)
-        self.controls_scroll.setMinimumWidth(300)
-        self.controls_scroll.setMaximumWidth(440)
+        note.setObjectName("subtitle")
+        new_layout.addWidget(note)
         self.controls_scroll.setWidget(controls)
-        layout.addWidget(self.controls_scroll, 1)
-        right = QVBoxLayout()
-        self.service_status = QLabel("点击刷新读取 PostgreSQL 配置与历史记录。")
-        self.service_status.setTextFormat(Qt.TextFormat.PlainText)
-        self.service_status.setWordWrap(True)
-        right.addWidget(self.service_status)
-        self.status = QLabel("点击刷新读取 PostgreSQL 配置与历史记录。")
-        self.status.setTextFormat(Qt.TextFormat.PlainText)
-        self.status.setWordWrap(True)
-        right.addWidget(self.status)
+        right = QVBoxLayout(history)
+        right.setContentsMargins(11, 9, 11, 10)
+        right.setSpacing(7)
         toolbar = QHBoxLayout()
+        self.session = QComboBox()
+        self.session.setAccessibleName("选择历史监控记录")
+        self.session.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.session.setMinimumContentsLength(14)
+        self.session.currentIndexChanged.connect(self.session_changed)
+        toolbar.addWidget(self.session, 1)
+        self.period = QComboBox()
+        self.period.setAccessibleName("历史曲线时段")
+        for title, value in (("所选记录全部时段", 0), ("最近10分钟", 600), ("最近1小时", 3600), ("最近24小时", 86400), ("自定义区间", -1)):
+            self.period.addItem(title, value)
+        toolbar.addWidget(self.period)
+        metrics_toggle = QPushButton("显示指标")
+        metrics_toggle.setObjectName("secondary")
+        metrics_toggle.setCheckable(True)
+        toolbar.addWidget(metrics_toggle)
+        self.query = QPushButton("查询曲线")
+        self.query.clicked.connect(self.curves)
+        toolbar.addWidget(self.query)
         self.refresh = QPushButton("刷新状态 / 记录")
+        self.refresh.setObjectName("secondary")
         self.refresh.clicked.connect(lambda: self.refresh_context())
         toolbar.addWidget(self.refresh)
         self.more = QPushButton("加载更早记录")
+        self.more.setObjectName("secondary")
         self.more.setEnabled(False)
         self.more.clicked.connect(lambda: self.load_records(True))
         toolbar.addWidget(self.more)
         right.addLayout(toolbar)
-        self.session = QComboBox()
-        self.session.currentIndexChanged.connect(self.session_changed)
-        right.addWidget(self.session)
-        self.period = QComboBox()
-        for title, value in (("所选记录全部时段", 0), ("最近10分钟", 600), ("最近1小时", 3600), ("最近24小时", 86400), ("自定义区间", -1)):
-            self.period.addItem(title, value)
-        right.addWidget(self.period)
-        custom = QHBoxLayout()
+        self.custom_range = QWidget()
+        custom = QHBoxLayout(self.custom_range)
+        custom.setContentsMargins(0, 0, 0, 0)
         self.range_start = QDateTimeEdit(QDateTime.currentDateTime().addSecs(-3600))
         self.range_end = QDateTimeEdit(QDateTime.currentDateTime())
         for title, widget in (("开始", self.range_start), ("结束", self.range_end)):
@@ -251,23 +301,53 @@ class RecordingsPanel(QWidget):
             widget.setCalendarPopup(True)
             widget.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
             custom.addWidget(widget)
-        right.addLayout(custom)
+        custom.addStretch()
+        right.addWidget(self.custom_range)
         self.period.currentIndexChanged.connect(self.update_period)
         self.update_period()
         self.view_metrics = QListWidget()
+        self.view_metrics.setAccessibleName("显示指标，最多12条，按单位分图")
         self.view_metrics.setMaximumHeight(125)
-        right.addWidget(QLabel("显示指标 · 最多12条，按单位分图"))
+        self.view_metrics.hide()
+        metrics_toggle.toggled.connect(self.view_metrics.setVisible)
         right.addWidget(self.view_metrics)
-        self.query = QPushButton("查询完整曲线")
-        self.query.clicked.connect(self.curves)
-        right.addWidget(self.query)
+        self.curve_status = QLabel()
+        self.curve_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.curve_status.setWordWrap(True)
+        self.curve_status.setObjectName("subtitle")
+        right.addWidget(self.curve_status)
+
+        results = QWidget()
+        result_layout = QVBoxLayout(results)
+        result_layout.setContentsMargins(0, 0, 0, 0)
         self.graphs = QWidget()
         self.graph_layout = QVBoxLayout(self.graphs)
+        self.graph_layout.setContentsMargins(0, 0, 0, 0)
+        result_layout.addWidget(self.graphs, 1)
+        self.recent = QWidget()
+        recent_layout = QVBoxLayout(self.recent)
+        recent_layout.setContentsMargins(0, 4, 0, 0)
+        recent_layout.addWidget(QLabel("近期记录"))
+        self.recent_table = QTableWidget(0, 4)
+        self.recent_table.setHorizontalHeaderLabels(["记录编号", "开始时间（北京时间）", "保存频率", "状态"])
+        self.recent_table.setAccessibleName("近期监控记录")
+        self.recent_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.recent_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.recent_table.verticalHeader().hide()
+        self.recent_table.verticalHeader().setDefaultSectionSize(28)
+        self.recent_table.setAlternatingRowColors(True)
+        self.recent_table.setShowGrid(False)
+        self.recent_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.recent_table.cellClicked.connect(self.select_recent_record)
+        self.recent_table.cellActivated.connect(self.select_recent_record)
+        recent_layout.addWidget(self.recent_table)
+        self.recent.hide()
+        result_layout.addWidget(self.recent)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setWidget(self.graphs)
+        scroll.setWidget(results)
         right.addWidget(scroll, 1)
-        layout.addLayout(right, 2)
+        right.addWidget(QLabel("监控记录独立于正式测试、审批与 MTBF。"))
         self.timer = QTimer(self)
         self.timer.setInterval(5000)
         self.timer.timeout.connect(self.tick)
@@ -300,6 +380,9 @@ class RecordingsPanel(QWidget):
         self.save_metrics.clear()
         self.session.clear()
         self.view_metrics.clear()
+        self.curve_status.clear()
+        self.refresh_recent_records()
+        self.recording_status.emit("记录待核对")
         while self.graph_layout.count():
             item = self.graph_layout.takeAt(0)
             if item.widget():
@@ -364,11 +447,11 @@ class RecordingsPanel(QWidget):
     def choose_postgres_file(self):
         _, token_file = self.station()
         if not token_file:
-            self.status.setText("请先使用start-monitor.sh启动电脑后台，建立私有配置目录。")
+            self.database_status.setText("请先启动电脑后台，建立私有配置目录。")
             return
         destination = Path(token_file).with_name("postgres-url.txt")
         if os.path.lexists(destination):
-            self.status.setText("长期历史库已配置；请按文档人工变更，本入口不覆盖现有文件。配置变更后需重启电脑后台。")
+            self.database_status.setText("长期历史库已配置。变更请按文档操作，完成后重启电脑后台。")
             return
         source, _ = QFileDialog.getOpenFileName(
             self, "选择私有PostgreSQL连接文件（0600，当前用户所有）", "",
@@ -378,13 +461,13 @@ class RecordingsPanel(QWidget):
         try:
             configure_postgres_file(source, token_file)
         except FileExistsError:
-            self.status.setText("长期历史库已配置；请按文档人工变更，本入口不覆盖现有文件。")
+            self.database_status.setText("长期历史库已配置。此处不会覆盖已有连接文件。")
         except ValueError as error:
-            self.status.setText(str(error))
+            self.database_status.setText(str(error))
         except (OSError, UnicodeError):
-            self.status.setText("无法导入私有连接文件；请核对当前用户权限、0600权限和文件类型，不接受符号链接。")
+            self.database_status.setText("无法导入私有连接文件。请核对文件由当前用户所有、权限为0600且为普通文件。")
         else:
-            self.status.setText("私有连接文件已保存。请在数据库迁移006审核并人工部署后重启电脑后台；本次未连接数据库、未建库、未执行迁移。重启前不能开启长期记录。")
+            self.database_status.setText("连接文件已保存。确认数据库迁移006已部署后，重启电脑后台以启用长期记录。")
 
     def tick(self):
         if self.isVisible():
@@ -394,8 +477,7 @@ class RecordingsPanel(QWidget):
 
     def update_period(self):
         custom = self.period.currentData() == -1
-        self.range_start.setEnabled(custom)
-        self.range_end.setEnabled(custom)
+        self.custom_range.setVisible(custom)
 
     def update_actions(self):
         active = bool(self.context.get("active"))
@@ -466,6 +548,10 @@ class RecordingsPanel(QWidget):
             self.context = data
             self.update_robots(data)
             active = data.get("active")
+            self.recording_status.emit(
+                "记录待核对" if not data.get("robot_id")
+                else f"{data['robot_id']} · " + ("记录中" if active else "未在记录")
+            )
             if active:
                 saved = active["session"]
                 for field, key in ((self.case, "case_number"), (self.robot, "robot_number"), (self.site, "site")):
@@ -533,6 +619,7 @@ class RecordingsPanel(QWidget):
                 if index >= 0:
                     self.session.setCurrentIndex(index)
             self.session.blockSignals(False)
+            self.refresh_recent_records()
             self.session_changed()
             self.update_actions()
             if not self.records:
@@ -541,6 +628,30 @@ class RecordingsPanel(QWidget):
         if more and self.cursor:
             params["before"] = self.cursor
         self.call("GET", "?"+urlencode(params) if params else "", apply)
+
+    def refresh_recent_records(self):
+        recent = self.records[:2]
+        self.recent.setVisible(bool(recent))
+        self.recent_table.setRowCount(len(recent))
+        self.recent_table.setFixedHeight(30 + 30 * len(recent))
+        for i, row in enumerate(recent):
+            started = datetime.fromisoformat(row["started_at"]).astimezone(ZoneInfo("Asia/Shanghai"))
+            title = ("[模拟] " if row["source_kind"] == "simulated" else "") + row["run_number"]
+            cells = (title, started.strftime("%Y-%m-%d %H:%M:%S"), f"{row['frequency_hz']:g} Hz", "已结束" if row.get("ended_at") else "未结束")
+            for column, value in enumerate(cells):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, (row["robot_id"], row["id"]))
+                self.recent_table.setItem(i, column, item)
+
+    def select_recent_record(self, row, _column):
+        item = self.recent_table.item(row, 0)
+        if item:
+            selected = item.data(Qt.ItemDataRole.UserRole)
+            for index in range(self.session.count()):
+                if self.session.itemData(index) == selected:
+                    self.session.setCurrentIndex(index)
+                    break
 
     def session_changed(self):
         selected = self.session.currentData()
@@ -625,12 +736,12 @@ class RecordingsPanel(QWidget):
             if item.widget():
                 item.widget().deleteLater()
         if not data["count"]:
-            self.status.setText("该区间没有已入库记录")
+            self.curve_status.setText("该区间没有已入库记录")
             return
         zone = ZoneInfo("Asia/Shanghai")
         start = datetime.fromisoformat(data["start"]).astimezone(zone).strftime("%Y-%m-%d %H:%M:%S")
         end = datetime.fromisoformat(data["end"]).astimezone(zone).strftime("%Y-%m-%d %H:%M:%S")
-        self.status.setText(f"完整区间（北京时间）：{start} 至 {end}\n原始 {data['count']} 点，显示 {len(data['points'])} 个时间桶；分桶均值及最小/最大范围，缺失保留断点。")
+        self.curve_status.setText(f"北京时间 {start} 至 {end} · 原始 {data['count']} 点 · 显示 {len(data['points'])} 个时间桶，缺失保留断点")
         groups = {}
         for metric in data["metrics"]:
             groups.setdefault(metric["unit"], []).append(metric)
@@ -642,7 +753,7 @@ class RecordingsPanel(QWidget):
         stamps = np.array([datetime.fromisoformat(stamp).timestamp() for stamp, point in plotted])
         for unit, entries in groups.items():
             plot = pg.PlotWidget(axisItems={"bottom": pg.DateAxisItem(utcOffset=-8 * 3600)})
-            plot.setMinimumHeight(260)
+            plot.setMinimumHeight(195)
             plot.showGrid(x=True, y=True, alpha=0.2)
             plot.setLabel("left", unit or "数值")
             plot.addLegend()

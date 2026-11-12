@@ -2,13 +2,14 @@
 
 Importing this file does nothing. Only E0 01 queries are sent; no SDK, ROS,
 enable, disable, zeroing or control fallback is used, including during cleanup.
-There is no shared writer lock or protocol transaction ID: process checks and
+The position protocol has no transaction ID. The local lock, process checks and
 kernel receive windows cannot eliminate external writers or correlate arbitrary
 late responses. Raw output-shaft degrees are not a mechanical-limit validation.
 """
 
 import argparse
 import errno
+import fcntl
 import hashlib
 import json
 import math
@@ -38,6 +39,17 @@ FRAME = struct.Struct("=IBBBB64s")
 TIMESPEC = struct.Struct("@ll")
 QUERY_TIMEOUT_NS = 250_000_000
 SESSION_LIMIT_NS = 30_000_000_000
+MOTOR_CONTROL_LOCK = "/run/lock/rp1-monitor-motor-control.lock"
+
+
+def acquire_motor_lock(path):
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
 
 
 def load_configuration(dof):
@@ -97,7 +109,7 @@ def process_conflict(executable, arguments):
                for index in range(len(arguments) - 1))
 
 
-def check_processes(proc=Path("/proc"), check_cancel=lambda: None):
+def check_processes(proc=Path("/proc"), check_cancel=lambda: None, *, extra_conflict=None):
     for entry in proc.iterdir():
         check_cancel()
         if not entry.name.isdigit() or int(entry.name) == os.getpid():
@@ -116,7 +128,7 @@ def check_processes(proc=Path("/proc"), check_cancel=lambda: None):
         except OSError as error:
             code = errno.errorcode.get(error.errno, "UNKNOWN")
             raise ValueError(f"无法确认进程状态，拒绝查询：PID {entry.name}，读取{field}失败（{code}，errno={error.errno}）") from error
-        if process_conflict(executable, arguments):
+        if process_conflict(executable, arguments) or (extra_conflict and extra_conflict(executable, arguments)):
             raise ValueError("推理、标零或其他电机工具仍在运行：PID " + entry.name)
 
 
@@ -241,14 +253,18 @@ class SessionControl:
 
 
 class WriterGuard:
-    def __init__(self, control):
+    def __init__(self, control, *, extra_conflict=None):
         self.control, self.checked_ns = control, None
+        self.extra_conflict = extra_conflict
 
     def check(self, force=False):
         self.control.check()
         now = time.monotonic_ns()
         if force or self.checked_ns is None or now - self.checked_ns >= 500_000_000:
-            check_processes(check_cancel=self.control.check)
+            if self.extra_conflict is None:
+                check_processes(check_cancel=self.control.check)
+            else:
+                check_processes(check_cancel=self.control.check, extra_conflict=self.extra_conflict)
             self.checked_ns = time.monotonic_ns()
 
 
@@ -304,11 +320,16 @@ def run_session(dof, session_id, *, rounds=3, stdin=None, output=None):
         raise ValueError("复查轮数只支持1至3")
     stdin, output = stdin or sys.stdin, output or sys.stdout
     started_ns, connections = time.monotonic_ns(), {}
+    lock = None
     cancelled, failed = False, False
     try:
         control = SessionControl(stdin, started_ns)
         control.check()
         affinity = restrict_affinity()
+        try:
+            lock = acquire_motor_lock(MOTOR_CONTROL_LOCK)
+        except BlockingIOError:
+            raise ValueError("其他上位机电机工具正在使用查询通道") from None
         motors, digest = load_configuration(dof)
         guard = WriterGuard(control)
         guard.check(force=True)
@@ -348,6 +369,8 @@ def run_session(dof, session_id, *, rounds=3, stdin=None, output=None):
                 connection.close()
             except OSError:
                 pass  # Closing another socket never sends a cleanup command.
+        if lock is not None:
+            os.close(lock)
         emit(output, dict(type="complete", session_id=session_id, cancelled=cancelled,
                           finished_monotonic_ns=time.monotonic_ns()))
     return 1 if failed else 0

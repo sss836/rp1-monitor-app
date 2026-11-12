@@ -14,6 +14,7 @@ import json
 import math
 import os
 import queue
+import select
 import signal
 import socket
 import struct
@@ -49,6 +50,7 @@ except ImportError:  # Explicit modules supplied by the SSH bootstrap.
     from torque_estimation import estimate_output_torque
 
 CONTROL_HZ = 50
+ENCODER_PAIR_MAX_SKEW_NS = 100_000_000
 SDK_INIT_STEP_S = 0.005  # Verified LRO init_motor normal_sleep_time.
 HEARTBEAT_TIMEOUT_S = 2.0
 FEEDBACK_TIMEOUT_S = 0.25
@@ -144,7 +146,8 @@ class InputPump:
                 elif name == "disable":
                     self.disable_requested.set()
                 elif name in {"enable", "run", "prepare_check", "check", "continue_check",
-                              "manual_check", "manual_pause", "manual_retest", "manual_skip", "manual_confirm_pin"}:
+                              "manual_check", "manual_pause", "manual_retest", "manual_skip", "manual_confirm_pin",
+                              "read_encoder", "read_joint_encoders"}:
                     self.commands.put_nowait(command)
                 else:
                     raise ValueError("不支持的电机控制命令")
@@ -157,6 +160,24 @@ class InputPump:
             raise StopRequested(self.error or "收到停止请求或SSH输入已关闭")
         if time.monotonic() - self.last_heartbeat > HEARTBEAT_TIMEOUT_S:
             raise StopRequested("上位机心跳中断")
+
+
+class EncoderQueryControl:
+    """Use the control heartbeat and stop signals during a bounded position query."""
+
+    def __init__(self, control):
+        self.control = control
+
+    def check(self):
+        self.control.check()
+        if self.control.disable_requested.is_set():
+            raise ValueError("收到失能请求，位置读取已取消")
+
+    def wait(self, readers, timeout):
+        self.check()
+        ready = select.select(readers, [], [], max(0, min(timeout, 0.05)))[0]
+        self.check()
+        return ready
 
 
 def acquire_lock(path=LOCK_PATH):
@@ -516,7 +537,7 @@ class MotorDriver:
 
 
 class ControlSession:
-    def __init__(self, motors, dof, control, emit, *, driver=None, clock=time.monotonic):
+    def __init__(self, motors, dof, control, emit, *, driver=None, clock=time.monotonic, encoder_mapping=None):
         self.motors, self.dof, self.control, self.emit = motors, dof, control, emit
         self.driver = driver or MotorDriver(motors)
         self.clock = clock
@@ -539,6 +560,8 @@ class ControlSession:
         self.damping_kd = 0.5
         self.manual_engine = self.manual_mapping = self.manual_logical = None
         self.manual_run_id = None
+        self._last_encoder_query = float("-inf")
+        self.encoder_mapping = encoder_mapping
 
     def state(self, state, message):
         self.emit({"type": "state", "state": state, "message": message})
@@ -589,7 +612,11 @@ class ControlSession:
 
     def handle(self, command):
         name = command.get("command")
-        if name == "enable":
+        if name == "read_encoder":
+            self._read_encoder(command)
+        elif name == "read_joint_encoders":
+            self._read_joint_encoders(command)
+        elif name == "enable":
             if self.enabled:
                 raise ValueError("电机已经使能，不会重复使能")
             try:
@@ -663,6 +690,83 @@ class ControlSession:
             self.state("running", "已确认恢复姿态，低速接续下一检查组")
         else:
             raise ValueError("电机控制命令无效")
+
+    def _read_encoder(self, command):
+        index, request_id = command.get("index"), command.get("request_id")
+        if type(index) is not int or not 0 <= index < len(self.motors) or not isinstance(request_id, str):
+            return
+        try:
+            if str(UUID(request_id)) != request_id:
+                return
+        except ValueError:
+            return
+        motor = self.motors[index]
+        event = {"type": "encoder_position", "index": index, "request_id": request_id,
+                 "interface": motor["interface"], "motor_id": motor["motor_id"]}
+        try:
+            control = self._encoder_query_control()
+            with reader.open_can(motor["interface"], [motor["motor_id"]]) as connection:
+                sample = reader.query_once(connection, motor["motor_id"], control, reader.WriterGuard(control))
+        except (OSError, ValueError) as error:
+            sample = dict(status="error", angle_deg=None, received_at=None, rx_monotonic_ns=None,
+                          query_sent_monotonic_ns=None, raw_hex=None, fault=None, kernel_rx_timestamp=False,
+                          message="".join(c if c.isprintable() else " " for c in str(error))[:240])
+        self.emit({**event, **sample})
+
+    def _encoder_query_control(self):
+        control = EncoderQueryControl(self.control)
+        control.check()
+        if self.enabled or self.driver.motors:
+            raise ValueError("仅未使能时可读取电机轴角度")
+        now = self.clock()
+        if now - self._last_encoder_query < reader.QUERY_TIMEOUT_NS / 1_000_000_000:
+            raise ValueError("位置读取过于频繁，请稍后再试")
+        self._last_encoder_query = now
+        if reader.load_configuration(self.dof)[0] != self.motors:
+            raise ValueError("控制会话中电机配置发生改变")
+        check_other_writers(check_cancel=control.check)
+        return control
+
+    def _read_joint_encoders(self, command):
+        joint, request_id = command.get("joint"), command.get("request_id")
+        if not isinstance(joint, str) or not 1 <= len(joint) <= 64 or not joint.isascii() or not joint.isidentifier():
+            return
+        try:
+            if not isinstance(request_id, str) or str(UUID(request_id)) != request_id:
+                return
+        except ValueError:
+            return
+        samples = []
+        position = error = None
+        try:
+            if self.encoder_mapping is None:
+                raise ValueError("当前版本未核对只读关节角映射")
+            row = next((row for row in self.encoder_mapping["rows"] if row["name"] == joint), None)
+            if row is None:
+                raise ValueError("请求关节不在已核对的只读映射中")
+            control = self._encoder_query_control()
+            mapping = joint_mapping.encoder_observation_mapping(self.dof, self.motors, reader.ROOT)
+            if mapping != self.encoder_mapping:
+                raise ValueError("控制会话中只读关节映射发生改变")
+            guard = reader.WriterGuard(control)
+            for index in row["motor_indices"]:
+                control.check()
+                motor = self.motors[index]
+                interface, motor_id = motor["interface"], motor["motor_id"]
+                with reader.open_can(interface, [motor_id]) as connection:
+                    sample = reader.query_once(connection, motor_id, control, guard)
+                samples.append({"index": index, "interface": interface, "motor_id": motor_id, **sample})
+                if sample["status"] != "fresh":
+                    raise ValueError("当前关节缺少本次编码器反馈")
+            skew = samples[-1]["rx_monotonic_ns"] - samples[0]["rx_monotonic_ns"]
+            if not 0 <= skew <= ENCODER_PAIR_MAX_SKEW_NS:
+                raise ValueError("踝部两路编码器反馈间隔过长")
+            position = joint_mapping.encoder_joint_angle(
+                mapping, joint, {sample["index"]: sample["angle_deg"] for sample in samples})
+        except (OSError, ValueError) as failure:
+            error = "".join(c if c.isprintable() else " " for c in str(failure))[:240] or "关节编码器读取失败"
+        self.emit({"type": "joint_encoder_positions", "request_id": request_id, "joint": joint,
+                   "samples": samples, "position_rad": position, "error": error})
 
     def _check_inputs(self, command, *, service=None):
         if (not self.enabled or self.plan or self.check_engine is not None or self.manual_engine is not None or self.check_handoff is not None
@@ -1267,17 +1371,21 @@ def run_session(dof, session_id):
             mapping_summary = {"rows": mapping["rows"], "joint_names": mapping["joint_names"]}
         except (OSError, ValueError) as error:
             check_ready, check_reason, mapping_summary = False, str(error)[:400], None
+        try:
+            encoder_mapping = joint_mapping.encoder_observation_mapping(dof, motors, reader.ROOT)
+        except (OSError, ValueError):
+            encoder_mapping = None
         emit({"type": "metadata", "dof": dof, "motors": motors, "configuration_sha256": digest,
               "position_basis": "motor_output_sdk_rad", "affinity": affinity,
               "torque_basis": "estimated_from_motor_iq", "timestamp_basis": "kernel_so_timestampns",
               "calibration_check_ready": check_ready, "calibration_check_reason": check_reason,
-              "calibration_mapping": mapping_summary})
+              "calibration_mapping": mapping_summary, "encoder_observation_ready": encoder_mapping is not None})
         validate_driver_sources(reader.ROOT)
         report = verifier.verify_runtime_receipt(
             reader.ROOT, "/home/robo/.local/state/rp1-monitor/calibration/runtime-build.json")
         if report["status"] != "code_built":
             raise ValueError("现有驱动缺少匹配的构建记录，请先独立构建：" + "；".join(report["reasons"]))
-        session = ControlSession(motors, dof, control, emit)
+        session = ControlSession(motors, dof, control, emit, encoder_mapping=encoder_mapping)
         session.state("ready", "配置核对完成；尚未导入SDK、使能或发送电机指令")
         began, next_tick = time.monotonic(), time.monotonic()
         last_process_check = began

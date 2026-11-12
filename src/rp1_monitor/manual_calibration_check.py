@@ -21,10 +21,21 @@ CONDITIONS = {"in_range", "stable", "torque", "no_overshoot"}
 REFERENCE_FIELDS = ("zero_direction", "zero_source", "check_side_basis", "zero_pose_deg", "zero_reference_error_deg",
                     "check_mode", "tolerance_deg", "pin_hold_s", "pin_confirm_required")
 MAX_FRAME_GAP_S = 0.25
+MAX_ENCODER_FRAME_GAP_S = 0.55
 
 
 def _finite(value):
     return type(value) in (int, float) and math.isfinite(value)
+
+
+def _outcome_complete(row):
+    return (row['status'] in {'passed', 'skipped'}
+            or (row['status'] == 'failed' and 'failure_confirmation' in row['attempts'][-1]))
+
+
+def _target_not_reached(direction, difference):
+    limit = DEFAULT_OPTIONS['tolerance_deg'] + 1e-9
+    return direction == 'upper' and difference < -limit or direction == 'lower' and difference > limit
 
 
 def validate_options(options=None):
@@ -53,10 +64,10 @@ class ManualCalibrationCheck:
 
     The newest attempt is effective, including a retest of an earlier pass.
     An interrupted attempt is pending. A failed attempt can only be superseded
-    by an explicit retest/skip, never by later angles or the resume button.
+    by an explicit retest/skip. Confirming the failure keeps the attempt effective.
     """
 
-    def __init__(self, plan, options=None):
+    def __init__(self, plan, options=None, *, max_frame_gap_s=MAX_FRAME_GAP_S):
         if isinstance(plan, dict) and plan.get("mode") == "manual_opposite_zero_limit_check":
             try:
                 from .manual_check_plan import validate_manual_plan
@@ -70,6 +81,9 @@ class ManualCalibrationCheck:
             self.plan = validate_video_plan(plan, plan.get("dof") if isinstance(plan, dict) else None)
             self.reference_source_kind = "simulated"
         self.options = validate_options(options)
+        if not _finite(max_frame_gap_s) or not MAX_FRAME_GAP_S <= max_frame_gap_s <= MAX_ENCODER_FRAME_GAP_S:
+            raise ValueError("检查反馈最大间隔无效")
+        self.max_frame_gap_s = max_frame_gap_s
         self.dof = self.plan["dof"]
         self.phase, self.paused, self.current_index = "ready", False, 0
         self.interruption_reason = None
@@ -107,6 +121,7 @@ class ManualCalibrationCheck:
         row.update(status="active", effective_attempt_id=attempt["attempt_id"])
         self._window, self._baseline = [], []
         self._baseline_started = self._last_sample = self._last_unique_now = None
+        self._peak_sample_time = None
         self._baseline_closed = False
 
     def _attempt(self):
@@ -133,7 +148,7 @@ class ManualCalibrationCheck:
     def _advance(self):
         old = self.current_index
         indices = list(range(old + 1, len(self.results))) + list(range(old + 1))
-        following = next((index for index in indices if self.results[index]["status"] not in {"passed", "skipped"}), None)
+        following = next((index for index in indices if not _outcome_complete(self.results[index])), None)
         if following is None:
             self.current_index, self.phase, self.paused = None, "complete", False
         elif self.results[following]["status"] == "failed":
@@ -157,6 +172,9 @@ class ManualCalibrationCheck:
             attempt["conditions"]["in_range"] = attempt["conditions"]["torque"] = False
         return self.report()
 
+    def invalidate_measurement(self):
+        return self._invalid("missing_or_invalid_measurement") if self.current_index is not None else self.report()
+
     def update(self, now_s, positions_rad, torques_nm, *, sample_times_s=None):
         if self.current_index is None:
             return self.report()
@@ -175,17 +193,17 @@ class ManualCalibrationCheck:
             if not isinstance(sample_times_s, (list, tuple)) or len(sample_times_s) != self.dof:
                 return self._invalid("incomplete_sample_time_vector")
             stamp = sample_times_s[joint]
-        if not _finite(stamp) or stamp < 0 or stamp > now_s + 1e-9 or now_s - stamp > MAX_FRAME_GAP_S + 1e-9:
+        if not _finite(stamp) or stamp < 0 or stamp > now_s + 1e-9 or now_s - stamp > self.max_frame_gap_s + 1e-9:
             return self._invalid("missing_stale_or_future_sample_time")
         if self._last_sample is not None and stamp <= self._last_sample:
             if stamp < self._last_sample:
                 return self._invalid("out_of_order_sample")
             self.data_quality = "duplicate_sample"
-            if self._last_unique_now is not None and now_s - self._last_unique_now > MAX_FRAME_GAP_S + 1e-9:
+            if self._last_unique_now is not None and now_s - self._last_unique_now > self.max_frame_gap_s + 1e-9:
                 self._reset_window()
             return self.report()
-        gap = self._last_sample is not None and (stamp - self._last_sample > MAX_FRAME_GAP_S + 1e-9
-              or now_s - self._last_unique_now > MAX_FRAME_GAP_S + 1e-9)
+        gap = self._last_sample is not None and (stamp - self._last_sample > self.max_frame_gap_s + 1e-9
+              or now_s - self._last_unique_now > self.max_frame_gap_s + 1e-9)
         if gap:
             self._reset_window()
         self._last_sample, self._last_unique_now = float(stamp), float(now_s)
@@ -240,6 +258,8 @@ class ManualCalibrationCheck:
         previous_peak = attempt["peak_angle_deg"]
         peak = angle if previous_peak is None else (max if attempt["direction"] == "upper" else min)(previous_peak, angle)
         attempt["peak_angle_deg"] = peak
+        if peak != previous_peak:
+            self._peak_sample_time = float(stamp)
         reference = attempt["reference_deg"]
         outside = peak > reference + 3 + 1e-9 if attempt["direction"] == "upper" else peak < reference - 3 - 1e-9
         attempt["conditions"]["no_overshoot"] = not outside
@@ -310,6 +330,41 @@ class ManualCalibrationCheck:
         if self._attempt()["status"] == "failed":
             self._activate(self.current_index)
         self._finish("skipped", "operator_skipped_not_passed")
+        self._advance()
+        return self.report()
+
+    def continue_failed(self):
+        if self.phase != 'failed' or self._interrupted:
+            return self.report()
+        attempt = self._attempt()
+        attempt['failure_confirmation'] = {'difference_deg': attempt['peak_angle_deg'] - attempt['reference_deg']}
+        self._advance()
+        return self.report()
+
+    def target_not_reached_angle(self):
+        attempt = self._attempt()
+        if attempt and attempt['status'] == 'active' and self._peak_sample_time is not None:
+            peak = attempt['peak_angle_deg']
+            if _target_not_reached(attempt['direction'], peak - attempt['reference_deg']):
+                return peak
+        return None
+
+    def can_mark_target_not_reached(self):
+        attempt = self._attempt()
+        return bool(self.phase == 'collecting' and not self.paused and not self._interrupted
+                    and attempt and attempt['current_angle_deg'] is not None
+                    and self.target_not_reached_angle() is not None)
+
+    def mark_target_not_reached(self):
+        if not self.can_mark_target_not_reached():
+            return self.report()
+        attempt = self._attempt()
+        self._reset_window()
+        attempt.update(current_angle_deg=attempt['peak_angle_deg'], sample_time_s=self._peak_sample_time,
+                       torque_nm=None, rise_nm=None)
+        attempt['conditions'].update(in_range=False, torque=False)
+        attempt['failure_confirmation'] = {'difference_deg': attempt['peak_angle_deg'] - attempt['reference_deg']}
+        self._finish('failed', 'operator_target_not_reached')
         self._advance()
         return self.report()
 
@@ -393,6 +448,25 @@ def validate_report(report, dof):
             for key in ("sample_time_s", "started_at_s", "ended_at_s", "span_deg", "baseline_nm"):
                 if attempt[key] is not None and attempt[key] < 0:
                     raise ValueError("人工检查时间、幅度或基线不能为负值")
+            reason = attempt.get('reason')
+            if 'failure_confirmation' in attempt or reason == 'operator_target_not_reached':
+                confirmation = attempt.get('failure_confirmation')
+                difference = confirmation.get('difference_deg') if isinstance(confirmation, dict) else None
+                peak = attempt['peak_angle_deg']
+                if (attempt['status'] != 'failed' or peak is None or attempt['sample_time_s'] is None
+                        or not _finite(difference) or abs(difference - (peak - row['reference_deg'])) > 1e-9):
+                    raise ValueError('已确认的不合格结果缺少超限实测证据' if reason == 'outer_reference_tolerance_exceeded'
+                                     else '未达到目标的结果缺少有效实测证据')
+                if reason == 'operator_target_not_reached':
+                    if (not _target_not_reached(row['direction'], difference) or attempt['current_angle_deg'] != peak
+                            or attempt['started_at_s'] is None or attempt['ended_at_s'] is None
+                            or attempt['sample_time_s'] > attempt['ended_at_s'] + 1e-9
+                            or conditions['in_range'] or conditions['stable'] or not conditions['no_overshoot']):
+                        raise ValueError('未达到目标的结果缺少有效实测证据')
+                elif (reason != 'outer_reference_tolerance_exceeded'
+                      or not (row['direction'] == 'upper' and difference > 3 + 1e-9
+                              or row['direction'] == 'lower' and difference < -3 - 1e-9)):
+                    raise ValueError('已确认的不合格结果缺少超限实测证据')
             pin = row.get("check_mode") == "pin_zero"
             center = row.get("check_mode") == "center_zero"
             if pin or center:
@@ -444,7 +518,7 @@ def validate_report(report, dof):
             raise ValueError("人工检查有效状态与历史不一致")
     current = report.get("current_index")
     if current is None:
-        if report["phase"] != "complete" or report["paused"] or report.get("current") is not None or any(row["status"] not in {"passed", "skipped"} for row in rows):
+        if report["phase"] != "complete" or report["paused"] or report.get("current") is not None or not all(map(_outcome_complete, rows)):
             raise ValueError("人工检查完成状态不一致")
     elif type(current) is not int or not 0 <= current < len(rows) or not rows[current]["attempts"] or report.get("current") != rows[current]["attempts"][-1] or report["phase"] == "complete":
         raise ValueError("人工检查当前项与尝试历史不一致")
@@ -452,7 +526,7 @@ def validate_report(report, dof):
         raise ValueError("人工检查运行阶段与当前项不一致")
     if report["phase"] in {"paused", "failed"} and not report["paused"]:
         raise ValueError("人工检查暂停阶段与标记不一致")
-    if report["phase"] == "failed" and rows[current]["status"] != "failed":
+    if report["phase"] == "failed" and (rows[current]["status"] != "failed" or _outcome_complete(rows[current])):
         raise ValueError("人工检查失败阶段与当前项不一致")
     source = report.get("source")
     if not isinstance(source, dict) or source.get("hardware_acceptance") is not False or not isinstance(source.get("reference_source_kind"), str) or source["reference_source_kind"] not in {"simulated", "urdf_model"}:

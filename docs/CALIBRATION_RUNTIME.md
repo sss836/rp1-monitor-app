@@ -1,69 +1,46 @@
 # 标零前的驱动构建与检查
 
-机器人已更新 deploy 源码，但原来 `install/` 里的电机驱动和推理程序仍是旧编译产物。标零前需要单独编译；不要为了编译运行 `tools/start_robot.sh`，因为它还会启动运控。
+标零前，上位机核对当前 deploy 源码、已安装驱动和构建记录。机器人采集端安装包随附 `scripts/calibration_runtime.py` 和 `scripts/update_deploy.sh`。现有采集端如缺少这两个文件，使用上位机「设备设置 → 机器人采集端管理」更新一次安装包。
 
-本次新增的 `src/rp1_monitor/calibration_runtime.py` 是可独立运行的标准库脚本，只需临时复制这一个文件到机器人。上位机和网页继续放在电脑上，不需要安装到机器人。
+在上位机的「角度与标定」打开标零流程并核对机器人身份、SSH 绑定和机型。确认现场条件后，上位机使用机器人已安装的构建工具，优先复用与当前源码和安装产物匹配的记录。需要构建时，以普通机器人账号编译并写入记录。若运控、标零或其他电机工具仍在运行，退出这些工具后再开始。
 
-## 三个步骤
+## 在机器人终端拉取并编译
 
-以下是独立构建的操作说明。真实执行须获得现场授权；2026-10-30 本次已经获得“仅编译和只读验证”的授权，实际结果单独记录，不代表执行过标零或限位动作。
-
-**1．在电脑上复制构建工具。**
+退出运控、标零和其他电机工具后，用机器人普通账号执行。以下命令用于 `/home/robo/roboparty_deploy` 尚未建立的情况。
 
 ```bash
-scp src/rp1_monitor/calibration_runtime.py robo@192.168.137.250:/tmp/rp1-calibration-runtime.py
-```
-
-在已克隆的电脑端仓库根目录执行；将示例地址换成现场目标。它只复制一个 Python 文件，不会自动执行。SSH 按已有的主机指纹和认证流程连接，不要跳过主机指纹核对。
-
-**2．登录机器人，准备已有 ROS 环境。**
-
-```bash
-ssh robo@192.168.137.250
+cd /home/robo
+git clone --branch main --recurse-submodules https://github.com/Roboparty/roboparty_deploy.git
+cd roboparty_deploy
 source /opt/ros/jazzy/setup.bash
+colcon build --packages-up-to roboparty_inference
 ```
 
-`source` 只让本次终端找到已安装的 ROS 和编译工具，不启动 ROS 节点。若机器人的 ROS 安装路径不同，应使用实际路径。
+也可以执行完整的 `colcon build`。已有 Git 工作区时，先在该目录执行 `git pull --ff-only` 和 `git submodule update --init --recursive`，再编译。
 
-**3．在机器人运控、标零等工具已退出时编译。**
+构建成功后回上位机打开整机标定。上位机优先复用有效的构建记录。首次使用终端构建时，它会核对最近一次 colcon 的成功回执、当前源码及实际安装产物，然后写入可复用记录。记录缺失且现有构建无法核验时，按需补编译。GitHub 拉取和终端构建直接使用上述命令。
 
-```bash
-python3 -B /tmp/rp1-calibration-runtime.py --root /home/robo/roboparty_deploy --build
-```
-
-`--root` 指定要编译的 deploy；`--build` 明确要求编译；`-B` 避免为这个临时工具生成 `.pyc`。脚本使用普通 `robo` 用户，拒绝 root 构建，避免生成机器人用户无法修改的安装产物。
-
-工具按依赖构建 `roboparty_inference`，包括电机和 IMU 等所需包。采用单任务构建，排除 CPU0，并降低本次构建进程优先级。它检查已有工具与本地依赖，不自动安装软件、下载依赖或停止进程。
-
-需要只检查构建记录时，去掉 `--build`：
-
-```bash
-python3 -B /tmp/rp1-calibration-runtime.py --root /home/robo/roboparty_deploy
-```
-
-`code_built` 表示记录与当前源码、Python ABI、安装产物路径及哈希相符；`needs_build` 表示缺记录或内容已变化。它们都不代表实机验收通过。
+工具依赖本机 ROS Jazzy 和随 deploy 提供的第三方归档。上位机补编译采用单任务、非 CPU0 运行。`code_built` 表示当前源码、Python ABI 和安装产物已核对，实机标定仍在现场独立进行。
 
 ## 会修改机器人哪些地方
 
 | 位置 | 作用 |
 | --- | --- |
-| `/tmp/rp1-calibration-runtime.py` | 临时构建工具；不包含上位机、网页或凭据 |
+| `~/.local/share/rp1-collector-managed/releases/<release>/scripts/` | 随采集端安装包交付的构建和部署更新工具 |
 | `/home/robo/roboparty_deploy/build/` | 编译中间文件 |
 | `/home/robo/roboparty_deploy/install/` | 更新电机驱动、IMU 和推理的安装产物，以及构建系统安装的脚本/资源 |
 | `/home/robo/roboparty_deploy/log/` | colcon 构建日志 |
 | `/home/robo/.local/state/rp1-monitor/calibration/runtime-build.json` | 当前构建记录 |
 | 同目录 `runtime-build-*.json` | 每次成功构建的历史记录，使用唯一文件名保留 |
 
-工具不改写源码、策略参数、零偏、固件、总线配置、系统分核和自启设置；不导入电机 SDK，不启动推理，不发送 CAN 帧，不执行标零或限位动作。已有的 CMake 构建步骤会更新上述构建目录，这属于本次需要审核的机器人文件改动。
-
-构建成功后，临时 Python 文件可以删除。构建记录需要保留；上位机的标零预检会使用它确认当前安装产物与源码一致。源码或安装产物后来发生变化，预检会要求重新构建。
+构建和 GitHub 更新步骤只准备部署源码、编译产物和构建记录。电机、推理、CAN 总线和现场标零操作保持独立。
 
 ## 上位机流程变化
 
 重启上位机后，在“角度与标定”打开标零流程：
 
 1. 核对在线采集连接、机器人身份、SSH 绑定和弹窗中的“标零机型”。有明确绑定配置时自动选24/28；没有时必须独立人工选择。此流程不要求先有角度、关节名称或参考姿态；角度表的显示数量不参与选型，旧角度也不用于标零或保存参考。
-2. 完成现场确认，再打开独立终端。终端检查脚本、配置、已审查的 LRO 驱动源码，以及构建记录；缺失或不匹配时拒绝启动电机工具。
+2. 完成现场确认，再打开独立终端。终端检查脚本、配置和已审查的 LRO 驱动源码，并使用已安装的工具检查或生成构建记录。
 3. 终端内仍需 SSH/sudo 认证及明确的 `CALIBRATE 24` 或 `CALIBRATE 28` 确认，随后才运行原有标零脚本。上位机不会因终端打开或脚本退出就判定标零成功。
 
 109 固件的被动监听解析已在本机回放中按低三位故障码、8/12 字节 Type1 帧修正。该代码没有自动同步到机器人；旧版健康快照补丁不能直接套到新 deploy。

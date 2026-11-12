@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+import httpx
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
@@ -24,11 +25,13 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -40,8 +43,15 @@ from PySide6.QtWidgets import (
 
 from .board_check_view import BoardCheckView, board_check_view
 from .desktop_result_summary import ResultSummaryPanel
+from .factory_duration_policy import duration_status
 from .factory_models import FactorySegmentStart
-from .factory_store import FUNCTIONAL_CHECK_NAMES, ITEM_NAMES, STATUS_NAMES, FactoryStore
+from .factory_store import (
+    BATTERY_SWAP_STAGES,
+    FUNCTIONAL_CHECK_NAMES,
+    ITEM_NAMES,
+    STATUS_NAMES,
+    FactoryStore,
+)
 from .factory_test_catalog import (
     BOARD_CASE_CODES,
     CATEGORY_NAMES,
@@ -78,6 +88,36 @@ class FactoryJob(QThread):
             self.completed.emit(self.operation())
         except Exception as exc:
             self.failed.emit(exc)
+
+
+def _send_light_test(context, password=None):
+    from .deploy_policy import station_headers
+    from .factory_client import _local_url
+
+    body = {"robot_id": context["robot_id"], "relay_url": context["relay_url"]}
+    if password is not None:
+        body["sudo_password"] = password
+    try:
+        with httpx.Client(timeout=25, trust_env=False, follow_redirects=False) as client:
+            response = client.post(
+                _local_url(context["station_url"]) + "/api/v1/station/light-test",
+                headers=station_headers(context),
+                json=body,
+            )
+    except (OSError, httpx.HTTPError) as exc:
+        raise ValueError("未收到点灯回执，请核对电脑后台和机器人连接") from exc
+    if response.status_code == 404:
+        raise ValueError("电脑后台尚未支持点灯测试，请使用新版上位机后台并重新连接")
+    result = response.json()
+    if not isinstance(result, dict):
+        raise ValueError("电脑后台返回的点灯回执无效")
+    if response.status_code != 200:
+        detail = result.get("detail")
+        raise ValueError(detail if isinstance(detail, str) else "电脑后台未确认点灯命令")
+    allowed = {"command_sent", "password_required"} if password is None else {"command_sent"}
+    if result.get("robot_id") != context["robot_id"] or result.get("status") not in allowed:
+        raise ValueError("点灯回执与所选机器人不匹配")
+    return result["status"]
 
 
 class _NoticeLabel(QLabel):
@@ -134,7 +174,6 @@ class FactoryPanel(QScrollArea):
         super().__init__()
         self.source_provider = source_provider
         self.deploy_context_provider = deploy_context_provider or (lambda: {})
-        self.motor_parameter_dialog = None
         self.battery_swap_dialog = None
         self.live_frame = None
         self.live_frame_received = None
@@ -142,6 +181,15 @@ class FactoryPanel(QScrollArea):
         self.board_profile_values = self.store.board_profile()
         self.client = self.tunnel = None
         self.identity = None
+        self._motion_epoch = 0
+        self._motion_worker = None
+        self._motion_next_poll = 0.0
+        self._motion_confirmed_at = None
+        self._motion_confirmed_wall = None
+        self._motion_problem = ""
+        self._motion_active_id = None
+        self._motion_pending = []
+        self._motion_paused = False
         self.sn = ""
         self.remote_rows = []
         self.local_rows = []
@@ -188,14 +236,22 @@ class FactoryPanel(QScrollArea):
         motion_connection = QWidget()
         connection_layout = QVBoxLayout(motion_connection)
         connection_layout.setContentsMargins(0, 0, 0, 0)
-        connection_layout.addWidget(_text("动作日志连接（第4～5项）：可复用主界面连接，或独立SSH连接机器人已有监听。"))
+        connection_layout.addWidget(_text("运控记录自动复用主界面连接。"))
+        self.policy = QLineEdit()
+        self.policy.setPlaceholderText("本段记录标签（可选）")
+        self.policy.setAccessibleName("本段记录标签")
+        connection_layout.addWidget(self.policy)
         quick = QHBoxLayout()
-        self._button(quick, "使用当前连接", self.use_current)
-        self._button(quick, "刷新 / 重连核对", self.refresh_remote)
+        self._button(quick, "使用主界面连接", self.use_current)
+        self.motion_refresh_button = self._button(quick, "立即核对", self.refresh_remote)
         self._button(quick, "断开本页连接", self.disconnect_connection)
         connection = QGroupBox("独立SSH：仅转发机器人已有监听")
         connection.setVisible(False)
-        self._button(quick, "展开 / 收起独立SSH设置", lambda: connection.setVisible(not connection.isVisible()))
+        ssh_settings = QPushButton("独立 SSH 设置")
+        ssh_settings.setCheckable(True)
+        ssh_settings.toggled.connect(connection.setVisible)
+        quick.addWidget(ssh_settings)
+        self.action_buttons.append(ssh_settings)
         connection_layout.addLayout(quick)
         form = QFormLayout(connection)
         self.target = QLineEdit("robo@192.168.137.250")
@@ -220,34 +276,118 @@ class FactoryPanel(QScrollArea):
         layout.addWidget(self.work_tabs)
 
         record = QGroupBox("机器人本地测试记录")
+        record.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         body = QVBoxLayout(record)
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(12)
+        identity = QWidget()
+        identity.setObjectName("factoryMotionIdentity")
+        identity.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        identity_row = QHBoxLayout(identity)
+        identity_row.setContentsMargins(14, 9, 14, 9)
+        self.motion_sn_label = _text("未选择")
+        self.motion_robot_label = _text("—")
+        self.motion_connection_label = _text("未连接")
+        self.motion_connection_label.setObjectName("factoryMotionConnection")
+        for title, value in (("整机 SN", self.motion_sn_label), ("机器人", self.motion_robot_label)):
+            group = QVBoxLayout()
+            group.setSpacing(2)
+            label = _text(title)
+            label.setObjectName("factoryMotionCaption")
+            value.setObjectName("factoryMotionIdentityValue")
+            group.addWidget(label)
+            group.addWidget(value)
+            group.setAlignment(Qt.AlignmentFlag.AlignTop)
+            identity_row.addLayout(group, 1)
+        identity_row.addWidget(self.motion_connection_label)
+        body.addWidget(identity)
+
+        recording = QWidget()
+        recording.setObjectName("factoryMotionCard")
+        recording.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        recording_layout = QVBoxLayout(recording)
+        recording_layout.setContentsMargins(14, 12, 14, 12)
+        recording_layout.setSpacing(10)
+        recording_header = QHBoxLayout()
+        self.motion_record_heading = _text("本轮记录")
+        self.motion_record_heading.setObjectName("factoryMotionHeading")
+        self.motion_record_heading.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        self.motion_state_label = _text("状态待确认")
+        self.motion_state_label.setObjectName("factoryMotionState")
+        self.motion_state_label.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
+        recording_header.addWidget(self.motion_record_heading, 1)
+        recording_header.addWidget(self.motion_state_label)
+        recording_layout.addLayout(recording_header)
+
         self.connection_options = motion_connection
         motion_connection.hide()
-        entry = QHBoxLayout()
+        self.motion_type_options = QWidget()
+        entry = QHBoxLayout(self.motion_type_options)
+        entry.setContentsMargins(0, 0, 0, 0)
         self.test_type = QComboBox()
         for value, title in TYPES.items():
             self.test_type.addItem(f"{MOTION_CASE_CODES[value]} · {title}", value)
         self.test_type.currentIndexChanged.connect(self.motion_type_changed)
-        self.policy = QLineEdit()
-        self.policy.setPlaceholderText("本段记录标签（可选；策略在机器人端手动启动）")
+        self.test_type.setAccessibleName("运控动作类型")
+        entry.addWidget(_text("动作类型"))
         entry.addWidget(self.test_type)
-        entry.addWidget(self.policy, 1)
-        self.start_button = self._button(entry, "开始记录", self.start_segment)
-        self.read_button = self._button(entry, "读取数据", self.read_data)
-        self.read_button.setToolTip("接回网线后，结束当前SN的本段记录并取回日志；不会停止机器人策略。可选择已结束的历史记录重新读取。")
-        body.addLayout(entry)
-        self.motion_notice = _text("点击“开始记录”后，机器人本地持续记录；测试后接回网线，点击“读取数据”。")
+        entry.addStretch(1)
+        recording_layout.addWidget(self.motion_type_options)
+        self.motion_type_options.hide()
+
+        self.duration_label = _text("—")
+        self.motion_valid_points = _text("—")
+        self.motion_health_points = _text("—")
+        self.motion_duration_caption = _text("记录时长（约）")
+        metrics = QHBoxLayout()
+        for label, value in ((self.motion_duration_caption, self.duration_label),
+                             (_text("运控有效点"), self.motion_valid_points),
+                             (_text("健康有效点"), self.motion_health_points)):
+            group = QVBoxLayout()
+            group.setSpacing(2)
+            label.setObjectName("factoryMotionCaption")
+            value.setObjectName("factoryMotionValue")
+            group.addWidget(label)
+            group.addWidget(value)
+            group.setAlignment(Qt.AlignmentFlag.AlignTop)
+            metrics.addLayout(group, 1)
+        recording_layout.addLayout(metrics)
+
+        actions = QHBoxLayout()
+        self.start_button = self._button(actions, "开始记录", self.start_segment)
+        self.read_button = self._button(actions, "结束记录并取回", self.read_data)
+        self.read_button.setToolTip("结束并取回当前样品、机器人及测试项目的活动记录。")
+        actions.addStretch(1)
+        advanced = QPushButton("高级设置")
+        advanced.setCheckable(True)
+        advanced.toggled.connect(motion_connection.setVisible)
+        actions.addWidget(advanced)
+        self.action_buttons.append(advanced)
+        recording_layout.addLayout(actions)
+        recording_layout.addWidget(motion_connection)
+
+        self.motion_notice = _text("测试期间可接网线查看实时趋势。取回后在“测试数据”查看曲线和关键统计。")
         self.motion_notice.setObjectName("factoryMotionNotice")
         self.motion_notice.setAccessibleName("动作日志连接、开始记录与导入结果")
+        self.motion_notice.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         self.motion_notice.setStyleSheet("color:#294f86;background:#edf3ff;border:1px solid #cbdcf5;border-radius:6px;padding:8px;")
         self.notice.text_changed.connect(self.motion_notice.setText)
-        body.addWidget(self.motion_notice)
-        self.duration_label = _text("记录时长：未开始；每段要求超过2小时，最终按机器人日志确认。")
-        body.addWidget(self.duration_label)
+        recording_layout.addWidget(self.motion_notice)
+        self.motion_recovery = QWidget()
+        recovery = QHBoxLayout(self.motion_recovery)
+        recovery.setContentsMargins(0, 0, 0, 0)
+        self.motion_retry_button = self._button(recovery, "重试本次开始", self.retry_start)
+        self.motion_release_button = self._button(recovery, "放弃本次请求", self.release_pending)
+        recovery.addStretch(1)
+        recording_layout.addWidget(self.motion_recovery)
+        self.motion_recovery.hide()
+        body.addWidget(recording)
+
         self.duration_timer = QTimer(self)
         self.duration_timer.timeout.connect(self.update_duration)
+        self.duration_timer.timeout.connect(self._poll_motion)
         self.duration_timer.start(1000)
-        self.manual_deploy_guide = _text("1. 点击“开始记录”，确认记录中。\n2. 到机器人端手动启动deploy，按原手柄流程测试；拔掉网线后机器人仍会记录。\n3. 每段记录超过2小时后接回网线，点击“读取数据”，取回关键统计、趋势和异常证据；不会停止策略。\n24轴特技使用UFO；28轴不测试特技。不足2小时也能读取，但标记时长不足。记录时长不等于实际动作时长。")
+        self.manual_deploy_guide = _text("确认样品 SN 与机器人后开始记录。现场人员在机器人端手动启动策略，站立期间可接网线查看实时趋势。站立记录达到2小时后取回；行走、跑步和特技无两小时时长要求。结束记录后在“测试数据”查看曲线和关键统计。24轴特技使用UFO，28轴不适用。结论由人员填写。")
         body.addWidget(self.manual_deploy_guide)
         self.functional_check_box = QGroupBox("整机功能必测 · 24轴 / 28轴")
         function_layout = QVBoxLayout(self.functional_check_box)
@@ -262,17 +402,24 @@ class FactoryPanel(QScrollArea):
                 lambda _checked=False, value=kind: self.confirm_functional_check(value))
         function_layout.addLayout(function_buttons)
         body.addWidget(self.functional_check_box)
+        history = QWidget()
+        history.setObjectName("factoryMotionCard")
+        history.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        history_layout = QVBoxLayout(history)
+        history_layout.setContentsMargins(14, 12, 14, 12)
+        history_header = QHBoxLayout()
+        history_label = _text("历史片段")
+        history_label.setObjectName("factoryMotionHeading")
+        history_header.addWidget(history_label, 1)
+        self.motion_history_button = self._button(history_header, "取回所选历史片段", self.import_motion_history)
+        history_layout.addLayout(history_header)
         self.remote_table = _table(["SN / 类型", "机器人 / 来源", "状态 / 片段ID", "有效点（健康 / 运动）"])
-        body.addWidget(self.remote_table)
+        history_layout.addWidget(self.remote_table)
+        body.addWidget(history)
         buttons = QHBoxLayout()
         self.motion_result_button = self._button(buttons, "保存到第4项结果", self.save_motion_evidence)
-        self._button(buttons, "连接 / 记录恢复设置", lambda: motion_connection.setVisible(not motion_connection.isVisible()))
-        body.insertLayout(body.indexOf(self.remote_table), buttons)
-        recovery = QHBoxLayout()
-        self._button(recovery, "重试待确认开始", self.retry_start)
-        self._button(recovery, "核对后解除待确认", self.release_pending)
-        connection_layout.addLayout(recovery)
-        body.addWidget(motion_connection)
+        buttons.addStretch(1)
+        body.addLayout(buttons)
         self.work_tabs.addTab(self.build_workflow(record), "测试项目")
 
         evidence = QGroupBox("电脑已保存日志（拔插网线不影响这些文件）")
@@ -330,7 +477,7 @@ class FactoryPanel(QScrollArea):
         function_results.addWidget(_text("以下是人工现场结论；遥测仅作证据，不自动判断急停生效或换电成功。人工记录时间不等于实际操作时间，操作时间请写入备注。"))
         self.functional_result_table = _table(["功能", "人工结论", "记录时间", "关联日志 / 现场观察"])
         function_results.addWidget(self.functional_result_table)
-        self.soc_table = _table(["编号 / 记录时间", "SOC变化 / %", "机器人 / 来源", "连续性"])
+        self.soc_table = _table(["编号 / 记录时间", "电池阶段 / SOC", "机器人 / 来源", "连续性"])
         function_results.addWidget(self.soc_table)
         self._button(function_results, "查看选中SOC截图", self.show_soc_screenshot)
         self.functional_result_box.hide()
@@ -526,8 +673,9 @@ class FactoryPanel(QScrollArea):
                         if row["segment_id"] == exc.identifier:
                             if exc.sealed_info:
                                 self.remote_rows[index] = exc.sealed_info
-                            state = exc.sealed_info["state"] if exc.sealed_info else "结束待确认"
-                            self.remote_table.setItem(index, 2, QTableWidgetItem(f"{state} / {exc.identifier}"))
+                                if self._motion_active_id == exc.identifier:
+                                    self._motion_active_id = None
+                            self.update_motion_controls()
                     if exc.sealed_info:
                         self.notice.setText(f"片段{exc.identifier}的记录已结束（{exc.sealed_info['state']}）；导入失败：{exc}。机器人原件保留，可重新导入；后续测试需新开记录段。电脑已有文件保留。")
                     else:
@@ -697,25 +845,43 @@ class FactoryPanel(QScrollArea):
         else:
             self.calibration_confirmation_note.setText("整机标定：尚未确认。")
         check = self.result_rows[2].get("calibration")
+        angle_check = self.result_rows[2].get("angle_calibration")
+        encoder = bool(angle_check and not check)
+        check = check or angle_check
         self.calibration_table.setVisible(bool(check))
         if check:
             rows = check["report"]["results"]
             labels = {"passed": "合格", "failed": "不合格", "skipped": "已跳过", "pending": "未测", "active": "检查中", "interrupted": "已中断"}
+            if encoder:
+                labels["passed"] = "角度达标"
             counts = {status: sum(row["status"] == status for row in rows) for status in labels}
-            summary = f"标定检查：合格 {counts['passed']}/{len(rows)}，跳过 {counts['skipped']}，不合格 {counts['failed']}，未完成 {counts['pending'] + counts['active'] + counts['interrupted']}"
-            self.calibration_note.setText(f"{summary} · 机器人 {check['robot_id']} · 本机保存。逐项结果与人工结论分别保留。")
-            self.calibration_stage_note.setText(f"{summary} · 机器人 {check['robot_id']} · 本机已保存。")
+            title = "只读编码器角度检查" if encoder else "标定检查"
+            summary = f"{title}：{labels['passed']} {counts['passed']}/{len(rows)}，跳过 {counts['skipped']}，不合格 {counts['failed']}，未完成 {counts['pending'] + counts['active'] + counts['interrupted']}"
+            saved_summary = f"{summary} · 机器人 {check['robot_id']} · 本机已保存。"
+            if angle_check and not encoder:
+                saved_summary += " 只读编码器记录见「查看结果」。"
+            self.calibration_note.setText(saved_summary + " 逐项结果与人工结论分别保留。")
+            self.calibration_stage_note.setText(saved_summary)
             self.result_table.item(2, 3).setText(summary + "；" + (self.result_rows[2]["latest"] or {}).get("notes", ""))
+            self.calibration_table.horizontalHeaderItem(3).setText("实测 / °" if encoder else "实测峰值 / °")
             self.calibration_table.setRowCount(len(rows))
             for index, row in enumerate(rows):
                 attempt = next((a for a in reversed(row["attempts"]) if a["attempt_id"] == row["effective_attempt_id"]), {})
-                peak = attempt.get("peak_angle_deg")
-                measured = f"{peak:.2f}" if isinstance(peak, (int, float)) else "未知"
-                error = f"{peak - row['reference_deg']:+.2f}" if isinstance(peak, (int, float)) else "未知"
+                angle = attempt.get("current_angle_deg" if encoder and row["status"] != "failed" else "peak_angle_deg")
+                measured = f"{angle:.2f}" if isinstance(angle, (int, float)) else "未知"
+                error = f"{angle - row['reference_deg']:+.2f}" if isinstance(angle, (int, float)) else "未知"
                 self._fill(self.calibration_table, index, [row["joint"], {"lower": "下限", "upper": "上限", "center": "插销零位" if row.get("check_mode") == "pin_zero" else "零位"}.get(row["direction"], row["direction"]), f"{row['reference_deg']:.2f}", measured, error, labels[row["status"]]])
         else:
             self.calibration_note.setText("标定检查：尚未关联。请先选SN；已有检查可导入本机JSON。")
             self.calibration_stage_note.setText("标定检查：尚未关联；先选SN，已有结果可导入。")
+        zero_check = self.result_rows[2].get("zero_reference_check")
+        if zero_check:
+            rows = zero_check["report"]["results"]
+            passed = sum(row["status"] == "passed" for row in rows)
+            summary = f"标零位复查：达标 {passed}/{len(rows)} 项 · 机器人 {zero_check['robot_id']} · 详见「查看结果」。"
+            if check:
+                summary = self.calibration_stage_note.text() + "\n" + summary
+            self.calibration_stage_note.setText(summary)
 
         if self.result_summary.sn != self.sn:
             self.result_summary.set_sn(self.sn)
@@ -758,10 +924,22 @@ class FactoryPanel(QScrollArea):
         observations = self.store.soc_observations(self.sn) if self.sn else []
         self.soc_table.setRowCount(len(observations))
         for index, entry in enumerate(observations):
+            stage = entry.get("stage")
             previous = entry.get("previous_soc")
-            change = f"{entry['soc']:g}" if previous is None else f"{previous:g} → {entry['soc']:g}"
+            recorded_at = entry["sampled_at"]
+            if stage == "backup":
+                change = "小电池 · 无SOC"
+                if entry["soc"] is not None:
+                    change += "（历史BMS读数未归属）"
+                recorded_at = entry.get("created_at") or recorded_at
+            elif stage in BATTERY_SWAP_STAGES:
+                change = f"{BATTERY_SWAP_STAGES[stage]} · {entry['soc']:g}%"
+            else:
+                event = {"baseline": "起始", "change": "变化", "final": "结束快照"}.get(entry["event"], "观测")
+                reading = f"{entry['soc']:g}%" if previous is None else f"{previous:g}% → {entry['soc']:g}%"
+                change = f"BMS {event} · {reading}（阶段未标记）"
             source = "SIMULATED · 模拟数据" if entry["source_kind"] == "simulated" else "ROS2观测"
-            self._fill(self.soc_table, index, [f"{FUNCTION_CASE_CODES['battery_hot_swap']} · {entry['sampled_at']}",
+            self._fill(self.soc_table, index, [f"{FUNCTION_CASE_CODES['battery_hot_swap']} · {recorded_at}",
                 change, f"{entry['robot_id']} / {source}", entry["continuity"]])
             self.soc_table.item(index, 0).setData(Qt.ItemDataRole.UserRole, entry)
         current = self.result_table.item(3, 3)
@@ -849,6 +1027,10 @@ class FactoryPanel(QScrollArea):
         observation_ids = list(monitor.observation_ids)
         monitor.deleteLater()
         if self.closing or self.closed:
+            return
+        if monitor.target_error:
+            self.refresh_local()
+            self.notice.setText(monitor.target_error)
             return
         if not accepted:
             self.refresh_local()
@@ -943,7 +1125,7 @@ class FactoryPanel(QScrollArea):
         if not observation_ids:
             text += "\n未取得有效SOC截图，以上为人员现场结论。"
         if monitor.error:
-            text += "\nSOC截图保存异常，未将缺失证据视作有效数据。"
+            text += f"\nSOC截图保存异常：{monitor.error}。"
         self._job(lambda: self.store.save_functional_check(sn, kind, status, text, ids,
                   soc_observation_ids=observation_ids), saved)
 
@@ -992,17 +1174,72 @@ class FactoryPanel(QScrollArea):
     def mark_disconnected(self):
         self.live_frame = None
         self.live_frame_received = None
+        if self.tunnel is None:
+            self._motion_epoch += 1
+            self._motion_problem = "主界面连接已断开"
+            self._motion_next_poll = 0.0
         if hasattr(self, "workbench"):
             self.workbench.refresh_status()
+            self.update_motion_controls()
         if self.battery_swap_dialog:
             self.battery_swap_dialog.mark_disconnected()
 
-    def confirm_light(self):
+    def test_light(self):
         sn = self.sn
         if not sn:
-            self.notice.setText("请先打开对应整机SN，再确认灯板亮灯。")
+            self.notice.setText("请先打开对应整机SN，再测试灯板。")
             return
-        box = QMessageBox(QMessageBox.Icon.Question, "确认灯板亮灯", f"SN：{sn}\n请按原测试流程点亮灯板。实际观察到灯板亮了吗？\n本操作只记录观察结果，不发送灯板控制命令。", parent=self)
+        context = self.deploy_context_provider()
+        robot_id = context.get("robot_id")
+        if (not context.get("connected") or not robot_id or not context.get("relay_url")
+                or not context.get("station_url") or not context.get("station_token_file")):
+            self.notice.setText("请先在设备设置通过「添加后台机器人」连接当前SN对应的实机。")
+            return
+        binding = self.store.sn_identity(sn)
+        if binding and (binding["robot_id"], binding["source_kind"]) != (robot_id, "ros2"):
+            self.notice.setText("当前SN与连接的实机身份不一致，未发送点灯命令。")
+            return
+        target_keys = ("robot_id", "relay_url", "generation", "station_url", "station_token_file")
+
+        def same_target():
+            current = self.deploy_context_provider()
+            return (self.sn == sn and current.get("connected")
+                    and all(current.get(key) == context.get(key) for key in target_keys))
+
+        def dispatch(password=None):
+            status = None
+
+            def completed(value):
+                nonlocal status
+                status = value
+
+            def confirm():
+                if not same_target():
+                    self.notice.setText("SN或机器人连接已变化，本次灯板结果未记录。")
+                    return
+                if status == "password_required":
+                    entered, ok = QInputDialog.getText(
+                        self, "授权灯板测试", f"{robot_id} 需要 sudo 密码。密码仅用于本次点灯。",
+                        QLineEdit.EchoMode.Password,
+                    )
+                    if ok and entered and same_target():
+                        dispatch(entered)
+                    else:
+                        self.notice.setText("本次点灯授权未完成，未保存灯板结论。")
+                    return
+                if status == "command_sent":
+                    self.confirm_light(sn, robot_id, same_target)
+
+            self._job(lambda: _send_light_test(context, password), completed,
+                      on_error=lambda exc: self.notice.setText(f"点灯未确认：{exc}。本次未保存灯板结论。"),
+                      progress=f"正在给 {robot_id} 的灯板发送点灯命令…", after_success=confirm)
+
+        dispatch()
+
+    def confirm_light(self, sn, robot_id, same_target):
+        box = QMessageBox(QMessageBox.Icon.Question, "确认灯板亮灯",
+                          f"SN：{sn}\n机器人：{robot_id}\n已收到点灯命令的成功回执。请现场观察，灯板实际亮了吗？",
+                          parent=self)
         yes = box.addButton("亮了", QMessageBox.ButtonRole.YesRole)
         no = box.addButton("没亮", QMessageBox.ButtonRole.NoRole)
         cancel = box.addButton("暂不确认", QMessageBox.ButtonRole.RejectRole)
@@ -1011,8 +1248,8 @@ class FactoryPanel(QScrollArea):
         answer = box.clickedButton()
         if answer not in (yes, no):
             return
-        if self.sn != sn:
-            self.notice.setText("SN已变化，本次灯板观察未保存，请核对后重新确认。")
+        if not same_target():
+            self.notice.setText("SN或机器人连接已变化，本次灯板观察未保存。")
             return
         lit = answer == yes
         def complete(_):
@@ -1066,6 +1303,36 @@ class FactoryPanel(QScrollArea):
             if done:
                 done(False, message)
         self._job(lambda: self.store.save_calibration_check(sn, path, expected_robot), success, failure)
+
+    def sync_angle_calibration_check(self, sn, data, expected_robot, done):
+        if self.busy or self.closing or self.result_summary.busy:
+            message = "本机正在处理其他任务，请稍后重试保存角度记录。"
+            self.notice.setText(message)
+            done(False, message)
+            return
+
+        def finish(ok, message):
+            self.notice.setText(message)
+            done(ok, message)
+
+        def success(result):
+            if self.sn == sn:
+                self.refresh_local()
+            finish(True, f"只读角度记录已保存到 SN：{sn} · {result['robot_id']}。可在 SYS-006 的「查看结果」查看。")
+
+        def failure(exc):
+            finish(False, f"角度记录未能保存：{exc}")
+
+        self._job(lambda: self.store.save_angle_calibration_check(sn, data, expected_robot), success, failure)
+
+    def save_zero_reference_check(self, sn, data, expected_robot):
+        if self.busy or self.closing or self.result_summary.busy:
+            raise ValueError("本机正在处理其他任务，请稍后重试保存标零位复查记录")
+        result = self.store.save_zero_reference_check(sn, data, expected_robot)
+        if self.sn == sn:
+            self.refresh_local()
+        self.notice.setText(f"标零位复查已保存到 SN：{sn} · {result['robot_id']}。可在 SYS-006 的「查看结果」查看。")
+        return True
 
     def completion_changed(self, changed):
         if changed.column() != 1 or not self.sn or self.busy or self.closing:
@@ -1128,24 +1395,16 @@ class FactoryPanel(QScrollArea):
             self.update_model_controls()
 
     def use_current(self):
-        self._connect_current()
-
-    def _connect_current(self, after_success=None):
-        from .factory_client import FactoryClient
-        url = self.source_provider()
-        def operation():
-            client = FactoryClient(url)
-            identity = client.probe()
-            return client, identity, client.list_segments(), None
-        def failed(exc):
-            self.notice.setText(f"动作日志连接失败：{str(exc).rstrip('。')}。未发送开始记录请求；请检查主界面机器人连接，或展开独立SSH设置连接已有observer。")
-        self._job(operation, self.connected, on_error=failed, progress="正在核对当前主连接的动作日志服务，请稍候…", after_success=after_success)
+        self._motion_paused = False
+        self._poll_motion(force=True, main_only=True)
 
     def connect_ssh(self):
         from .factory_client import FactoryClient
         from .ssh_transport import SshTunnel
         target, password, port, fingerprint = self.target.text(), self.password.text(), self.port.value(), self.trust.text().strip()
         self.password.clear()
+        self._motion_paused = False
+        self._motion_epoch += 1
         def operation():
             tunnel = SshTunnel.connect(target, password, self.store.directory / "known_hosts", collector_port=port, confirmed_fingerprint=fingerprint)
             try:
@@ -1157,93 +1416,66 @@ class FactoryPanel(QScrollArea):
                 raise
         self._job(operation, self.connected, progress="正在通过独立SSH连接机器人动作日志服务，请稍候…")
 
-    def open_motor_parameters(self):
-        from .factory_client import FactoryClient
-
+    def open_motor_parameters(self, section="parameters"):
         if self.busy or self.closing:
             return
-        if self.motor_parameter_dialog:
-            self.motor_parameter_dialog.raise_()
-            self.motor_parameter_dialog.activateWindow()
-            return
         if not self.sn:
-            self.notice.setText("先打开整机SN，再检查对应机器人的电机参数。")
-            return
+            self.notice.setText("先打开整机SN，再维护对应机器人的电机。")
+        self.tool_requested.emit(f"motor_{section}", 1)
+
+    def motor_maintenance_context(self):
         context = self.deploy_context_provider()
         if self.tunnel and self.identity and hasattr(self.tunnel, "deploy_binding"):
             context = {**self.tunnel.deploy_binding, "connected": True, "robot_id": self.identity["robot_id"],
                        "relay_url": self.client.url, "tunnel": self.tunnel}
-        if (not context.get("connected") or not context.get("robot_id")
+        return context
+
+    def validate_motor_maintenance_context(self, context):
+        sn = self.sn
+        frame = self.live_frame or {}
+        if not sn:
+            raise ValueError("请先在整机测试打开本次样品的SN。")
+        if (not context.get("connected") or not context.get("robot_id") or not context.get("target")
                 or context.get("relay_url", "").rstrip("/") != self.source_provider().rstrip("/")):
-            self.notice.setText("请先在设备设置连接对应机器人，再打开电机参数检查；不会使用可编辑地址猜测目标。")
-            return
-        sn, dof = self.sn, self.model.currentData()
-        profile_snapshot = json.loads(json.dumps(self.board_profile_values))
+            raise ValueError("请先在设备设置连接当前SN对应的机器人。")
+        if (self.live_frame_received is None or time.monotonic() - self.live_frame_received > 2
+                or frame.get("upload", {}).get("collector_connected") is False):
+            raise ValueError("等待机器人采集端的实时数据，请核对设备连接。")
+        if frame.get("robot_id") != context["robot_id"] or frame.get("source_kind") != "ros2":
+            raise ValueError("采集端的机器人身份或来源与维护目标不一致。")
         bound = self.store.sn_identity(sn)
         if bound and (bound["robot_id"] != context["robot_id"] or bound["source_kind"] != "ros2"):
-            self.notice.setText("此SN绑定的机器人与当前连接不一致，未打开电机参数操作。")
-            return
-        def complete(identity):
-            if (self.sn, self.model.currentData()) != (sn, dof):
-                self.notice.setText("SN或机型已变化，未打开参数操作。")
-                return
-            if identity.get("robot_id") != context["robot_id"] or identity.get("source_kind") != "ros2":
-                self.notice.setText("已连接采集端的机器人身份或来源不一致，未打开参数操作。")
-                return
-            from .desktop_motor_parameters import MotorParameterDialog
-            def save_parameter_evidence(bound_sn, request, result):
-                self.save_motor_parameter_report(bound_sn, request, result, board_test_profile=profile_snapshot)
-            self.motor_parameter_dialog = MotorParameterDialog(context, sn, dof, save_parameter_evidence, self)
-            self.motor_parameter_dialog.report_requested.connect(self.show_motor_parameter_report)
-            self.motor_parameter_dialog.finished.connect(self.motor_parameter_dialog_closed)
-            self.motor_parameter_dialog.open()
-        self._job(lambda: FactoryClient(context["relay_url"]).probe(), complete,
-                  progress="正在核对参数检查的机器人身份，尚未发送CAN查询…")
+            raise ValueError("此SN绑定的机器人与当前连接不一致。")
 
-    def motor_parameter_dialog_closed(self):
-        if self.motor_parameter_dialog:
-            self.motor_parameter_dialog.deleteLater()
-            self.motor_parameter_dialog = None
-
-    def show_motor_parameter_report(self, sn):
+    def show_motor_parameter_report(self, sn, section="parameters"):
         """Open the already-archived check; never query hardware or duplicate evidence."""
         if sn != self.sn or self.result_summary.busy or self.closing:
             self.notice.setText("请先打开检查对应的SN并等待当前报告操作结束。")
             return
-        if self.motor_parameter_dialog:
-            if self.motor_parameter_dialog.worker:
-                return
-            self.motor_parameter_dialog.reject()
         self.refresh_local()
-        self.show_item_result(1)
-        table = self.result_summary.table
-        for index in range(table.rowCount()):
-            if table.item(index, 0).text() == MOTOR_PARAMETERS_CASE_CODE:
-                table.setCurrentCell(index, 0)
-                table.selectRow(index)
-                table.scrollToItem(table.item(index, 0))
-                break
+        if section == "firmware":
+            self.show_case_result("SYS-003")
+            return
+        self.show_case_result(MOTOR_PARAMETERS_CASE_CODE)
         self.notice.setText(f"SN：{sn} · 电机检查已自动加入SYS-003固件与SYS-004参数报告。"
                             "可编辑当前最终版后导出CSV，或导出原始HTML / 明细CSV查看逐电机参数。")
 
+    def save_motor_firmware_report(self, sn, request, result, *, board_test_profile=None):
+        profile = self.board_profile_values if board_test_profile is None else board_test_profile
+        path = self._write_motor_receipt(
+            "motor-firmware", f"motor-firmware-{uuid4()}",
+            dict(sn=sn, request=request, result=result, board_test_profile=profile),
+        )
+        self._attach_motor_receipt(sn, path)
+        self.notice.setText(f"SN：{sn} · 电机固件维护回执已保存到第1项附件。")
+
     def save_motor_parameter_report(self, sn, request, result, *, board_test_profile=None):
-        directory = self.store.directory / "motor-parameters"
-        directory.mkdir(exist_ok=True, mode=0o700)
-        path = directory / f"{request['request_id']}-{uuid4()}.json"
-        with path.open("x", encoding="utf-8") as stream:
-            os.chmod(path, 0o600)
-            profile = self.board_profile_values if board_test_profile is None else board_test_profile
-            json.dump(dict(sn=sn, request=request, result=result, board_test_profile=profile), stream, ensure_ascii=False, allow_nan=False)
-            stream.flush()
-            os.fsync(stream.fileno())
-        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        attachment = self.store.add_attachment(sn, 1, path)
-        previous = self.store.results(sn)[0]["latest"] or {}
-        status, completed = previous.get("status", "incomplete"), previous.get("completed", False)
+        profile = self.board_profile_values if board_test_profile is None else board_test_profile
+        path = self._write_motor_receipt(
+            "motor-parameters", f"{request['request_id']}-{uuid4()}",
+            dict(sn=sn, request=request, result=result, board_test_profile=profile),
+        )
+        status = completed = None
         note = ""
         if result["state"] == "checked":
             rows = result["rows"]
@@ -1252,14 +1484,39 @@ class FactoryPanel(QScrollArea):
             note = f"电机MIT量程检查：一致{len(rows)-different-unreadable}，差异{different}，未完成{unreadable}；固件版本与其他Pn参数未判定合规。"
             if different or unreadable:
                 status, completed = ("fail" if different else "incomplete"), False
-        elif request["operation"] == "update":
+        elif request["operation"] in {"update", "rewrite"}:
             status, completed = "incomplete", False
             note = f"电机量程更新：{result['state']}；需重新检查，未自动判定第1项通过。"
+        self._attach_motor_receipt(sn, path, note=note, status=status, completed=completed)
+        self.notice.setText(f"SN：{sn} · 电机参数记录已保存；" + (note or "原值先保存在电脑。"))
+
+    def _write_motor_receipt(self, subdirectory, filename, payload):
+        directory = self.store.directory / subdirectory
+        directory.mkdir(exist_ok=True, mode=0o700)
+        path = directory / f"{filename}.json"
+        with path.open("x", encoding="utf-8") as stream:
+            os.chmod(path, 0o600)
+            json.dump(payload, stream, ensure_ascii=False, allow_nan=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return path
+
+    def _attach_motor_receipt(self, sn, path, *, note="", status=None, completed=None):
+        attachment = self.store.add_attachment(sn, 1, path)
+        previous = self.store.results(sn)[0]["latest"] or {}
+        if status is None:
+            status = previous.get("status", "incomplete")
+        if completed is None:
+            completed = previous.get("completed", False)
         notes = previous.get("notes", "") + ("\n" + note if note else "")
         self.store.save_result(sn, 1, status, notes, previous.get("segment_ids", []),
                                [*previous.get("attachment_ids", []), attachment["attachment_id"]], completed=completed)
         self.refresh_local()
-        self.notice.setText(f"SN：{sn} · 电机参数记录已保存；" + (note or "原值先保存在电脑。"))
 
     def connected(self, value):
         client, identity, rows, tunnel = value
@@ -1269,47 +1526,227 @@ class FactoryPanel(QScrollArea):
         self.render_remote(rows)
 
     def refresh_remote(self):
-        if not self.client:
-            self.notice.setText("请先使用当前连接或独立SSH连接；本地历史仍可使用。")
+        self._poll_motion(force=True)
+
+    def _motion_target(self, *, main_only=False):
+        if self.tunnel is not None and not main_only:
+            return (self.client.url, self.identity["robot_id"], self.identity["source_kind"], self.tunnel)
+        frame = self.live_frame
+        received = self.live_frame_received
+        if frame is None or received is None or time.monotonic() - received > 3:
+            return None
+        if not isinstance(frame, dict):
+            frame = frame.model_dump()
+        if frame.get("upload", {}).get("collector_connected") is False:
+            return None
+        url = self.source_provider().rstrip("/")
+        if url and frame.get("robot_id") and frame.get("source_kind"):
+            return (url, frame["robot_id"], frame["source_kind"], None)
+        return None
+
+    def _poll_motion(self, *, force=False, main_only=False):
+        from .factory_client import FactoryClient
+
+        if self.busy or self.closing or self._motion_worker is not None:
             return
-        self._job(self.client.list_segments, self.render_remote, progress="正在刷新机器人记录状态，请稍候…")
+        if not force and (self._motion_paused or not self.motion_record_box.isVisible()
+                          or time.monotonic() < self._motion_next_poll):
+            return
+        target = self._motion_target(main_only=main_only)
+        if target is None:
+            if force:
+                self.notice.setText("请在设备设置连接机器人，或使用高级设置中的独立 SSH。")
+            return
+        self._motion_next_poll = time.monotonic() + 3
+        epoch = self._motion_epoch
+        url, robot_id, source_kind, tunnel = target
+        client = self.client if self.client and self.client.url == url else None
+        identity = self.identity or {}
+        if (identity.get("robot_id"), identity.get("source_kind")) != (robot_id, source_kind):
+            client = None
+
+        def operation():
+            connection = client or FactoryClient(url)
+            listing = connection.list_segments()
+            if (connection.robot_id, connection.source_kind) != (robot_id, source_kind):
+                raise ValueError("动作记录服务与主界面的机器人身份不一致，请核对设备连接。")
+            return connection, {"robot_id": robot_id, "source_kind": source_kind}, listing, tunnel
+
+        def current():
+            return (not self.closing and not self.busy and self._motion_epoch == epoch
+                    and self._motion_target(main_only=main_only) == target)
+
+        def received(value):
+            if current():
+                try:
+                    self.connected(value)
+                except (ValueError, OSError, TypeError, KeyError) as exc:
+                    failed(exc)
+
+        def failed(exc):
+            if current():
+                self._motion_problem = str(exc)
+                self.motion_connection_label.setToolTip(str(exc))
+                self.update_motion_controls()
+                if force:
+                    self.notice.setText(f"记录状态待确认：{exc}")
+
+        worker = FactoryJob(operation)
+        self._motion_worker = worker
+        _WORKERS.add(worker)
+
+        def finished():
+            self._motion_worker = None
+            _WORKERS.discard(worker)
+            worker.deleteLater()
+
+        worker.completed.connect(received)
+        worker.failed.connect(failed)
+        worker.finished.connect(finished)
+        worker.start()
+
+    def _motion_ready(self):
+        target = self._motion_target()
+        if self._motion_paused or self._motion_problem or self._motion_confirmed_at is None or target is None:
+            return False
+        identity = self.identity or {}
+        return (self.client is not None and time.monotonic() - self._motion_confirmed_at <= 8
+                and target[:3] == (self.client.url, identity.get("robot_id"), identity.get("source_kind")))
+
+    @staticmethod
+    def _motion_row_key(row):
+        return tuple(row[key] for key in ("sn", "test_type", "robot_id", "source_kind"))
+
+    def _motion_selection(self):
+        identity = self.identity or {}
+        robot_id, source_kind = identity.get("robot_id"), identity.get("source_kind")
+        if self.tunnel is None and self.live_frame is not None:
+            frame = self.live_frame
+            if isinstance(frame, dict):
+                robot_id, source_kind = frame.get("robot_id"), frame.get("source_kind")
+            else:
+                robot_id, source_kind = frame.robot_id, frame.source_kind
+        return self.sn, self.test_type.currentData(), robot_id, source_kind
+
+    def _active_motion_row(self):
+        return next((row for row in self.remote_rows if row["segment_id"] == self._motion_active_id), None)
+
+    def _motion_pending_here(self):
+        selection = self._motion_selection()
+        return [request for request in self._motion_pending
+                if (request.sn, request.test_type, request.robot_id, request.source_kind) == selection]
 
     def render_remote(self, result):
         self.remote_rows = result["segments"]
-        known = {row["segment_id"] for row in self.remote_rows}
+        self._motion_active_id = result.get("active_segment_id")
+        self._motion_pending = []
+        known = {row["segment_id"]: self._motion_row_key(row) for row in self.remote_rows}
         for request in self._pending():
-            if str(request.segment_id) in known:
+            if known.get(str(request.segment_id)) == (request.sn, request.test_type, request.robot_id, request.source_kind):
                 self._write_intent(request, True)
-        self._render_remote_rows()
-        source = "模拟数据·非实机" if self.identity["source_kind"] == "simulated" else "ROS2来源·实机待验收"
-        active = result.get("active_segment_id") or "无"
-        self.notice.setText(f"已核对 {self.identity['robot_id']} · {source}；机器人活动段：{active}。新记录保存1Hz趋势及关键统计，缺失按实际来源显示。拔线后本页只是最后确认状态，请接线刷新。" + (f" 记录故障：{result['fault']}" if result.get("fault") else ""))
+            else:
+                self._motion_pending.append(request)
+        self._motion_confirmed_at = time.monotonic()
+        self._motion_confirmed_wall = datetime.now(timezone.utc)
+        self._motion_problem = ""
+        self.motion_connection_label.setToolTip(result.get("fault", ""))
+        self.update_motion_controls()
+
+    def _motion_history(self):
+        selection = self._motion_selection()
+        return [row for row in self.remote_rows
+                if row["state"] != "recording" and self._motion_row_key(row) == selection]
 
     def _render_remote_rows(self):
-        self.remote_table.setRowCount(len(self.remote_rows))
-        for index, row in enumerate(self.remote_rows):
+        rows = self._motion_history()
+        shown = getattr(self, "_motion_history_shown", [])
+        if rows == shown:
+            return
+        index = self.remote_table.currentRow()
+        selected = shown[index]["segment_id"] if 0 <= index < len(shown) else None
+        self._motion_history_shown = rows
+        self.remote_table.setRowCount(len(rows))
+        states = {"sealed": "已结束", "interrupted": "已中断", "fault": "记录故障"}
+        for index, row in enumerate(rows):
             valid = row["valid_counts"]
-            self._fill(self.remote_table, index, [f"{row['sn']} / {TYPES[row['test_type']]}", f"{row['robot_id']} / {row['source_kind']}", f"{row['state']} / {row['segment_id']}", f"{valid.get('health',0)} / {valid.get('motion',0)}"])
-        self.update_duration()
+            state = states.get(row["state"], row["state"])
+            self._fill(self.remote_table, index, [f"{row['sn']} / {TYPES[row['test_type']]}", f"{row['robot_id']} / {row['source_kind']}", f"{state} / {row['segment_id']}", f"{valid.get('health',0)} / {valid.get('motion',0)}"])
+            if row["segment_id"] == selected:
+                self.remote_table.selectRow(index)
 
     def update_duration(self):
         if hasattr(self, "workbench"):
             self.workbench.refresh_status()
-        row = next((row for row in self.remote_rows if row["sn"] == self.sn and row["state"] == "recording"), None)
-        if not row:
-            self.duration_label.setText("每段记录要求超过2小时；已结束记录的实际时长在“本地曲线”查看。")
-            return
-        start = datetime.fromisoformat(row["started_at"].replace("Z", "+00:00"))
-        elapsed = max(0, (datetime.now(timezone.utc) - start).total_seconds())
-        hours, remainder = divmod(int(elapsed), 3600)
-        minutes, seconds = divmod(remainder, 60)
-        self.duration_label.setText(f"记录时长约 {hours:02d}:{minutes:02d}:{seconds:02d} · 要求超过2小时。此处为时钟估计，最终以读取的机器人单调计时为准。")
+        self.update_motion_controls()
+
+    def update_motion_controls(self):
+        ready = self._motion_ready()
+        idle = not self.busy and not self.closing and not self.result_summary.busy
+        selection = self._motion_selection()
+        active = self._active_motion_row()
+        ours = active is not None and self._motion_row_key(active) == selection
+        pending = self._motion_pending_here()
+        bound = self.store.sn_identity(self.sn) if self.sn and idle and ready else None
+        wrong_robot = bool(bound and (bound["robot_id"], bound["source_kind"]) != selection[2:])
+        supported = selection[1] != "stunt" or self.model.currentData() == 24
+        if not ready:
+            status = "状态待确认"
+        elif active and not ours:
+            status = f"{active['sn']} · {TYPES[active['test_type']]}录制中"
+        elif ours:
+            status = "录制中"
+        elif not self.sn:
+            status = "请先打开整机 SN"
+        elif wrong_robot:
+            status = "SN 与机器人不匹配"
+        elif self._motion_pending:
+            request = self._motion_pending[0]
+            status = "开始请求待确认" if pending else f"{request.sn} · {TYPES[request.test_type]}待确认"
+        else:
+            status = "待开始" if supported else "28 轴不适用"
+        robot, source = selection[2:]
+        self.motion_robot_label.setText((robot or "—") + (" · SIMULATED 模拟数据" if source == "simulated" else ""))
+        self.motion_sn_label.setText(self.sn or "未选择")
+        self.motion_connection_label.setText("已连接 · 独立 SSH" if ready and self.tunnel else
+                                             "已连接" if ready else "连接待确认" if self.identity else "等待连接")
+        self.motion_state_label.setText(status)
+        duration = "—"
+        counts = {}
+        if ours and self._motion_confirmed_wall is not None:
+            now = datetime.now(timezone.utc) if ready else self._motion_confirmed_wall
+            start = datetime.fromisoformat(active["started_at"].replace("Z", "+00:00"))
+            hours, rest = divmod(max(0, int((now - start).total_seconds())), 3600)
+            minutes, seconds = divmod(rest, 60)
+            duration = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+            counts = active["valid_counts"]
+        requirement = "站立要求达到 02:00:00" if selection[1] == "standing" else "无两小时时长要求"
+        duration_caption = "记录时长（约）"
+        if ours and not ready and self._motion_confirmed_wall is not None:
+            last_check = self._motion_confirmed_wall.astimezone().strftime("%H:%M:%S")
+            duration_caption = f"最后确认 {last_check}（约）"
+        self.motion_duration_caption.setText(f"{duration_caption} · {requirement}")
+        self.duration_label.setText(duration)
+        self.motion_valid_points.setText(f"{counts['motion']:,}" if "motion" in counts else "—")
+        self.motion_health_points.setText(f"{counts['health']:,}" if "health" in counts else "—")
+        self.start_button.setEnabled(idle and ready and bool(self.sn) and supported and not wrong_robot
+                                     and not active and not self._motion_pending)
+        self.read_button.setEnabled(idle and ready and ours)
+        self.motion_recovery.setVisible(bool(pending) and ready and not active)
+        self.motion_retry_button.setEnabled(idle and supported and not wrong_robot)
+        self.motion_release_button.setEnabled(idle)
+        self.motion_refresh_button.setEnabled(idle and self._motion_target() is not None)
+        self._render_remote_rows()
+        self.motion_history_button.setEnabled(idle and ready and bool(self._motion_history()))
+        for button in self.motion_export_buttons:
+            button.setEnabled(idle and bool(self.sn))
 
     def disconnect_connection(self):
         tunnel, self.tunnel = self.tunnel, None
+        self._motion_paused = True
+        self._motion_epoch += 1
         self.client = None
-        self.identity = None
         self.notice.setText("本页已断开；机器人记录继续。电脑文件、SN结果和曲线保留。远端表格为最后确认状态。")
+        self.update_motion_controls()
         if tunnel:
             self._job(tunnel.close, lambda _: None)
 
@@ -1354,14 +1791,12 @@ class FactoryPanel(QScrollArea):
         if self.model.currentData() == 28 and self.test_type.currentData() == "stunt":
             self.notice.setText("28轴不进行特技测试，未开始记录。")
             return
-        if not self.client:
-            expected = (self.sn, self.test_type.currentData(), self.policy.text())
-            def start_after_connect():
-                if (self.sn, self.test_type.currentData(), self.policy.text()) != expected:
-                    self.notice.setText("SN或测试内容已变化，连接已核对，但未自动开始；请核对后重新点击开始。")
-                    return
-                self.start_segment()
-            self._connect_current(start_after_connect)
+        if not self._motion_ready():
+            self.notice.setText("正在等待当前机器人记录状态核对。确认后即可开始。")
+            self.refresh_remote()
+            return
+        if self._motion_active_id:
+            self.notice.setText("机器人已有活动段，请按页面显示的 SN 和测试项目处理本段。")
             return
         try:
             bound = self.store.sn_identity(self.sn)
@@ -1372,82 +1807,111 @@ class FactoryPanel(QScrollArea):
                 self.notice.setText("存在开始状态待确认的片段，请先刷新核对或点击重试待确认开始，避免新建重复段。")
                 return
             request = FactorySegmentStart(segment_id=uuid4(), sn=self.sn, robot_id=self.identity["robot_id"], source_kind=self.identity["source_kind"], test_type=self.test_type.currentData(), policy=self.policy.text())
-            self._write_intent(request)
         except (ValueError, OSError) as exc:
             self.notice.setText(f"未发送开始请求：{exc}")
             return
         self._start(request)
 
     def retry_start(self):
-        try:
-            pending = self._pending()
-        except (ValueError, OSError) as exc:
-            self.notice.setText(f"待确认请求无法读取：{exc}")
-            return
-        if not pending or not self.client:
+        pending = self._motion_pending_here()
+        if not pending or not self._motion_ready() or self._motion_active_id:
             self.notice.setText("当前机器人没有待确认的开始请求；请刷新核对活动段。")
             return
-        self._start(pending[0])
+        if self.motion_retry_button.isEnabled():
+            self._start(pending[0], retry=True)
 
     def release_pending(self):
-        if not self.client:
+        pending = self._motion_pending_here()
+        if not pending or not self._motion_ready() or self._motion_active_id:
             self.notice.setText("接回网线并核对机器人无活动段后，才能解除待确认请求。")
             return
+        request = pending[0]
         client = self.client
+        self._motion_epoch += 1
+        epoch = self._motion_epoch
+
         def operation():
             listing = client.list_segments()
+            self._check_motion_epoch(epoch)
+            if any(row["segment_id"] == str(request.segment_id) for row in listing["segments"]):
+                return listing, False
             if listing.get("active_segment_id"):
                 raise ValueError("机器人仍有活动段，请先核对并结束/导入，不能解除")
-            pending = self._pending()
-            for request in pending:
-                path = self._intent_path(request.segment_id)
-                data = json.loads(path.read_text())
-                data["abandoned"] = True
-                temporary = path.with_suffix(".tmp")
-                with temporary.open("w", encoding="utf-8") as stream:
-                    os.chmod(temporary, 0o600)
-                    json.dump(data, stream, ensure_ascii=False)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary, path)
-            return listing, len(pending)
-        def complete(value):
-            listing, count = value
-            self.render_remote(listing)
-            self.notice.setText(f"已核对机器人无活动段，解除{count}个本地待确认请求。请求历史和机器人原件保留；后续开始使用新ID，不恢复旧段。")
-        self._job(operation, complete)
+            path = self._intent_path(request.segment_id)
+            data = json.loads(path.read_text())
+            data["abandoned"] = True
+            temporary = path.with_suffix(".tmp")
+            with temporary.open("w", encoding="utf-8") as stream:
+                os.chmod(temporary, 0o600)
+                json.dump(data, stream, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            return listing, True
 
-    def _start(self, request):
+        def complete(value):
+            listing, abandoned = value
+            if self._motion_epoch == epoch:
+                self.render_remote(listing)
+            self.notice.setText("已放弃本次开始请求，历史记录保留。" if abandoned
+                                else "已核对机器人上的原片段，待确认状态已更新。")
+
+        self._job(operation, complete, on_error=self._motion_action_failed)
+
+    def _check_motion_epoch(self, epoch):
+        if epoch != self._motion_epoch:
+            raise ValueError("机器人连接已变化，请核对当前记录状态后重试。")
+
+    def _motion_action_failed(self, exc):
+        self._motion_problem = str(exc)
+        self._motion_next_poll = 0.0
+
+    def _start(self, request, *, retry=False):
         client = self.client
+        self._motion_epoch += 1
+        epoch = self._motion_epoch
+
         def operation():
+            listing = client.list_segments()
+            self._check_motion_epoch(epoch)
+            if retry and any(row["segment_id"] == str(request.segment_id) for row in listing["segments"]):
+                return None, listing, "已找到原片段，请查看当前记录状态。"
+            if listing.get("active_segment_id"):
+                return None, listing, "机器人已有活动段，请按页面显示的 SN 和测试项目处理本段。"
+            if not retry:
+                self._write_intent(request)
             info = client.start(request)
             self._write_intent(request, True)
             try:
                 listing = client.list_segments()
             except (ValueError, OSError):
                 listing = None
-            return info, listing
+            return info, listing, ""
+
         def complete(value):
-            info, listing = value
-            if listing:
+            info, listing, notice = value
+            current = self._motion_epoch == epoch
+            if current and listing is not None:
                 self.render_remote(listing)
-            else:
-                # The POST was acknowledged even if the subsequent GET failed.
-                # Show that exact acknowledgement without inventing a fresh list.
+            elif current and info is not None:
                 self.remote_rows = [info, *(row for row in self.remote_rows if row["segment_id"] != info["segment_id"])]
-                self._render_remote_rows()
-            for index, row in enumerate(self.remote_rows):
-                if row["segment_id"] == info["segment_id"]:
-                    self.remote_table.selectRow(index)
-                    break
-            state = info["state"]
-            message = "记录段已开始；创建成功不代表已有有效数据，请接线刷新查看。" if state == "recording" else f"原片段状态为{state}，没有恢复记录。可导入该旧段，核对后开始新片段。"
-            self.notice.setText(f"{info['sn']} · {info['segment_id']}：{message}请到机器人端手动启动deploy；记录超过2小时后接回网线，点击“读取数据”。" + (" 列表刷新未完成，已确认的片段状态保留。" if listing is None else ""))
-        self._job(operation, complete, progress=f"正在为SN：{request.sn}开始记录；片段：{request.segment_id}。请等待机器人确认，暂勿拔线。")
+                if info["state"] == "recording":
+                    self._motion_active_id = info["segment_id"]
+                self._motion_confirmed_wall = datetime.now(timezone.utc)
+                self._motion_problem = "开始回执已收到，等待重新核对活动段"
+                self._motion_next_poll = 0.0
+            if info is not None:
+                notice = (f"{info['sn']} · {TYPES[info['test_type']]}已开始记录，请在机器人端现场操作。"
+                          if info["state"] == "recording" else "原片段已结束，可在历史片段中取回。")
+            self.notice.setText(notice)
+
+        self._job(operation, complete, on_error=self._motion_action_failed,
+                  progress=f"正在确认 {request.sn} 的{TYPES[request.test_type]}记录…")
 
     def _selected_remote(self):
         index = self.remote_table.currentRow()
-        return self.remote_rows[index] if 0 <= index < len(self.remote_rows) else None
+        rows = getattr(self, "_motion_history_shown", [])
+        return rows[index] if 0 <= index < len(rows) else None
 
     def save_motion_evidence(self):
         if self.busy or self.closing:
@@ -1460,7 +1924,7 @@ class FactoryPanel(QScrollArea):
             self.refresh_local()
             self.show_item_result(item)
             self.notice.setText(f"{sn} · 已将{value['segment_count']}段测试数据保存到第{item}项结果，关键统计和时长已附上。" +
-                                ("所有关联段记录均超过2小时；请填写实际结论。" if value["duration_satisfied"] else "存在时长不足的记录，保持未完成。") +
+                                (("站立时长要求已满足；请填写实际结论。" if item == 4 else "特技无两小时时长要求；请填写实际结论。") if value["duration_satisfied"] else "站立记录不足2小时或未完成，保持未完成。") +
                                 "保存数据不等于测试通过。")
         self._job(lambda: self.store.save_motion_evidence(sn, item), complete,
                   progress=f"正在保存到{sn}的第{item}项结果，请稍候…")
@@ -1468,29 +1932,63 @@ class FactoryPanel(QScrollArea):
     def read_data(self):
         if self.busy or self.closing:
             return
-        if not self.sn:
-            self.notice.setText("先打开整机SN，再读取对应机器人的测试数据。")
+        row = self._active_motion_row()
+        selection = self._motion_selection()
+        if not self._motion_ready() or not row or self._motion_row_key(row) != selection:
+            self.notice.setText("当前样品和测试项目没有已核对的活动记录。可在历史片段中取回已结束的记录。")
             return
-        if not self.client:
-            self._connect_current(self.read_data)
+        identifier = row["segment_id"]
+        client = self.client
+        answer = QMessageBox.question(
+            self, "结束记录并取回",
+            f"结束 {row['sn']} · {row['robot_id']} 的{TYPES[row['test_type']]}记录并取回电脑？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
             return
-        client, sn = self.client, self.sn
-        stunt = self.selected_stage == 5
-        selected = self._selected_remote()
-        selected_id = selected["segment_id"] if selected else None
+        if (not self._motion_ready() or self._motion_selection() != selection or self.client is not client
+                or self._motion_active_id != identifier):
+            self.notice.setText("连接或活动片段已变化，请核对后重试。")
+            return
+        self._motion_epoch += 1
+        epoch = self._motion_epoch
+
         def operation():
             listing = client.list_segments()
-            candidates = [row for row in listing["segments"] if row["sn"] == sn
-                          and (row["test_type"] == "stunt") == stunt]
-            row = next((r for r in candidates if r["segment_id"] == listing["active_segment_id"]), None)
-            row = row or next((r for r in candidates if r["segment_id"] == selected_id), None)
-            row = row or max(candidates, key=lambda r: r["started_at"], default=None)
-            if not row:
-                raise ValueError("机器人上没有当前SN和测试项的记录；请先开始记录。历史记录按原SN保留")
-            return self._download_segment(client, row, row["state"] == "recording")
-        self._job(operation, self._import_complete,
-                  progress="正在核对机器人记录、结束本段并读取测试数据；不会停止机器人策略…",
+            self._check_motion_epoch(epoch)
+            current = next((item for item in listing["segments"] if item["segment_id"] == identifier), None)
+            if (listing.get("active_segment_id") != identifier or not current or current["state"] != "recording"
+                    or self._motion_row_key(current) != selection):
+                raise ValueError("活动记录已变化，请重新核对本段状态。")
+            return self._download_segment(client, current, True)
+
+        self._job(operation, lambda value: self._motion_imported(value, epoch), on_error=self._motion_action_failed,
+                  progress=f"正在结束并取回 {row['sn']} 的{TYPES[row['test_type']]}记录…",
                   after_success=self.select_local)
+
+    def import_motion_history(self):
+        if self.busy or self.closing or not self._motion_ready():
+            return
+        history = self._motion_history()
+        row = self._selected_remote() or max(history, key=lambda item: item["started_at"], default=None)
+        if row is None:
+            self.notice.setText("当前样品和测试项目没有已结束的记录。")
+            return
+        client = self.client
+        self._motion_epoch += 1
+        epoch = self._motion_epoch
+        self._job(lambda: self._download_segment(client, row, False),
+                  lambda value: self._motion_imported(value, epoch), on_error=self._motion_action_failed,
+                  progress="正在取回选中的历史片段…", after_success=self.select_local)
+
+    def _motion_imported(self, value, epoch):
+        imported, listing = value
+        if self._motion_epoch != epoch:
+            listing = None
+        elif listing is None:
+            self._motion_problem = "数据已取回，等待核对机器人记录状态"
+            self._motion_next_poll = 0.0
+        self._import_complete((imported, listing))
 
     def _download_segment(self, client, row, seal):
         identifier = row["segment_id"]
@@ -1526,24 +2024,9 @@ class FactoryPanel(QScrollArea):
                 break
         duration = summary["duration_seconds"]
         duration_text = "时长未知" if duration is None else f"记录{duration / 60:.2f}分钟"
-        self.notice.setText(f"已校验并保存电脑副本；{duration_text}，" + ("满足超过2小时的记录要求。" if summary["duration_satisfied"] else "时长不足或未知，不算完成。") + "机器人原件保留，性能结论仍需核对关键数据。" +
+        self.notice.setText(f"已校验并保存电脑副本；{duration_text}，" + duration_status(summary) + "。机器人原件保留，性能结论仍需核对关键数据。" +
                             (" 重复导入，沿用已有文件。" if imported.get("duplicate") else "") +
                             (" 远端列表刷新未完成，本地保存成功。" if listing is None else ""))
-
-    def _import(self, seal):
-        row, client = self._selected_remote(), self.client
-        if not row or not client:
-            self.notice.setText("请连接并选择一个机器人片段。")
-            return
-        self._job(lambda: self._download_segment(client, row, seal), self._import_complete,
-                  progress="正在结束记录并导入电脑，请稍候…" if seal else "正在导入已结束片段，请稍候…",
-                  after_success=self.select_local)
-
-    def finish_import(self):
-        self._import(True)
-
-    def import_remote(self):
-        self._import(False)
 
     def import_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择机器人片段manifest.json", str(self.store.directory), "JSON (*.json)")
@@ -1582,7 +2065,7 @@ class FactoryPanel(QScrollArea):
         measured = "未知" if duration is None else f"{duration / 60:.2f}分钟"
         mode = "关键数据：1Hz趋势及完整观察统计" if summary["recording_mode"] == "key_data" else "历史原始记录"
         self.key_data_note.setText(f"{mode} · 记录时长{measured} · " +
-                                  ("超过2小时" if summary["duration_satisfied"] else "时长不足或未知") +
+                                  duration_status(summary) +
                                   f" · 异常观察{summary.get('exception_count', '未统计')}次。记录时长不等于动作时长，数据不构成自动合格判定。")
         metrics = summary.get("metrics", {})
         self.key_data_table.setVisible(bool(metrics))
@@ -1657,7 +2140,7 @@ class FactoryPanel(QScrollArea):
             self.attachments = []
             self.refresh_local()
             self.notice.setText("人工结果已追加保存，历史结果保留。" +
-                                ("时长不足或未知，未标记完成；每段记录要求超过2小时。" if completed and not saved["completed"] else "缺失和未验证项在报告中保留。"))
+                                ("站立时长不足、状态未完成或功能子项未测，未标记完成。" if completed and not saved["completed"] else "缺失和未验证项在报告中保留。"))
         self._job(operation, complete)
 
     def export_reports(self):
@@ -1674,15 +2157,13 @@ class FactoryPanel(QScrollArea):
     def shutdown(self):
         if self.closed:
             return True
-        if self.motor_parameter_dialog and self.motor_parameter_dialog.worker:
-            return False
         if not self.result_summary.shutdown():
             return False
         self.closing = True
         if self.battery_swap_dialog:
             self.battery_swap_dialog.reject()
         self.duration_timer.stop()
-        if self.busy or self.board_queue:
+        if self.busy or self.board_queue or self._motion_worker is not None:
             self._drain_board_sync()
             return False
         if self.tunnel:

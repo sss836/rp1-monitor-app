@@ -19,6 +19,11 @@ PACKAGE = "rp1-monitor-app"
 DEFAULT_VERSION = "0.4.5"
 APP_ROOT = "/opt/rp1-monitor-app"
 EXTRAS = "desktop,server,station"
+COLLECTOR_CALIBRATION_TOOLS = {
+    "scripts/calibration_runtime.py": "src/rp1_monitor/calibration_runtime.py",
+    "scripts/calibration_preflight.py": "src/rp1_monitor/calibration_preflight.py",
+    "scripts/update_deploy.sh": "scripts/update_deploy.sh",
+}
 SOURCE_IGNORE = shutil.ignore_patterns(
     "build", "dist", "*.egg-info", "__pycache__", "*.pyc", ".venv", "venv", ".git",
     ".pytest_cache", ".ruff_cache", ".pip-cache", ".tmp", "runtime", "state", "credentials", ".secrets",
@@ -239,6 +244,14 @@ def prepare_package(source, wheelhouse, stage, version):
     return stage
 
 
+def collector_calibration_tools(source):
+    tools = {name: Path(source) / path for name, path in COLLECTOR_CALIBRATION_TOOLS.items()}
+    for path in tools.values():
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"Missing regular calibration tool: {path}")
+    return tools
+
+
 def collector_bundle_for_build(output, *, source=None, supplied=None, wheelhouse=None):
     """Every production PC package ships an installable ARM64 collector payload."""
     candidate = Path(supplied) if supplied else (Path(source) if source else ROOT) / "src/rp1_monitor/data/collector-bundle.zip"
@@ -270,6 +283,20 @@ def collector_bundle_for_build(output, *, source=None, supplied=None, wheelhouse
         for name, digest in files.items():
             if hashlib.sha256(archive.read(name)).hexdigest() != digest:
                 raise ValueError("Collector bundle file checksum mismatch")
+        tools = {name: path.read_bytes() for name, path in collector_calibration_tools(source or ROOT).items()}
+        digests = {name: hashlib.sha256(data).hexdigest() for name, data in tools.items()}
+        if any(files.get(name) != digest for name, digest in digests.items()):
+            # Keep the verified observer wheels and add the tools from this PC release.
+            updated = output / "collector-bundle-with-calibration.zip"
+            manifest["files"].update(digests)
+            with zipfile.ZipFile(updated, "x", compression=zipfile.ZIP_DEFLATED) as result:
+                for item in archive.infolist():
+                    if item.filename not in {*tools, "manifest.json"}:
+                        result.writestr(item, archive.read(item))
+                for name, data in tools.items():
+                    result.writestr(name, data)
+                result.writestr("manifest.json", json.dumps(manifest, sort_keys=True) + "\n")
+            return updated
     return candidate
 
 

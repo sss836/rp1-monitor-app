@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from pydantic import TypeAdapter
 
@@ -29,7 +29,7 @@ from .board_check_view import BoardCheckView, board_check_view
 from .factory_basic_checks import BASIC_CHECKS, EXTRA_CHECKS, FactoryCheckReport
 from .factory_board_profile import BoardTestProfile, default_board_profile, factory_board_view
 from .factory_codec import decode_payload
-from .factory_key_data import MINIMUM_TEST_SECONDS
+from .factory_duration_policy import duration_requirement, duration_status
 from .factory_key_data import SCHEMA as KEY_DATA_SCHEMA
 from .factory_models import FACTORY_SEGMENT_SCHEMA, FactorySegmentInfo, FactorySegmentManifest
 from .factory_test_catalog import (
@@ -50,6 +50,8 @@ MAX_PACKAGE_BYTES = 2 * 1024**3
 RESERVE_BYTES = 16 * 1024**2
 MAX_ROWS = 2_000_000
 MAX_SOC_SCREENSHOT_BYTES = 4 * 1024**2
+ANGLE_CALIBRATION_SOURCE = "version_bound_encoder_observation"
+ZERO_REFERENCE_SOURCE = "version_bound_zero_reference_observation"
 ITEM_NAMES = {
     1: "镜像、电气与电机参数",
     2: "整机标定",
@@ -60,6 +62,7 @@ ITEM_NAMES = {
 STATUS_NAMES = {"pass": "通过（人工填写）", "fail": "不通过（人工填写）", "incomplete": "未填写结论 / 待复核"}
 STATUS_NAMES["not_applicable"] = "不适用（28轴不测试特技）"
 FUNCTIONAL_CHECK_NAMES = {"remote_estop": "远程急停", "battery_hot_swap": "热换电"}
+BATTERY_SWAP_STAGES = {"first": "第一块电池", "backup": "小电池", "second": "第二块电池"}
 _metric = TypeAdapter(MetricKey)
 _robot_id = TypeAdapter(RobotId)
 _source_kind = TypeAdapter(SourceKind)
@@ -181,23 +184,126 @@ def _timestamp(value):
     return value
 
 
+def _validate_zero_reference_evidence(row, limits):
+    from .joint_angle_monitor import RAW_FLOAT32_MAX, valid_raw_utc
+
+    motor_count = len(row["motor_indices"])
+    required = limits["required_samples"]
+    for evidence in (row, *row["attempts"]):
+        if not isinstance(evidence, dict):
+            raise ValueError("标零位复查尝试记录无效")
+        samples = evidence.get("samples")
+        if (not isinstance(samples, list) or len(samples) > required
+                or type(evidence.get("sample_count")) is not int or evidence["sample_count"] != len(samples)):
+            raise ValueError("标零位复查的原始采样数不匹配")
+        previous_sequence = previous_ns = None
+        for sample in samples:
+            if not isinstance(sample, dict):
+                raise ValueError("标零位复查样本格式无效")
+            raw, rx, utc = (sample.get(key) for key in ("raw_angles_deg", "raw_rx_monotonic_ns", "raw_received_at"))
+            ns, sequence = sample.get("frame_monotonic_ns"), sample.get("sequence")
+            if (not all(isinstance(values, list) and len(values) == motor_count for values in (raw, rx, utc))
+                    or not all(type(value) in (int, float) and -RAW_FLOAT32_MAX <= value <= RAW_FLOAT32_MAX for value in raw)
+                    or type(ns) is not int or not 0 < ns < 2**63
+                    or type(sequence) is not int or sequence < 1
+                    or (previous_sequence is not None and sequence != previous_sequence + 1)
+                    or not all(type(stamp) is int and (previous_ns or 0) < stamp <= ns for stamp in rx)
+                    or not all(valid_raw_utc(value) for value in utc)
+                    or (motor_count > 1 and not 0 < max(rx) - min(rx) <= limits["max_pair_skew_ms"] * 1_000_000)):
+                raise ValueError("标零位复查样本缺少完整的原始角度或接收时间")
+            for key in ("logical_measured_deg", "logical_delta_deg"):
+                angle = sample.get(key)
+                if angle is not None and (type(angle) not in (int, float) or not -180 <= angle <= 180):
+                    raise ValueError("标零位复查样本逻辑角无效")
+            previous_sequence, previous_ns = sequence, ns
+        columns = list(zip(*(sample["raw_angles_deg"] for sample in samples)))
+        spans = [max(column) - min(column) for column in columns]
+        latest = samples[-1] if samples else {}
+        if (evidence.get("raw_span_deg") != (spans if samples else None)
+                or any(evidence.get(key) != latest.get(key)
+                       for key in ("raw_angles_deg", "logical_measured_deg", "logical_delta_deg"))):
+            raise ValueError("标零位复查结果与原始采样不一致")
+        if evidence.get("status") == "passed":
+            if (len(samples) != required
+                    or any(abs(value) > limits["raw_tolerance_deg"] for column in columns for value in column)
+                    or any(span > limits["max_span_deg"] for span in spans)
+                    or any(sample.get("logical_measured_deg") is None for sample in samples)):
+                raise ValueError("标零位复查达标记录缺少符合条件的原始采样")
+
+
+def _validate_angle_evidence(automatic, report, *, legacy_missing_failures=False):
+    passing = automatic.get("passing_samples")
+    failing = {} if legacy_missing_failures else automatic.get("failing_samples")
+    if not isinstance(passing, dict) or not isinstance(failing, dict) or not (passing or failing):
+        raise ValueError("只读角度检查尚无可归档的实测样本")
+    rows = report["results"]
+    passing_attempts = {str(row["index"]): row["attempts"][-1] for row in rows if row["status"] == "passed"}
+    failing_attempts = {str(row["index"]): {str(a["attempt_id"]): a for a in row["attempts"] if a["status"] == "failed"}
+                        for row in rows if any(a["status"] == "failed" for a in row["attempts"])}
+    if (len(passing) != len(passing_attempts) or set(map(str, passing)) != passing_attempts.keys()
+            or (not legacy_missing_failures
+                and (len(failing) != len(failing_attempts) or set(map(str, failing)) != failing_attempts.keys()))):
+        raise ValueError("只读角度实测样本与逐关节结果不一致")
+    measurements = [(sample, passing_attempts[str(index)]) for index, sample in passing.items()]
+    for index, samples in failing.items():
+        attempts = failing_attempts[str(index)]
+        if not isinstance(samples, dict) or len(samples) != len(attempts) or set(map(str, samples)) != attempts.keys():
+            raise ValueError("只读角度超限样本与尝试记录不一致")
+        measurements.extend((sample, attempts[str(attempt)]) for attempt, sample in samples.items())
+    for sample, attempt in measurements:
+        position = sample.get("position_rad") if isinstance(sample, dict) else None
+        if (type(position) not in (int, float) or not -math.pi <= position <= math.pi
+                or attempt["current_angle_deg"] is None
+                or abs(math.degrees(position) - attempt["current_angle_deg"]) > 1e-9):
+            raise ValueError("只读关节角与报告实测值不一致")
+        frames = sample.get("samples")
+        received = []
+        if not isinstance(frames, list) or not 1 <= len(frames) <= 2:
+            raise ValueError("只读角度缺少原始编码器反馈")
+        for frame in frames:
+            raw = frame.get("raw_hex") if isinstance(frame, dict) else None
+            stamp = frame.get("rx_monotonic_ns") if isinstance(frame, dict) else None
+            if (not isinstance(raw, str) or len(raw) != 12 or not raw.startswith("a001")
+                    or any(char not in "0123456789abcdef" for char in raw) or frame.get("status") != "fresh"
+                    or type(stamp) is not int or not 0 < stamp < 2**63):
+                raise ValueError("只读角度缺少原始编码器反馈或接收时间")
+            received.append(stamp)
+        if type(sample.get("rx_monotonic_ns")) is not int or sample["rx_monotonic_ns"] != min(received):
+            raise ValueError("只读关节角接收时间与原始反馈不一致")
+    result = {"passing_samples": {str(index): sample for index, sample in passing.items()}}
+    if not legacy_missing_failures:
+        result["failing_samples"] = {str(index): {str(attempt): sample for attempt, sample in samples.items()}
+                                     for index, samples in failing.items()}
+    return result
+
+
 def _soc_observation(value):
     required = {"session_id", "robot_id", "source_kind", "event", "sampled_at", "received_at",
                 "soc", "soc_age_ms", "continuity"}
     optional = {"previous_soc", "voltage", "current", "uptime_seconds"}
-    if not isinstance(value, dict) or not required <= value.keys() or value.keys() - required - optional:
+    if not isinstance(value, dict) or not required <= value.keys() or value.keys() - required - optional - {"stage"}:
         raise ValueError("SOC观察缺少必填字段或包含未允许字段")
     answer = dict(value)
     if not isinstance(value["session_id"], str):
         raise ValueError("SOC观察会话编号无效")
     answer["session_id"] = str(UUID(value["session_id"]))
     answer["robot_id"] = _robot_id.validate_python(value["robot_id"])
-    if value["source_kind"] not in ("ros2", "simulated") or value["event"] not in ("baseline", "change", "final"):
+    if value["source_kind"] not in ("ros2", "simulated") or value["event"] not in ("baseline", "change", "final", "stage"):
         raise ValueError("SOC观察来源或事件无效")
+    if value["event"] == "stage":
+        if value.get("stage") not in tuple(BATTERY_SWAP_STAGES):
+            raise ValueError("SOC观察的换电阶段无效")
+    elif "stage" in value:
+        raise ValueError("仅现场标记可以附加换电阶段")
     for key in ("sampled_at", "received_at"):
         _timestamp(value[key])
+    backup = value.get("stage") == "backup"
     for key in ("soc", "soc_age_ms", *optional):
         number = value.get(key)
+        if backup and key != "uptime_seconds":
+            if number is not None:
+                raise ValueError("小电池阶段只保存现场标记及主控观测，电池读数须留空")
+            continue
         if key in optional and number is None:
             continue
         try:
@@ -213,6 +319,38 @@ def _soc_observation(value):
     if not isinstance(value["continuity"], str) or len(value["continuity"]) > 200:
         raise ValueError("SOC连续性说明无效或超过200字")
     return answer
+
+
+def hot_swap_soc_summary(observations, observation_ids):
+    """Display only this conclusion's observations, keeping each capture session distinct."""
+    linked = set(observation_ids)
+    sessions = {}
+    for entry in observations:
+        if entry["observation_id"] in linked:
+            key = (entry["session_id"], entry["robot_id"], entry["source_kind"])
+            sessions.setdefault(key, []).append(entry)
+    if not sessions:
+        return "本次未关联有效SOC读数。"
+    blocks = []
+    for (_, robot, source), entries in sessions.items():
+        stages = {entry["stage"]: entry for entry in entries if entry.get("stage")}
+        origin = "SIMULATED 模拟数据" if source == "simulated" else "ROS 2"
+        first = f"{stages['first']['soc']:g}%" if "first" in stages else "SOC未标记"
+        second = f"{stages['second']['soc']:g}%" if "second" in stages else "SOC未标记"
+        backup = "未标记"
+        if "backup" in stages:
+            marker = stages["backup"]
+            backup = "已标记 " + (marker.get("created_at") or marker["sampled_at"])
+        lines = [
+            f"现场阶段（{robot} · {origin}）：第一块电池 {first} → 小电池 无SOC（{backup}） → 第二块电池 {second}",
+        ]
+        unassigned = [f"{entry['soc']:g}%" for entry in entries
+                      if entry.get("stage") not in {"first", "second"} and entry["soc"] is not None]
+        if unassigned:
+            lines.append("未标记电池阶段的BMS原始读数：" + " → ".join(unassigned))
+        lines.append(f"{entries[-1]['continuity']}。")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
 
 
 def _soc_png(path):
@@ -487,19 +625,19 @@ class FactoryStore:
             row = self.db.execute("SELECT dof FROM sn_models WHERE sn=?", (_sn(sn),)).fetchone()
             if row:
                 return row["dof"]
-            calibration = self.calibration_check(sn)
+            calibration = self.calibration_check(sn) or self.angle_calibration_check(sn) or self.zero_reference_check(sn)
             return calibration["report"]["dof"] if calibration else 24
 
     def set_model_dof(self, sn, dof):
         sn = _sn(sn)
         if type(dof) is not int or dof not in (24, 28):
             raise ValueError("机型必须是24或28轴")
-        with self.lock:
-            calibration = self.calibration_check(sn)
-            if calibration and calibration["report"]["dof"] != dof:
+        with self.lock, self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            checks = (self.calibration_check(sn), self.angle_calibration_check(sn), self.zero_reference_check(sn))
+            if any(check and check["report"]["dof"] != dof for check in checks):
                 raise ValueError("机型与本SN已保存的标定检查不一致")
-            with self.db:
-                self.db.execute("INSERT INTO sn_models VALUES(?,?) ON CONFLICT(sn) DO UPDATE SET dof=excluded.dof", (sn, dof))
+            self.db.execute("INSERT INTO sn_models VALUES(?,?) ON CONFLICT(sn) DO UPDATE SET dof=excluded.dof", (sn, dof))
 
     def close(self):
         with self.lock:
@@ -527,7 +665,7 @@ class FactoryStore:
             duration = json.loads(metadata["recording_duration_seconds"]) if "recording_duration_seconds" in metadata else maximum
             if duration is not None and (type(duration) not in (int, float) or not math.isfinite(duration)
                                          or duration < 0 or (maximum is not None and duration < maximum)):
-                raise ValueError("日志记录时长无效，不能判断是否超过2小时")
+                raise ValueError("日志记录时长无效，无法判断时长要求")
             summary = decode_payload(metadata["key_data_summary"]) if "key_data_summary" in metadata else {}
             if summary:
                 if (summary.get("schema_version") != KEY_DATA_SCHEMA or summary.get("duration_seconds") != duration
@@ -542,14 +680,24 @@ class FactoryStore:
                         value = stat.get(name)
                         if value is not None and (type(value) not in (int, float) or not math.isfinite(value)):
                             raise ValueError("关键数据统计含无效数值")
-            return {**summary, "duration_seconds": duration, "minimum_test_seconds": MINIMUM_TEST_SECONDS,
-                    "duration_satisfied": duration is not None and duration > MINIMUM_TEST_SECONDS,
+            return {**summary, "duration_seconds": duration,
+                    "source_minimum_test_seconds": summary.get("minimum_test_seconds"),
+                    "source_duration_satisfied": summary.get("duration_satisfied"),
+                    **duration_requirement(manifest["test_type"], duration),
                     "recording_mode": summary.get("recording_mode", "legacy_raw"),
                     "performance_verdict": "unverified"}
 
     def item_duration_satisfied(self, sn, item):
-        segments = [row for row in self.list_segments(sn) if (5 if row["test_type"] == "stunt" else 4) == item]
-        return bool(segments) and all(self.segment_summary(row["segment_id"])["duration_satisfied"] for row in segments)
+        if item != 4:
+            return True
+        standing = [row for row in self.list_segments(sn) if row["test_type"] == "standing"]
+        if not standing:
+            return False
+        # A completed retest can supersede a short earlier attempt without deleting it.
+        latest = max(standing, key=lambda row: (
+            datetime.fromisoformat(row["started_at"].replace("Z", "+00:00")), row["segment_id"]
+        ))
+        return latest["state"] == "sealed" and self.segment_summary(latest["segment_id"])["duration_satisfied"]
 
     def save_motion_evidence(self, sn, item):
         sn, item = _sn(sn), _item(item)
@@ -583,10 +731,11 @@ class FactoryStore:
             attachment = attachment or self.add_attachment(sn, item, path)
             previous = self.results(sn)[item - 1]["latest"] or {}
             ids = [row["segment_id"] for row in rows]
-            enough = all(row["summary"]["duration_satisfied"] for row in records)
+            enough = self.item_duration_satisfied(sn, item)
             if attachment["attachment_id"] not in previous.get("attachment_ids", []) or previous.get("segment_ids") != ids:
                 self.save_result(sn, item, "incomplete", f"已归档{len(ids)}段关键数据；" +
-                                 ("各段记录超过2小时，待填写实际结论。" if enough else "存在时长不足的记录，未标记完成。"), ids,
+                                 (("站立时长要求已满足，待填写实际结论。" if item == 4 else "特技无两小时时长要求，待填写实际结论。")
+                                  if enough else "站立记录不足2小时或未完成，未标记完成。"), ids,
                                  [*previous.get("attachment_ids", []), attachment["attachment_id"]], completed=False)
             return dict(segment_count=len(ids), duration_satisfied=enough)
 
@@ -621,29 +770,153 @@ class FactoryStore:
                 return {key: observation[key] for key in ("robot_id", "source_kind")}
             return None
 
+    def validate_soc_target(self, sn, robot_id, source_kind):
+        """Check the intended SOC archive identity before starting observation."""
+        sn = _sn(sn)
+        robot_id = _robot_id.validate_python(robot_id)
+        if source_kind not in ("ros2", "simulated"):
+            raise ValueError(f"SN：{sn} 的SOC观测来源无效。")
+        with self.lock:
+            try:
+                self._check_identity(sn, robot_id, source_kind)
+            except ValueError as exc:
+                previous = self.sn_identity(sn)
+                current = f"SN：{sn}，当前机器人：{robot_id}（{source_kind}）"
+                if previous is not None:
+                    current += f"，已关联：{previous['robot_id']}（{previous['source_kind']}）"
+                raise ValueError(f"{current}。{exc}") from None
+
     def save_calibration_check(self, sn, path, expected_robot=None):
         """Save validated measured results without changing the human conclusion."""
-        from .manual_calibration_check import validate_report
-
         sn = _sn(sn)
         data = _read_json(path, maximum=16 * 1024**2)
+        if isinstance(data, dict) and data.get("kind") == "zero_reference_check":
+            return self.save_zero_reference_check(sn, data, expected_robot)
+        if isinstance(data, dict) and data.get("kind") == "angle_observations":
+            return self.save_angle_calibration_check(sn, data, expected_robot)
         if not isinstance(data, dict) or data.get("source_kind") != "hardware":
             raise ValueError("只接受人工标定检查保存的实机结果")
+        report = self._validated_calibration_report(data.get("report"))
+        return self._save_calibration_check(sn, data, report, expected_robot)
+
+    def save_angle_calibration_check(self, sn, data, expected_robot=None):
+        """Associate read-only encoder evidence with its original SN."""
+        sn = _sn(sn)
+        if not isinstance(data, dict) or data.get("kind") != "angle_observations" or data.get("sn") != sn:
+            raise ValueError("只读角度记录的原始SN与待归档SN不一致")
+        if data.get("preview_source") != "ros2":
+            raise ValueError("只读角度检查须来自已绑定的真实ROS2机器人")
+        _robot_id.validate_python(data.get("robot_id"))
+        try:
+            stream_id = data.get("stream_id")
+            if not isinstance(stream_id, str) or str(UUID(stream_id)) != stream_id:
+                raise ValueError
+        except ValueError:
+            raise ValueError("只读角度记录缺少原始采集流ID") from None
+        saved_at = data.get("saved_at")
+        if saved_at is not None and datetime.fromisoformat(_timestamp(saved_at).replace("Z", "+00:00")).utcoffset() != timezone.utc.utcoffset(None):
+            raise ValueError("只读角度保存时间必须使用UTC")
+        legacy = "run_id" not in data and "saved_at" not in data
+        automatic = data.get("automatic_encoder_check")
+        if (not isinstance(automatic, dict) or automatic.get("source") != ANGLE_CALIBRATION_SOURCE
+                or automatic.get("hardware_acceptance") is not False):
+            raise ValueError("只读角度记录缺少编码器来源或错误声称实机验收")
+        report = self._validated_calibration_report(automatic.get("report"))
+        if type(data.get("dof")) is not int or data["dof"] != report["dof"]:
+            raise ValueError("只读角度记录与逐关节报告机型不一致")
+        if any(not isinstance(data.get(key), list) for key in ("records", "encoder_samples")):
+            raise ValueError("只读角度记录格式无效")
+        evidence = _validate_angle_evidence(automatic, report, legacy_missing_failures=legacy and "failing_samples" not in automatic)
+        if legacy:
+            digest = hashlib.sha256(_json(data).encode()).hexdigest()
+            run_id = str(uuid5(NAMESPACE_URL, "rp1-angle-observations:" + digest))
+        else:
+            run_id = str(UUID(str(data.get("run_id"))))
+        archived = {key: data[key] for key in ("kind", "sn", "robot_id", "preview_source", "stream_id", "dof",
+                                               "records", "encoder_samples")}
+        archived.update(run_id=run_id, saved_at=saved_at,
+                        source_kind=ANGLE_CALIBRATION_SOURCE, report=report,
+                        automatic_encoder_check={"source": ANGLE_CALIBRATION_SOURCE, "hardware_acceptance": False,
+                                                 **evidence})
+        return self._save_calibration_check(sn, archived, report, expected_robot)
+
+    def save_zero_reference_check(self, sn, data, expected_robot=None):
+        """Archive the offset-based zero recheck as separate evidence."""
+        from .zero_reference_check import ZeroReferenceCheck
+
+        sn = _sn(sn)
+        if not isinstance(data, dict) or data.get("kind") != "zero_reference_check" or data.get("sn") != sn:
+            raise ValueError("标零位复查记录的原始SN与待归档SN不一致")
+        if data.get("preview_source") != "ros2":
+            raise ValueError("标零位复查须来自已绑定的真实ROS2机器人")
+        _robot_id.validate_python(data.get("robot_id"))
+        try:
+            if any(str(UUID(data[key])) != data[key] for key in ("stream_id", "run_id")):
+                raise ValueError
+        except (AttributeError, KeyError, TypeError, ValueError):
+            raise ValueError("标零位复查记录缺少原始采集流ID或运行ID") from None
+        saved_at = _timestamp(data.get("saved_at"))
+        if datetime.fromisoformat(saved_at.replace("Z", "+00:00")).utcoffset() != timezone.utc.utcoffset(None):
+            raise ValueError("标零位复查保存时间必须使用UTC")
+        dof, report = data.get("dof"), data.get("report")
+        if type(dof) is not int or dof not in (24, 28) or not isinstance(report, dict):
+            raise ValueError("标零位复查报告或机型无效")
+        reference = ZeroReferenceCheck(dof).report()
+        if (any(report.get(key) != reference[key] for key in ("schema_version", "mode", "dof", "limits", "source"))
+                or data.get("configuration_sha256") != reference["source"]["configuration_sha256"]):
+            raise ValueError("标零位复查报告的配置、来源或参考不匹配")
+        rows = report.get("results")
+        if not isinstance(rows, list) or len(rows) != len(reference["results"]):
+            raise ValueError("标零位复查报告缺少逐关节记录")
+        for row, expected in zip(rows, reference["results"]):
+            if (not isinstance(row, dict)
+                    or any(row.get(key) != expected[key] for key in ("index", "joint", "motor_indices", "motors", "logical_reference_deg"))
+                    or row.get("status") not in {"pending", "awaiting_confirmation", "collecting", "passed", "failed", "skipped", "incomplete"}
+                    or not isinstance(row.get("samples"), list) or not isinstance(row.get("attempts"), list)):
+                raise ValueError("标零位复查报告的关节、电机或样本与官方参考不匹配")
+            _validate_zero_reference_evidence(row, report["limits"])
+        if not any(row["samples"] or row["attempts"] for row in rows):
+            raise ValueError("标零位复查尚无可归档的记录")
+        archived = {key: data[key] for key in ("kind", "sn", "robot_id", "preview_source", "stream_id", "dof",
+                                              "run_id", "configuration_sha256", "report")}
+        archived.update(saved_at=saved_at, source_kind=ZERO_REFERENCE_SOURCE)
+        if reason := data.get("end_reason"):
+            if not isinstance(reason, str) or len(reason) > 300:
+                raise ValueError("标零位复查的停止原因无效")
+            archived["end_reason"] = reason
+        return self._save_calibration_check(sn, archived, report, expected_robot)
+
+    @staticmethod
+    def _validated_calibration_report(report):
+        from .manual_calibration_check import validate_report
+
+        if not isinstance(report, dict):
+            raise ValueError("报告缺少逐关节结果")
+        validated = validate_report(report, report.get("dof"))
+        if validated.get("source", {}).get("plan_mode") != "manual_opposite_zero_limit_check":
+            raise ValueError("模拟方案不能作为实机标定检查结果")
+        return validated
+
+    def _save_calibration_check(self, sn, data, report, expected_robot):
         robot = data.get("robot_id")
         if not isinstance(robot, str) or not robot or (expected_robot and robot != expected_robot):
             raise ValueError("报告机器人身份与本次连接不一致")
         run_id = str(UUID(str(data.get("run_id"))))
-        report = data.get("report")
-        if not isinstance(report, dict):
-            raise ValueError("报告缺少逐关节结果")
-        validate_report(report, report.get("dof"))
-        if report.get("source", {}).get("plan_mode") != "manual_opposite_zero_limit_check":
-            raise ValueError("模拟方案不能作为实机标定检查结果")
+        source = data["source_kind"]
+        is_read_only = source in (ANGLE_CALIBRATION_SOURCE, ZERO_REFERENCE_SOURCE)
         serialized = _json(data)
-        digest = hashlib.sha256(serialized.encode()).hexdigest()
-        with self.lock:
+        if len(serialized.encode()) > 16 * 1024**2:
+            raise ValueError("标定检查归档大小超限")
+        digest_input = _json({key: value for key, value in data.items() if key != "saved_at"}) if is_read_only else serialized
+        digest = hashlib.sha256(digest_input.encode()).hexdigest()
+        with self.lock, self.db:
+            self.db.execute("BEGIN IMMEDIATE")
             model = self.db.execute("SELECT dof FROM sn_models WHERE sn=?", (sn,)).fetchone()
-            if model and model["dof"] != report["dof"]:
+            prior_angle = self.angle_calibration_check(sn)
+            prior_powered = self.calibration_check(sn) if is_read_only else None
+            prior_zero = self.zero_reference_check(sn)
+            if ((model and model["dof"] != report["dof"])
+                    or any(previous and previous["report"]["dof"] != report["dof"] for previous in (prior_angle, prior_powered, prior_zero))):
                 raise ValueError("标定检查关节数与本SN机型不一致，请核对机型和报告")
             bound = self.sn_identity(sn)
             if bound and (bound["robot_id"] != robot or bound["source_kind"] == "simulated"):
@@ -651,13 +924,35 @@ class FactoryStore:
             previous = self.db.execute("SELECT robot_id FROM calibration_checks WHERE sn=? LIMIT 1", (sn,)).fetchone()
             if previous and previous["robot_id"] != robot:
                 raise ValueError("该SN已有其他机器人的标定检查结果")
-            with self.db:
-                self.db.execute("INSERT OR IGNORE INTO calibration_checks(sn,robot_id,run_id,sha256,payload) VALUES(?,?,?,?,?)", (sn, robot, run_id, digest, serialized))
-        return {"sn": sn, "robot_id": robot, "run_id": run_id}
+            if source == ZERO_REFERENCE_SOURCE:
+                same_run = self.db.execute(
+                    "SELECT sn,robot_id,json_extract(payload, '$.stream_id') AS stream_id FROM calibration_checks "
+                    "WHERE run_id=? AND json_extract(payload, '$.source_kind')=? LIMIT 1", (run_id, source)
+                ).fetchone()
+                if same_run and (same_run["sn"], same_run["robot_id"], same_run["stream_id"]) != (sn, robot, data["stream_id"]):
+                    raise ValueError("该轮标零位复查已绑定其他SN、机器人或采集会话")
+            self.db.execute("INSERT OR IGNORE INTO calibration_checks(sn,robot_id,run_id,sha256,payload) VALUES(?,?,?,?,?)", (sn, robot, run_id, digest, serialized))
+        return {"sn": sn, "robot_id": robot, "run_id": run_id, "source_kind": source}
 
     def calibration_check(self, sn):
+        return self._latest_calibration_check(sn, "hardware")
+
+    def angle_calibration_check(self, sn):
+        return self._latest_calibration_check(sn, ANGLE_CALIBRATION_SOURCE)
+
+    def zero_reference_check(self, sn):
+        return self._latest_calibration_check(sn, ZERO_REFERENCE_SOURCE)
+
+    def zero_reference_history(self, sn):
         with self.lock:
-            row = self.db.execute("SELECT payload FROM calibration_checks WHERE sn=? ORDER BY sequence DESC LIMIT 1", (_sn(sn),)).fetchone()
+            rows = self.db.execute("SELECT payload FROM calibration_checks WHERE sn=? AND json_extract(payload, '$.source_kind')=? ORDER BY sequence",
+                                   (_sn(sn), ZERO_REFERENCE_SOURCE))
+            return [json.loads(row["payload"]) for row in rows]
+
+    def _latest_calibration_check(self, sn, source):
+        with self.lock:
+            row = self.db.execute("SELECT payload FROM calibration_checks WHERE sn=? AND json_extract(payload, '$.source_kind')=? ORDER BY sequence DESC LIMIT 1",
+                                  (_sn(sn), source)).fetchone()
             return json.loads(row["payload"]) if row else None
 
     def import_segment(self, manifest_path, data_path):
@@ -995,7 +1290,9 @@ class FactoryStore:
                 entries = [entry for entry in history if entry["item"] == item]
                 latest = entries[-1] if entries else None
                 completed = latest.get("completed", latest["status"] != "incomplete") if latest else False
-                answer.append(dict(item=item, name=name, status=latest["status"] if latest else "incomplete", completed=completed, latest=latest, history=entries, board=self.board_snapshot(sn) if item == 1 else None, lights=self.light_observations(sn) if item == 1 else [], calibration_confirmations=self.calibration_confirmations(sn) if item == 2 else [], calibration=self.calibration_check(sn) if item == 3 else None))
+                answer.append(dict(item=item, name=name, status=latest["status"] if latest else "incomplete", completed=completed, latest=latest, history=entries, board=self.board_snapshot(sn) if item == 1 else None, lights=self.light_observations(sn) if item == 1 else [], calibration_confirmations=self.calibration_confirmations(sn) if item == 2 else [], calibration=self.calibration_check(sn) if item == 3 else None, angle_calibration=self.angle_calibration_check(sn) if item == 3 else None))
+                if item == 3:
+                    answer[-1]["zero_reference_check"] = self.zero_reference_check(sn)
                 if item == 1:
                     answer[-1]["estop_pairing"] = self.estop_pairing(sn)
                 if item == 4:
@@ -1153,15 +1450,40 @@ class FactoryStore:
                         for sequence, observation in enumerate(result.get("soc_observations", []), 1):
                             values = {key: observation.get(key) for key in ("soc", "previous_soc", "voltage", "current", "uptime_seconds", "soc_age_ms")}
                             note = "SOC变化证据不能独立证明主控不断电、无重启或整项功能通过；截图文件位于本CSV同目录"
+                            if observation.get("stage") == "backup":
+                                values.update(soc=None, previous_soc=None, voltage=None, current=None, soc_age_ms=None)
+                                note = "小电池现场标记 · 无SOC；原始记录见event_json；" + note
                             if observation["source_kind"] == "simulated":
                                 note = "SIMULATED 模拟数据；不能作为实机测试结果；" + note
                             if observation.get("screenshot_error"):
                                 note += "；" + observation["screenshot_error"]
                             write_row(["soc_observation", sn, item, observation["observation_id"], "battery_hot_swap", sequence, observation["received_at"], observation.get("uptime_seconds"), observation["sampled_at"], observation["source_kind"], _json(values), _json(dict(soc="%", previous_soc="%", voltage="V", current="A", uptime_seconds="s", soc_age_ms="ms")), "", "evidence_only", note, _json(observation)], case_code=FUNCTION_CASE_CODES["battery_hot_swap"])
-                        calibration = result.get("calibration")
-                        if calibration:
+                        for calibration in (result.get("calibration"), result.get("angle_calibration")):
+                            if not calibration:
+                                continue
+                            source = calibration["source_kind"]
+                            is_angle = source == ANGLE_CALIBRATION_SOURCE
+                            evidence = calibration.get("automatic_encoder_check", {})
+                            kind = "calibration_angle_observation" if is_angle else "calibration_check"
+                            note = ("只读编码器角度观察；作为证据留档，人工结论独立保存" if is_angle
+                                    else "单侧检查；跳过或未测不算合格")
                             for row in calibration["report"]["results"]:
-                                write_row(["calibration_check", sn, item, calibration["run_id"], row["joint"], row["index"], calibration.get("saved_at", ""), "", "", "hardware", _json(row), "", "", row["status"], "单侧检查；跳过或未测不算合格", ""], case_code=CALIBRATION_CASE_CODES[3])
+                                index = str(row["index"])
+                                sample = {name: evidence[name][index] for name in ("passing_samples", "failing_samples")
+                                          if index in evidence.get(name, {})}
+                                write_row([kind, sn, item, calibration["run_id"], row["joint"], row["index"],
+                                           calibration.get("saved_at") or "", "", "", source, _json(row), "", "",
+                                           row["status"], note, _json(sample) if sample else ""],
+                                          case_code=CALIBRATION_CASE_CODES[3])
+                        if item == 3:
+                            for zero_check in self.zero_reference_history(sn):
+                                evidence = {key: zero_check[key] for key in ("robot_id", "stream_id", "configuration_sha256")}
+                                evidence.update(limits=zero_check["report"]["limits"], end_reason=zero_check.get("end_reason"))
+                                for joint in zero_check["report"]["results"]:
+                                    write_row(["calibration_zero_reference", sn, item, zero_check["run_id"], joint["joint"], joint["index"],
+                                               zero_check["saved_at"], "", "", ZERO_REFERENCE_SOURCE, _json(joint), "", "",
+                                               joint["status"], "标零位复查证据，整项结论独立保存", _json(evidence)],
+                                              case_code=CALIBRATION_CASE_CODES[3])
                         board = result["board"]
                         if board:
                             for check in board["checks"]:
@@ -1175,7 +1497,7 @@ class FactoryStore:
                                 write_row(["unavailable", sn, item, segment["segment_id"], "", "", "", "", "", segment["source_kind"], "", "", "", "missing_evidence", segment["local_error"], ""], case_code=motion_case)
                                 continue
                             summary = self.segment_summary(segment["segment_id"])
-                            write_row(["key_data_summary", sn, item, segment["segment_id"], "summary", "", segment["ended_at"], summary["duration_seconds"], "", segment["source_kind"], _json(summary), "", "", "unverified", "记录时长要求超过2小时；不等于动作时长或性能合格", ""], case_code=motion_case)
+                            write_row(["key_data_summary", sn, item, segment["segment_id"], "summary", "", segment["ended_at"], summary["duration_seconds"], "", segment["source_kind"], _json(summary), "", "", "unverified", duration_status(summary) + "；记录时长不等于动作时长或性能合格", ""], case_code=motion_case)
                             with _open_evidence(self.packages / segment["segment_id"] / "segment.sqlite") as database:
                                 for row in database.execute("SELECT group_name,sequence,observed_at,elapsed_seconds,payload FROM samples ORDER BY elapsed_seconds,group_name,sequence"):
                                     payload = _sample(row, segment)
@@ -1231,7 +1553,7 @@ class FactoryStore:
             parts.append('</table></section>')
         if result.get("functional_checks"):
             parts.append('<p>现场判据：远程急停使用独立急停遥控器／无线急停按钮切断电机电源，主控保持供电，核对电机断电、主控持续运行、保持及解除状态。电机反馈中断不等于主控掉电，也不能单独证明电机已断电。热换电允许全程连接网线，要求主控全程不断电、无重启，并核对通信及运行状态。未观测的现象不能据遥测恢复推断为通过。</p>')
-            parts.append('<section><h2>整机功能测试：远程急停与热换电</h2><p>24轴与28轴均适用。人员在机器人现场操作并填写实际观察；上位机不触发急停、换电或策略。子项不要求持续2小时；动作记录仍要求每段超过2小时。数据中断不能自动证明急停或换电成功，也不推断断电原因。</p><p>第4项有效结果同时考虑整项人工结论和以下两项最新人工结论；任一子项失败时第4项不通过；缺失或未完成时不能标记完成。两个子项均已明确填写通过或失败后，可标记测试已完成，已完成不代表通过。历史原始结论保留。</p><table><tr><th>功能</th><th>最新人工结论</th><th>记录时间</th><th>现场观察 / 备注</th><th>关联片段 / SOC证据</th></tr>')
+            parts.append('<section><h2>整机功能测试：远程急停与热换电</h2><p>24轴与28轴均适用。人员在机器人现场操作并填写实际观察；上位机不触发急停、换电或策略。急停和换电子项不要求持续2小时；站立记录达到2小时，行走、跑步及特技无两小时时长要求。数据中断不能自动证明急停或换电成功，也不推断断电原因。</p><p>第4项有效结果同时考虑整项人工结论和以下两项最新人工结论；任一子项失败时第4项不通过；缺失或未完成时不能标记完成。两个子项均已明确填写通过或失败后，可标记测试已完成，已完成不代表通过。历史原始结论保留。</p><table><tr><th>功能</th><th>最新人工结论</th><th>记录时间</th><th>现场观察 / 备注</th><th>关联片段 / SOC证据</th></tr>')
             for check in result["functional_checks"].values():
                 head = check["latest"] or {}
                 associated = "片段：" + (", ".join(head.get("segment_ids", [])) or "无") + "；SOC：" + (", ".join(head.get("soc_observation_ids", [])) or "无")
@@ -1254,7 +1576,17 @@ class FactoryStore:
                 values = {key: "未知" if observation.get(key) is None else observation[key]
                           for key in ("voltage", "current", "uptime_seconds", "previous_soc")}
                 readings = f'{values["voltage"]} V / {values["current"]} A / {values["uptime_seconds"]} s'
-                parts.append(f'<tr><td>{esc(FUNCTION_CASE_CODES["battery_hot_swap"])}<br>{esc(observation["observation_id"])}<br>{esc(observation["session_id"])}</td><td>{esc(source)}<br>{esc(observation["robot_id"])}</td><td>{esc(observation["event"])}<br>{esc(observation["soc"])} % · 前值 {esc(values["previous_soc"])} %</td><td>{esc(readings)}</td><td>{esc(observation["sampled_at"])}<br>{esc(observation["received_at"])}<br>{esc(observation["soc_age_ms"])} ms</td><td>{esc(observation["continuity"])}</td><td>{image}</td></tr>')
+                event = BATTERY_SWAP_STAGES.get(observation.get("stage"), observation["event"])
+                if observation.get("stage") == "backup":
+                    soc_text = "无SOC"
+                    age = "—"
+                    readings = f'— / — / {values["uptime_seconds"]} s'
+                    if observation["soc"] is not None:
+                        soc_text += f' · 历史BMS原始读数 {observation["soc"]:g}%（未标记电池阶段）'
+                else:
+                    soc_text = f'{observation["soc"]} % · 前值 {values["previous_soc"]} %'
+                    age = f'{observation["soc_age_ms"]} ms'
+                parts.append(f'<tr><td>{esc(FUNCTION_CASE_CODES["battery_hot_swap"])}<br>{esc(observation["observation_id"])}<br>{esc(observation["session_id"])}</td><td>{esc(source)}<br>{esc(observation["robot_id"])}</td><td>{esc(event)}<br>{esc(soc_text)}</td><td>{esc(readings)}</td><td>{esc(observation["sampled_at"])}<br>{esc(observation["received_at"])}<br>{esc(age)}</td><td>{esc(observation["continuity"])}</td><td>{image}</td></tr>')
             parts.append('</table></section>')
         if not result["history"] and result["status"] != "not_applicable":
             parts.append("<p>尚未填写人工结论，完成标记独立显示；已同步的板卡结果见下表。</p>")
@@ -1282,9 +1614,12 @@ class FactoryStore:
             for confirmation in result["calibration_confirmations"]:
                 parts.append(f'<tr><td>{esc(CALIBRATION_CASE_CODES[2])} · {esc(confirmation["observed_at"])}</td><td>{"已完成" if confirmation["completed"] else "中断 / 未完成"}</td></tr>')
             parts.append('</table></section>')
-        calibration = result.get("calibration")
-        if calibration:
-            parts.append(f'<section><h2>标定检查逐关节结果</h2><p>机器人：{esc(calibration["robot_id"])} · 轮次：{esc(calibration["run_id"])} · 原始保存时间：{esc(calibration.get("saved_at", "未知"))}。跳过、未测或中断不算合格；人工结论独立保存。</p><table><tr><th>关节</th><th>方向</th><th>参考角度</th><th>结果</th><th>原始尝试</th></tr>')
+        for calibration in (result.get("calibration"), result.get("angle_calibration")):
+            if not calibration:
+                continue
+            title = ("只读编码器角度观察" if calibration["source_kind"] == ANGLE_CALIBRATION_SOURCE
+                     else "标定检查逐关节结果")
+            parts.append(f'<section><h2>{title}</h2><p>机器人：{esc(calibration["robot_id"])} · 轮次：{esc(calibration["run_id"])} · 原始保存时间：{esc(calibration.get("saved_at") or "未知")}。跳过、未测或中断不算合格；人工结论独立保存。</p><table><tr><th>关节</th><th>方向</th><th>参考角度</th><th>结果</th><th>原始尝试</th></tr>')
             for row in calibration["report"]["results"]:
                 parts.append(f'<tr><td>{esc(CALIBRATION_CASE_CODES[3])} · {esc(row["joint"])}</td><td>{esc(row["direction"])}</td><td>{esc(row["reference_deg"])}</td><td>{esc(row["status"])}</td><td><pre>{esc(_json(row["attempts"]))}</pre></td></tr>')
             parts.append('</table></section>')
@@ -1321,8 +1656,8 @@ class FactoryStore:
             summary = self.segment_summary(identifier)
             duration = summary["duration_seconds"]
             duration_text = "未知" if duration is None else f"{duration / 60:.2f}分钟"
-            duration_status = "超过2小时" if summary["duration_satisfied"] else "时长不足或未知"
-            parts.append(f'<p><strong>记录时长：{esc(duration_text)}，{esc(duration_status)}</strong>。记录时长不等于动作时长，不构成自动性能验收。</p>')
+            duration_label = duration_status(summary)
+            parts.append(f'<p><strong>记录时长：{esc(duration_text)}，{esc(duration_label)}</strong>。记录时长不等于动作时长，不构成自动性能验收。</p>')
             if summary.get("metrics"):
                 parts.append('<p>关键数据模式：1Hz趋势；统计包含10Hz运动数据观察。观察次数不等于独立反馈帧数。缺失保持未知。</p><table><tr><th>指标 / 单位</th><th>最小值</th><th>最大值</th><th>均值</th><th>有效 / 观察次数</th></tr>')
                 for key, value in sorted(summary["metrics"].items()):

@@ -30,7 +30,8 @@ def perform(context, password, request):
     if parse_ssh_target(context.get("target", ""))[0] != "robo":
         raise ValueError("参数维护只适用于已绑定的robo用户")
     if context.get("station_url"):
-        with httpx.Client(timeout=150, trust_env=False, follow_redirects=False) as client:
+        timeout = 250 if request["operation"] == "check" else 470
+        with httpx.Client(timeout=timeout, trust_env=False, follow_redirects=False) as client:
             response = client.post(_local_url(context["station_url"]) + "/api/v1/station/motor-parameters",
                                    headers=station_headers(context), json=dict(
                                        robot_id=request["robot_id"], relay_url=context["relay_url"],
@@ -64,7 +65,7 @@ def _remote(tunnel, password, request):
         channel.sendall(password + "\n")
         channel.shutdown_write()
         out, error = bytearray(), bytearray()
-        deadline = time.monotonic() + 120
+        deadline = time.monotonic() + (220 if request["operation"] == "check" else 430)
         while time.monotonic() < deadline:
             if channel.recv_ready():
                 out.extend(channel.recv(65536))
@@ -80,7 +81,7 @@ def _remote(tunnel, password, request):
             raise ValueError("未收到参数回执，请检查本次sudo密码与机器人状态")
         return json.loads(out)
     except Exception as error:
-        if dispatched and request["operation"] == "update":
+        if dispatched and request["operation"] != "check":
             return dict(state="unknown", request_id=request["request_id"], robot_id=request["robot_id"],
                         dof=request["dof"], detail="更新回执中断，部分参数可能已写入。请重新检查，禁止直接重复写入。")
         raise ValueError(str(error).replace(password, "[已隐藏]")) from None

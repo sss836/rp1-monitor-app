@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from .calibration_context import extract_calibration_context
+from .desktop_joint_angle_monitor import JointAngleMonitor
 from .desktop_manual_check import ManualCalibrationDialog
 from .desktop_postzero import PostzeroDialog
 from .joint_inspection import (
@@ -110,6 +111,8 @@ class JointInspectionPanel(QWidget):
         self.calibration_dialog = None
         self.calibration_terminal_opened = False
         self.postzero_dialog = None
+        self.joint_angle_monitor = None
+        self.zero_reference_dialog = None
         self.motor_control_dialog = None
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -118,27 +121,37 @@ class JointInspectionPanel(QWidget):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         content = QWidget()
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(7)
         self.identity = _label("尚未连接机器人", "sectionTitle")
-        layout.addWidget(self.identity)
+        identity_row = QHBoxLayout()
+        identity_row.addWidget(self.identity, 1)
+        self.maintenance_toggle = QPushButton("标定维护")
+        self.maintenance_toggle.setObjectName("secondary")
+        self.maintenance_toggle.setCheckable(True)
+        identity_row.addWidget(self.maintenance_toggle)
+        layout.addLayout(identity_row)
 
+        maintenance = QWidget()
+        maintenance_layout = QVBoxLayout(maintenance)
+        maintenance_layout.setContentsMargins(0, 0, 0, 0)
         tasks = QHBoxLayout()
-        self.calibrate = QPushButton("标定")
+        self.calibrate = QPushButton("标定（写入零位）")
         self.calibrate.clicked.connect(self.open_calibration)
         self.calibrate.setToolTip("使用机器人已有标零流程")
         self.motor_control = QPushButton("标定检查")
         self.motor_control.clicked.connect(self.open_motor_control)
         self.motor_control.setToolTip("按URDF动画手动摆动，自动检查所选限位")
-        self.postzero = QPushButton("角度监控")
-        self.postzero.clicked.connect(self.show_angle_monitor)
-        self.postzero.setToolTip("在当前页查看角度并保存数据")
-        for button in (self.calibrate, self.motor_control, self.postzero):
-            button.setMinimumHeight(46)
-            tasks.addWidget(button, 1)
-        layout.addLayout(tasks)
-        self.calibration_note = _label("标定写入硬件零位；标定检查按动画手动摆动；角度监控只读取数据。")
-        layout.addWidget(self.calibration_note)
+        self.motor_control.setObjectName("secondary")
+        tasks.addWidget(self.motor_control)
+        tasks.addWidget(self.calibrate)
+        tasks.addStretch()
+        maintenance_layout.addLayout(tasks)
+        self.calibration_note = _label("标定会写入硬件零位。标定检查需要人员按动画手动摆位。")
+        maintenance_layout.addWidget(self.calibration_note)
+        maintenance.hide()
+        self.maintenance_toggle.toggled.connect(maintenance.setVisible)
+        layout.addWidget(maintenance)
         self.feedback = _label()
         layout.addWidget(self.feedback)
 
@@ -148,6 +161,7 @@ class JointInspectionPanel(QWidget):
         self.monitor_source = QComboBox()
         self.monitor_source.addItem("采集端关节角度 · 实时", "reported")
         self.monitor_source.addItem("电机原始角度 · 采样", "motor")
+        self.monitor_source.addItem("编码器关节角度 · 实时", "encoder")
         self.monitor_source.setAccessibleName("角度监控数据来源")
         monitor_header.addWidget(self.monitor_source)
         layout.addLayout(monitor_header)
@@ -223,11 +237,21 @@ class JointInspectionPanel(QWidget):
             self.calibration_dialog.reject()
         if self.postzero_dialog:
             self.postzero_dialog.invalidate()
+        if self.joint_angle_monitor:
+            self.joint_angle_monitor.stop_capture("机器人连接已断开，编码器读取已停止。")
+        if self.zero_reference_dialog:
+            self.zero_reference_dialog.invalidate()
         if self.motor_control_dialog:
             self.motor_control_dialog.invalidate()
         self.render()
 
     def open_motor_control(self):
+        if self.zero_reference_capture_active():
+            self.feedback.setText("请先结束标零位复查，再打开标定检查。")
+            return
+        if self.encoder_capture_active():
+            self.feedback.setText("请先停止编码器角度读取，再打开标定检查。")
+            return
         postzero_worker = self.postzero_dialog.worker if self.postzero_dialog else None
         if (postzero_worker and postzero_worker.isRunning()
                 and self.postzero_dialog.mode.currentData() == "query"):
@@ -257,24 +281,82 @@ class JointInspectionPanel(QWidget):
                 self.feedback.setText("上一次电机控制会话仍在断开，请稍后重试。")
                 return
             self.motor_control_dialog.deleteLater()
-        self.motor_control_dialog = ManualCalibrationDialog(self.calibration_context, self.connection_context, self)
+        self.motor_control_dialog = ManualCalibrationDialog(
+            self.calibration_context, self.connection_context, self,
+            observed_pose=self.observed_pose,
+        )
         self.manual_dialog_created.emit(self.motor_control_dialog)
         self.feedback.clear()
         self.motor_control_dialog.show()
 
-    def show_angle_monitor(self):
-        self.monitor_source.setFocus()
-
     def select_monitor_source(self):
-        if self.monitor_source.currentData() == "motor":
-            self.open_postzero()
-        else:
+        source = self.monitor_source.currentData()
+        if source != "motor":
             if self.postzero_dialog and self.postzero_dialog.worker and self.postzero_dialog.worker.isRunning():
                 self.postzero_dialog.stop_capture()
+        if source == "motor":
+            self.open_postzero()
+        elif source == "encoder":
+            if self.joint_angle_monitor is None:
+                self.joint_angle_monitor = JointAngleMonitor(
+                    self.calibration_context, self.connection_context, self.encoder_capture_problem, self,
+                )
+                self.joint_angle_monitor.stopped.connect(self.resume_raw_angle_controls)
+                self.monitor_stack.addWidget(self.joint_angle_monitor)
+            self.monitor_stack.setCurrentWidget(self.joint_angle_monitor)
+        else:
             self.monitor_stack.setCurrentIndex(0)
 
+    def encoder_capture_active(self):
+        return self.joint_angle_monitor is not None and self.joint_angle_monitor.worker is not None
+
+    def encoder_capture_problem(self):
+        if self.zero_reference_capture_active():
+            return "请先结束标零位复查，再开始编码器读取。"
+        if self.postzero_dialog and self.postzero_dialog.worker and self.postzero_dialog.worker.isRunning():
+            return "正在结束电机原始角度采样，请稍候。"
+        if self.calibration_dialog is not None:
+            return "请先关闭标零窗口，再开始编码器读取。"
+        motor = self.motor_control_dialog
+        if motor and (motor.isVisible() or motor.worker and motor.worker.isRunning()):
+            return "请先结束控制会话并关闭标定检查窗口，再开始编码器读取。"
+        return ""
+
+    def resume_raw_angle_controls(self):
+        if self.postzero_dialog:
+            self.postzero_dialog.setEnabled(not (self.encoder_capture_active() or self.zero_reference_capture_active()))
+            self.postzero_dialog.refresh()
+
+    def zero_reference_capture_active(self):
+        dialog = self.zero_reference_dialog
+        return dialog is not None and dialog.reader.worker is not None
+
+    def zero_reference_problem(self):
+        if self.encoder_capture_active():
+            return "请先停止编码器角度读取，再开始标零位复查。"
+        return self.encoder_capture_problem()
+
+    def open_zero_reference_check(self, sn, save_report):
+        from .desktop_zero_reference_check import ZeroReferenceCheckDialog
+
+        if self.zero_reference_dialog:
+            self.zero_reference_dialog.raise_()
+            self.zero_reference_dialog.activateWindow()
+            return
+        dialog = ZeroReferenceCheckDialog(
+            sn, save_report, self.calibration_context, self.connection_context, self.zero_reference_problem, self,
+        )
+        self.zero_reference_dialog = dialog
+        dialog.finished.connect(self.zero_reference_finished)
+        dialog.reader.stopped.connect(self.resume_raw_angle_controls)
+        dialog.open()
+
+    def zero_reference_finished(self):
+        dialog, self.zero_reference_dialog = self.zero_reference_dialog, None
+        dialog.deleteLater()
+
     def open_postzero(self):
-        # Both angle sources share this page; opening a source never starts capture.
+        # Selecting an angle source never starts capture.
         if self.monitor_source.currentData() != "motor":
             self.monitor_source.setCurrentIndex(self.monitor_source.findData("motor"))
             return
@@ -288,6 +370,7 @@ class JointInspectionPanel(QWidget):
             except ValueError as error:
                 self.postzero_dialog.invalidate(str(error))
         self.monitor_stack.setCurrentWidget(self.postzero_dialog)
+        self.postzero_dialog.setEnabled(not (self.encoder_capture_active() or self.zero_reference_capture_active()))
         self.postzero_dialog.timer.start(250)
         self.postzero_dialog.show()
 
@@ -301,8 +384,11 @@ class JointInspectionPanel(QWidget):
             self.feedback.setText(message)
 
     def pose(self):
+        return self.observed_pose(self.dof.currentData())
+
+    def observed_pose(self, dof=None):
         return extract_joint_pose(
-            self._frame, dof=self.dof.currentData(),
+            self._frame, dof=dof,
             elapsed_ms=max(0, (time.monotonic() - self._received_at) * 1000) if self._frame else 0,
             transport_connected=self._frame is not None,
         )
@@ -432,6 +518,12 @@ class JointInspectionPanel(QWidget):
         self.render()
 
     def open_calibration(self):
+        if self.zero_reference_capture_active():
+            self.feedback.setText("请先结束标零位复查，再打开标零。")
+            return
+        if self.encoder_capture_active():
+            self.feedback.setText("请先停止编码器角度读取，再打开标零。")
+            return
         motor = self.motor_control_dialog
         if motor and motor.worker and motor.worker.isRunning():
             self.feedback.setText("电机控制会话仍在运行，请先停止并断开控制会话，再打开标零。")
@@ -483,7 +575,7 @@ class CalibrationDialog(QDialog):
         heading.addWidget(self.progress)
         header_layout.addLayout(heading)
         header_layout.addWidget(_label("运行前核对", "calibrationTitle"))
-        header_layout.addWidget(_label("使用机器人已有脚本，在独立终端内继续标定。", "calibrationCaption"))
+        header_layout.addWidget(_label("终端会优先复用机器人已有的编译产物，之后等待现场标定确认。", "calibrationCaption"))
         self.target = _label(initial.get("robot_id") or "尚未绑定机器人", "calibrationTarget")
         self.target.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.connection_target = _label(connection_context().get("target") or "需要上位机后台 SSH 连接", "calibrationConnection")
@@ -532,7 +624,7 @@ class CalibrationDialog(QDialog):
         steps_layout.setHorizontalSpacing(18)
         for column, (title, caption) in enumerate((
             ("SSH 认证", "终端输入密码"),
-            ("只读预检", "核对配置和进程"),
+            ("构建检查", "核对源码，按需编译"),
             ("现场标定", "逐台摆位、确认"),
         )):
             step = QHBoxLayout()
@@ -601,8 +693,8 @@ class CalibrationDialog(QDialog):
         technical_layout.setContentsMargins(16, 12, 16, 12)
         technical_layout.setSpacing(8)
         for text in (
-            "机器人源码文件改动：无。调用现有 roboparty_deploy/scripts/set_zero.py，按明确配置或独立人工选型指定24或28关节配置，不使用脚本默认配置。",
-            "预检遇到推理或其他标定进程会拒绝继续，不会停止任何进程。当前没有运控共享互斥锁。",
+            "配套工具随采集端一次安装。核对通过后按选定的 24 或 28 轴配置调用 roboparty_deploy/scripts/set_zero.py。",
+            "请先退出推理和其他电机工具。上位机优先核对现有 colcon 构建，需要时才以普通用户补编译。",
             "写硬件零位不会同步修改软件偏移；原脚本未逐电机验证写零结果，退出码或完成文字不代表标定通过。",
         ):
             text_label = _label(text, "calibrationCaption")
@@ -697,7 +789,7 @@ class CalibrationDialog(QDialog):
             self.target.setText(context["robot_id"])
             self.connection_target.setText(context["target"])
             self.status.setText(
-                "现场确认完成。打开终端后还需认证、预检和人工确认。"
+                "现场确认完成。打开终端后认证，随后自动核对并按需编译。"
                 if confirmed == 3 else "请完成3项现场确认。密码仅在终端认证，不保存。"
             )
             ready = shutil.which("x-terminal-emulator") is not None
@@ -738,5 +830,5 @@ class CalibrationDialog(QDialog):
             return
         # Terminal launch/exit says nothing about successful hardware calibration.
         self.parent().calibration_terminal_opened = True
-        self.parent().feedback.setText("已打开独立标定终端；标定结果需在现场核对，上位机未判定标定通过。")
+        self.parent().feedback.setText("已打开标定终端，等待认证和构建检查。未判定标定通过。")
         self.accept()

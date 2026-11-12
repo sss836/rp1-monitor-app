@@ -136,6 +136,112 @@ def sign_in(app, window, service):
     return service
 
 
+def test_motor_maintenance_factory_routes_keep_sn_and_leave_credentials_behind(ui, monkeypatch):
+    window, service = ui
+    factory = window.factory_panel
+    maintenance = window.motor_maintenance_panel
+    robot_id = "SYNTHETIC-MOTOR-ROBOT"
+    source = "http://127.0.0.1:18991"
+    window.active_source_url = source
+    monkeypatch.setattr(factory, "deploy_context_provider", lambda: {
+        "connected": True, "robot_id": robot_id, "target": "robo@192.0.2.1", "relay_url": source,
+    })
+    factory.set_frame({"robot_id": robot_id, "source_kind": "ros2", "stream_id": "synthetic"})
+
+    factory.firmware_button.click()
+    assert window.pages.currentWidget() is maintenance
+    assert not maintenance.password.isEnabled()
+    assert "SN" in maintenance.identity.text()
+
+    factory.activate_sn("SN-MOTOR-MAINTENANCE")
+    assert maintenance.password.isEnabled()
+    assert maintenance.tabs.currentWidget() is maintenance.firmware
+    maintenance.password.setText("synthetic-password")
+    maintenance.firmware.report_requested.emit(factory.sn)
+    assert window.pages.currentWidget() is factory
+    assert not maintenance.password.text()
+    table = factory.result_summary.table
+    assert table.item(table.currentRow(), 0).text() == "SYS-003"
+
+    factory.parameter_button.click()
+    assert maintenance.tabs.currentWidget() is maintenance.parameters
+    maintenance.password.setText("synthetic-password")
+    window.platform_stack.setCurrentWidget(window.offline_history)
+    assert not maintenance.password.text()
+    window.open_local_workbench()
+    assert maintenance.password.isEnabled()
+
+    maintenance.set_busy(True)
+    try:
+        assert not window.close()
+        assert not service.closed
+        factory.mark_disconnected()
+    finally:
+        maintenance.set_busy(False)
+    assert not maintenance.password.isEnabled()
+    assert "实时数据" in maintenance.identity.text()
+
+
+def test_motor_firmware_receipt_is_attached_without_changing_manual_result(ui):
+    import json
+
+    factory = ui[0].factory_panel
+    factory.activate_sn("SN-MOTOR-REPORT")
+    factory.store.save_result(factory.sn, 1, "pass", "人工确认", completed=True)
+    request = {"request_id": "synthetic-request", "operation": "update"}
+    result = {"state": "completed", "before": {"version": 108}, "after": {"version": 109}}
+    factory.save_motor_firmware_report(factory.sn, request, result)
+    latest = factory.store.results(factory.sn)[0]["latest"]
+    assert latest["status"] == "pass" and latest["completed"] and latest["notes"] == "人工确认"
+    raw = factory.store.attachments / latest["attachment_ids"][0]
+    assert json.loads(raw.read_text()) == {
+        "sn": factory.sn, "request": request, "result": result, "board_test_profile": factory.board_profile_values,
+    }
+
+
+def test_motor_firmware_report_uses_verified_read_and_links_update_receipts(ui):
+    from uuid import uuid4
+
+    factory = ui[0].factory_panel
+    factory.activate_sn("SN-FIRMWARE-EVIDENCE")
+    robot = dict(robot_id="SYNTHETIC-MOTOR-ROBOT", dof=24)
+    checked = dict(robot, request_id=str(uuid4()))
+    reading = dict(address="can0/2", before=dict(version="0.1.8", source="numeric"))
+    check = dict(checked, state="completed", rows=[reading])
+    factory.save_motor_firmware_report(factory.sn, dict(checked, operation="check"), check)
+
+    def report():
+        return next(row for row in factory.store.report_rows(factory.sn) if row["row_key"] == "SYS-003")
+
+    first = report()
+    assert "can0/2：0.1.8（数字回执）" in first["actual_result"]
+    assert first["verdict"] == "待复核" and first["source_kind"] == "ros2"
+    assert factory.workbench.motor_confirmation_buttons["SYS-003"]["通过"].isEnabled()
+    update = dict(robot, request_id=str(uuid4()), operation="update",
+                  targets=[dict(interface="can0", motor_id=2, model=1)])
+    factory.save_motor_firmware_report(factory.sn, update, dict(state="requested", before=check))
+    factory.save_motor_firmware_report(factory.sn, update, dict(state="unknown", detail="测试回执中断"))
+    interrupted = report()
+    assert "更新后请重新读取整机固件" in interrupted["actual_result"]
+    assert "can0/2：0.1.8 → 未知" in interrupted["actual_result"]
+    assert len(interrupted["evidence"].splitlines()) == 3
+
+    unreadable = dict(robot, request_id=str(uuid4()))
+    factory.save_motor_firmware_report(factory.sn, dict(unreadable, operation="check"),
+                                       dict(unreadable, state="completed", rows=[dict(reading, before=None)]))
+    missing = report()
+    assert missing["source_token"] != interrupted["source_token"]
+    assert "固件读取 0/24 台" in missing["actual_result"] and missing["verdict"] == "待复核"
+    checked_again = dict(robot, request_id=str(uuid4()))
+    current = dict(reading, before=dict(version="5.0.0.109", source="firmware_string"))
+    factory.save_motor_firmware_report(factory.sn, dict(checked_again, operation="check"),
+                                       dict(checked_again, state="completed", rows=[current]))
+    newest = report()
+    assert "can0/2：5.0.0.109" in newest["actual_result"]
+    assert "更新后请重新读取整机固件" not in newest["actual_result"]
+    assert len(newest["evidence"].splitlines()) == 3
+
+
 @pytest.mark.parametrize("address,ca,system_ca", [
     (DEFAULT_PLATFORM_URL, "", False),
     ("https://custom.example:8443", "", False),
@@ -159,6 +265,67 @@ def test_fixed_site_ca_and_explicit_overrides(app, ui, monkeypatch, address, ca,
     if expected_ca == str(SITE_PLATFORM_CA):
         context = ssl.create_default_context(cafile=expected_ca)
         assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname
+
+
+def test_factory_light_test_requires_receipt_and_explicit_observation(app, ui, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    from rp1_monitor import desktop_factory
+
+    window, _ = ui
+    factory = window.factory_panel
+    window.open_local_workbench(9)
+    factory.sn_edit.setEditText("RP1-TEST-SN")
+    factory.open_sn()
+    factory.workbench.select_case("SYS-002")
+    context = dict(connected=True, robot_id="RP1-TEST", relay_url="http://127.0.0.1:9124",
+                   station_url="http://127.0.0.1:18980", station_token_file="test-only")
+    monkeypatch.setattr(factory, "deploy_context_provider", lambda: context.copy())
+    events = []
+    outcome = "亮了"
+    require_sudo = True
+
+    def send(target, password):
+        assert target == context
+        if require_sudo and password is None:
+            events.append("sudo_required")
+            return "password_required"
+        if require_sudo:
+            assert password == "test-only"
+        events.append("sent")
+        if outcome == "error":
+            raise ValueError("测试回执失败")
+        return "command_sent"
+
+    class ObservationBox(QMessageBox):
+        def exec(self):
+            assert events[-1] == "sent"
+            assert "RP1-TEST" in self.text()
+            events.append("observation")
+            return 0
+
+        def clickedButton(self):
+            return next(button for button in self.buttons() if button.text() == outcome)
+
+    monkeypatch.setattr(desktop_factory, "_send_light_test", send)
+    monkeypatch.setattr(desktop_factory, "QMessageBox", ObservationBox)
+    monkeypatch.setattr(desktop_factory, "QInputDialog", SimpleNamespace(getText=lambda *_: ("test-only", True)))
+    factory.light_confirm_button.click()
+    wait_for(app, lambda: events == ["sudo_required", "sent", "observation"] and not factory.busy)
+    assert [row["lit"] for row in factory.store.light_observations(factory.sn)] == [True]
+
+    require_sudo = False
+    outcome = "暂不确认"
+    factory.light_confirm_button.click()
+    wait_for(app, lambda: len(events) == 5 and not factory.busy)
+    assert [row["lit"] for row in factory.store.light_observations(factory.sn)] == [True]
+
+    outcome = "error"
+    factory.light_confirm_button.click()
+    wait_for(app, lambda: len(events) == 6 and not factory.busy)
+    assert events == ["sudo_required", "sent", "observation", "sent", "observation", "sent"]
+    assert "本次未保存灯板结论" in factory.notice.text()
+    assert [row["lit"] for row in factory.store.light_observations(factory.sn)] == [True]
 
 
 def test_display_publication_starts_after_valid_login_and_stops_at_logout_and_expiry(app, ui, monkeypatch):

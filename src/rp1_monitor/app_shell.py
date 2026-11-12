@@ -1,6 +1,7 @@
 """App-style presentation of the existing read-only Qt monitor."""
 
 from collections import deque
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
@@ -22,12 +23,15 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
+from shiboken6 import isValid
 
 from .desktop import STYLE, GridBackground, MonitorWindow
 from .health_view import build_health
@@ -37,24 +41,31 @@ from .process_monitor import build_process_view
 APP_STYLE = (
     STYLE
     + """
-QFrame#sidebar { background:#f7faff; border:1px solid #d4e2f5; border-radius:16px; }
-QFrame#healthCard, QFrame#robotOverview { background:#ffffff; border:1px solid #d4e2f5; border-radius:16px; }
-QPushButton#nav { background:transparent; color:#263e61; border:0; border-radius:9px; text-align:left; padding:12px 16px; font-size:15px; }
-QPushButton#nav:hover { background:#edf3ff; }
-QPushButton#nav:checked { background:#dae8ff; color:#234fd1; font-weight:700; }
-QPushButton#nav:focus { border:2px solid #2b59e8; }
+QFrame#sidebar { background:#152337; border:0; border-radius:8px; }
+QLabel#navBrand { color:#ffffff; font-size:14px; font-weight:700; padding:4px 7px; }
+QLabel#navGroup { color:#a7b9d2; font-size:12px; padding:5px 8px 1px; }
+QPushButton#nav { background:transparent; color:#cad6e8; border:1px solid transparent; border-radius:5px; text-align:left; padding:5px 8px; font-size:14px; }
+QPushButton#nav:hover { background:#213652; }
+QPushButton#nav:checked { background:#28446e; color:#ffffff; font-weight:700; border-left:3px solid #77a8ff; }
+QPushButton#nav:focus { border:1px solid #8cbbff; }
+QFrame#healthCard, QFrame#robotOverview, QFrame#deviceContext { background:#ffffff; border:1px solid #dce5ef; border-radius:8px; }
+QLabel#pageTitle { color:#142337; font-size:24px; font-weight:700; }
+QLabel#deviceIdentity { color:#142337; font-size:14px; font-weight:700; }
 QPushButton#textLink { background:transparent; color:#2b59e8; border:0; text-align:left; padding:4px 0; font-size:13px; }
 QPushButton#textLink:focus { border:1px solid #2b59e8; }
-QLabel#healthValue { color:#142441; font-size:40px; font-weight:700; }
-QLabel#healthOverall { font-size:14px; }
-QLabel#source { font-size:12px; padding:7px 11px; }
+QLabel#healthValue { color:#142441; font-size:27px; font-weight:700; }
+QLabel#healthOverall { font-size:13px; }
+QLabel#source { font-size:12px; padding:5px 8px; }
 QLabel#cardCaption { color:#576c88; font-size:12px; }
+QLabel#sshFingerprint { background:#f4f7fc; color:#263e61; border:1px solid #d4e2f5; border-radius:6px; padding:8px 10px; }
 QLabel#heroId { color:#142441; font-size:23px; font-weight:700; }
 QLabel#callout { background:#ffffff; border:1px solid #c2d7f6; border-radius:8px; color:#2853c6; font-size:13px; padding:8px; }
 QProgressBar { background:#edf3ff; border:1px solid #d0e0fa; border-radius:5px; height:12px; }
 QProgressBar::chunk { background:#3370ee; border-radius:4px; }
 """
 )
+
+MOTOR_MAINTENANCE_PAGE = 10
 
 ICON_PATHS = {
     "home": '<path d="M3 11 12 3l9 8M5 10v11h5v-7h4v7h5V10"/>',
@@ -72,7 +83,7 @@ ICON_PATHS = {
 
 def icon(name):
     result = QIcon()
-    for checked, color in ((False, "#576c88"), (True, "#2b59e8")):
+    for checked, color in ((False, "#b3c5df"), (True, "#ffffff")):
         svg = f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">{ICON_PATHS[name]}</svg>'
         pixmap = QPixmap(48, 48)
         pixmap.fill(Qt.GlobalColor.transparent)
@@ -95,8 +106,8 @@ def panel(title):
     widget = QFrame()
     widget.setObjectName("healthCard")
     layout = QVBoxLayout(widget)
-    layout.setContentsMargins(18, 16, 18, 16)
-    layout.setSpacing(10)
+    layout.setContentsMargins(14, 10, 14, 10)
+    layout.setSpacing(7)
     if title:
         layout.addWidget(label(title, "sectionTitle"))
     return widget, layout
@@ -117,7 +128,7 @@ class RobotOverview(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setMinimumHeight(390)
+        self.setMinimumHeight(176)
         assets = Path(__file__).parent / "web" / "brand"
         self.pixmap = QPixmap(str(assets / "robot-wave.webp"))
         self.setAccessibleName("RP1机型示意，非实时姿态，物理部位映射待确认")
@@ -199,78 +210,86 @@ class AppMonitorWindow(MonitorWindow):
         old_root = self.takeCentralWidget()
         trend_page = self.tabs.widget(1)
         self.tabs.removeTab(1)
+        self.joint_feedback_title.hide()
         self.tabs.removeTab(self.tabs.indexOf(self.joint_inspection_panel))
         self.joint_inspection_panel.setParent(None)
         self.session_events = deque(maxlen=100)
         self.last_event = None
         root = GridBackground()
+        root.setProperty("plainBackground", True)
         layout = QHBoxLayout(root)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(20)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(14)
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(184)
+        sidebar.setFixedWidth(176)
         side = QVBoxLayout(sidebar)
-        side.setContentsMargins(10, 22, 10, 18)
-        side.setSpacing(8)
+        side.setContentsMargins(9, 13, 9, 10)
+        side.setSpacing(5)
         brand = QLabel()
         logo = QPixmap(str(Path(__file__).parent / "web" / "brand" / "logo.png"))
-        brand.setPixmap(
-            logo.scaled(
-                146,
-                50,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        )
+        if not logo.isNull():
+            mark = logo.scaled(112, 38, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            painter = QPainter(mark)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+            painter.fillRect(mark.rect(), QColor("#ffffff"))
+            painter.end()
+            brand.setPixmap(mark)
         brand.setAccessibleName("ROBO PARTY")
         side.addWidget(brand, alignment=Qt.AlignmentFlag.AlignHCenter)
-        side.addSpacing(12)
+        side.addWidget(label("RP1 整机测试工作台", "navBrand"))
         self.nav = QButtonGroup(self)
         self.nav.setExclusive(True)
-        titles = ("整机健康", "部件监测", "趋势分析", "告警记录", "设备设置", "诊断助手", "硬件自检", "监控记录", "角度与标定", "整机测试")
+        # Keep IDs stable for factory tools, startup and cross-page links.
+        titles = ("整机概览", "部件监测", "实时趋势", "告警与状态", "设备设置", "诊断助手", "硬件自检", "监控记录", "角度与标定", "整机测试", "电机维护")
+        glyphs = ("home", "parts", "trend", "bell", "settings", "chat", "checks", "trend", "settings", "checks", "settings")
         nav_body = QWidget()
         nav_layout = QVBoxLayout(nav_body)
         nav_layout.setContentsMargins(0, 0, 0, 0)
-        nav_layout.setSpacing(4)
-        for index, (title, glyph) in enumerate(
-            zip(titles, ("home", "parts", "trend", "bell", "settings", "chat", "checks", "trend", "settings", "checks"))
-        ):
-            button = QPushButton(title)
+        nav_layout.setSpacing(2)
+
+        def nav_button(index):
+            button = QPushButton(titles[index])
             button.setObjectName("nav")
-            button.setIcon(icon(glyph))
-            button.setIconSize(QSize(22, 22))
+            button.setIcon(icon(glyphs[index]))
+            button.setIconSize(QSize(18, 18))
             button.setCheckable(True)
-            button.setMinimumHeight(44)
+            button.setMinimumHeight(33)
             self.nav.addButton(button, index)
-            nav_layout.addWidget(button)
+            return button
+
+        for group, indices in (("监控", (0, 1, 2)), ("记录", (7,)), ("排查", (3, 5)), ("测试与维护", (9, 6, 8, MOTOR_MAINTENANCE_PAGE))):
+            nav_layout.addWidget(label(group, "navGroup"))
+            for index in indices:
+                nav_layout.addWidget(nav_button(index))
         nav_layout.addStretch()
         nav_scroll = QScrollArea()
         nav_scroll.setFrameShape(QFrame.Shape.NoFrame)
         nav_scroll.setWidgetResizable(True)
         nav_scroll.setWidget(nav_body)
         side.addWidget(nav_scroll, 1)
-        self.device_id = label("尚未连接机器人", "sectionTitle")
-        side.addWidget(self.device_id)
-        side.addWidget(label("只读监测 · 独立采集", "cardCaption"))
+        side.addWidget(nav_button(4))
         layout.addWidget(sidebar)
         body = QVBoxLayout()
-        body.setSpacing(14)
-        heading = QHBoxLayout()
-        title_box = QVBoxLayout()
-        self.app_title = label("RP1 整机健康", "title")
-        title_box.addWidget(self.app_title)
-        title_box.addWidget(self.health_overall)
-        heading.addLayout(title_box, 1)
-        switch = QPushButton("切换机器人")
+        body.setSpacing(8)
+        device_context = QFrame()
+        device_context.setObjectName("deviceContext")
+        context_row = QHBoxLayout(device_context)
+        context_row.setContentsMargins(11, 5, 7, 5)
+        self.device_id = label("尚未连接机器人", "deviceIdentity")
+        context_row.addWidget(self.device_id)
+        context_row.addWidget(self.source_label)
+        context_row.addWidget(self.health_overall, 1)
+        record_state = label("记录待核对", "cardCaption")
+        record_state.setToolTip("最近一次后台记录状态，以记录页选择的机器人为准。")
+        context_row.addWidget(record_state)
+        switch = QPushButton("管理连接")
         switch.setObjectName("secondary")
-        switch.setMinimumHeight(40)
         switch.clicked.connect(self.open_settings)
-        heading.addWidget(switch)
-        heading.addSpacing(12)
-        self.source_label.setFixedHeight(34)
-        heading.addWidget(self.source_label)
-        body.addLayout(heading)
+        context_row.addWidget(switch)
+        body.addWidget(device_context)
+        self.app_title = label("整机概览", "pageTitle")
+        body.addWidget(self.app_title)
         self.factory_return_bar = QFrame()
         self.factory_return_bar.setObjectName("healthBanner")
         return_layout = QVBoxLayout(self.factory_return_bar)
@@ -290,6 +309,11 @@ class AppMonitorWindow(MonitorWindow):
         self.factory_return_bar.hide()
         body.addWidget(self.factory_return_bar)
         self.pages = QStackedWidget()
+        self.pages.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        from .desktop_recordings import RecordingsPanel
+
+        self.recordings_panel = RecordingsPanel(lambda: (self.station_url, self.station_token_file))
+        self.recordings_panel.recording_status.connect(record_state.setText)
         self.pages.addWidget(self.home_page())
         self.pages.addWidget(self.components_page())
         trend, trend_layout = panel("")
@@ -297,8 +321,8 @@ class AppMonitorWindow(MonitorWindow):
         self.curve_controls.setMinimumWidth(235)
         self.curve_controls.setMaximumWidth(285)
         self.curve_controls.show()
-        trend_body.addWidget(self.curve_controls)
         trend_body.addWidget(trend_page, 1)
+        trend_body.addWidget(self.curve_controls)
         trend_page.show()
         trend_layout.addLayout(trend_body)
         self.pages.addWidget(trend)
@@ -306,9 +330,6 @@ class AppMonitorWindow(MonitorWindow):
         self.pages.addWidget(self.settings_page())
         self.pages.addWidget(self.operations_panel)
         self.pages.addWidget(self.operations_panel.board_panel)
-        from .desktop_recordings import RecordingsPanel
-
-        self.recordings_panel = RecordingsPanel(lambda: (self.station_url, self.station_token_file))
         self.pages.addWidget(self.recordings_panel)
         self.pages.addWidget(self.joint_inspection_panel)
         from .desktop_factory import create_factory_panel
@@ -319,13 +340,23 @@ class AppMonitorWindow(MonitorWindow):
                      "station_token_file": self.station_token_file},
         )
         self.pages.addWidget(self.factory_panel)
+        from .desktop_motor_maintenance import MotorMaintenancePanel
+
+        self.motor_maintenance_panel = MotorMaintenancePanel()
+        self.pages.addWidget(self.motor_maintenance_panel)
+        self._motor_maintenance_binding = None
+        self.motor_maintenance_panel.report_requested.connect(self.open_motor_maintenance_report)
+        self.motor_maintenance_panel.busy_changed.connect(self.refresh_motor_maintenance)
         if hasattr(self.factory_panel, "tool_requested"):
             self.factory_panel.tool_requested.connect(self.open_factory_tool)
             self.factory_panel.sn_changed.connect(self.factory_sn_changed)
             self.factory_panel.board_saved.connect(self.factory_board_saved)
+            self.factory_panel.model.currentIndexChanged.connect(self.refresh_motor_maintenance)
         self.factory_board_runs = {}
         self.joint_inspection_panel.manual_dialog_created.connect(self.connect_factory_manual_dialog)
         board = self.operations_panel.board_panel
+        board.native_context = lambda: {**self.calibration_connection(), "station_url": self.station_url,
+                                        "station_token_file": self.station_token_file}
         if hasattr(self.factory_panel, "store"):
             board.set_board_profile(self.factory_panel.board_profile_values)
             board.profile_saver = self.factory_panel.save_board_profile
@@ -357,17 +388,18 @@ class AppMonitorWindow(MonitorWindow):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setWidgetResizable(True)
         page = QWidget()
-        grid = QHBoxLayout(page)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(14)
+        main = QVBoxLayout(page)
+        main.setContentsMargins(0, 0, 3, 0)
+        main.setSpacing(9)
         hero, hero_layout = panel("")
         hero.setObjectName("robotOverview")
-        hero.setMinimumWidth(260)
-        hero.setMaximumWidth(360)
+        hero.setMinimumWidth(215)
+        hero.setMaximumWidth(320)
         self.hero_id = label("RP1", "heroId")
         hero_layout.addWidget(self.hero_id)
         hero_layout.addWidget(label("机器人概览"))
         self.robot_overview = RobotOverview()
+        self.robot_overview.setMaximumHeight(198)
         self.robot_overview.region_clicked.connect(self.open_temperature_region)
         hero_layout.addWidget(self.robot_overview, 1)
         self.motor_map_status = label("温度分布待接入", "cardCaption")
@@ -383,13 +415,10 @@ class AppMonitorWindow(MonitorWindow):
         )
         hero_layout.addWidget(self.motor_map_legend)
         hero_layout.addWidget(label("机型示意 · 非实时姿态", "cardCaption"))
-        grid.addWidget(hero, 3)
         right = QVBoxLayout()
-        right.setSpacing(12)
+        right.setSpacing(9)
         cards = QGridLayout()
-        cards.setSpacing(12)
-        cards.setColumnStretch(0, 1)
-        cards.setColumnStretch(1, 1)
+        cards.setSpacing(9)
         battery, battery_layout = panel("动力电池")
         battery_layout.addWidget(self.battery_soc)
         self.battery_bar = QProgressBar()
@@ -404,11 +433,10 @@ class AppMonitorWindow(MonitorWindow):
         self.temperature_value = label("—", "healthValue")
         temperature_layout.addWidget(self.temperature_value)
         temperature_layout.addWidget(label("最高电机温度 · 按已接入数据"))
-        temperature_layout.addStretch()
         all_temps = QPushButton("查看全部温度 →")
         all_temps.setObjectName("textLink")
         all_temps.setMinimumHeight(36)
-        all_temps.clicked.connect(lambda: self.navigate(1))
+        all_temps.clicked.connect(lambda: self.open_components(0))
         temperature_layout.addWidget(all_temps)
         host, host_layout = panel("计算主机")
         host_layout.addWidget(self.host_temperature)
@@ -417,9 +445,6 @@ class AppMonitorWindow(MonitorWindow):
         self.process_summary = label("核心进程 · 等待观测", "cardCaption")
         host_layout.addWidget(self.process_summary)
         self.host_core_summary = label("每核使用率 · 采集端尚未提供", "cardCaption")
-        host_layout.addWidget(self.host_core_summary)
-        host_layout.addWidget(label("每核0–100% · 大小核按内核拓扑", "cardCaption"))
-        host_layout.addStretch()
         host_layout.addWidget(self.health_status["host"])
         motors, motor_layout = panel("电机与通信")
         motor_layout.addWidget(self.motor_coverage)
@@ -427,14 +452,10 @@ class AppMonitorWindow(MonitorWindow):
         self.motor_summary = label()
         motor_layout.addWidget(self.motor_summary)
         motor_layout.addWidget(self.health_status["motors"])
-        for widget, row, column in (
-            (battery, 0, 0),
-            (temperature, 0, 1),
-            (host, 1, 0),
-            (motors, 1, 1),
-        ):
-            cards.addWidget(widget, row, column)
-        right.addLayout(cards, 3)
+        for column, widget in enumerate((battery, host, temperature, motors)):
+            cards.setColumnStretch(column, 1)
+            cards.addWidget(widget, 0, column)
+        main.addLayout(cards)
         banner, banner_layout = panel("")
         banner_layout.setContentsMargins(14, 10, 14, 10)
         self.health_detail.setStyleSheet("color:#7d5206; font-size:12px;")
@@ -449,8 +470,8 @@ class AppMonitorWindow(MonitorWindow):
         trend, trend_layout = panel("温度趋势 · 最近60秒")
         trend_layout.setContentsMargins(14, 10, 14, 10)
         self.health_plot = pg.PlotWidget()
-        self.health_plot.setMinimumHeight(100)
-        self.health_plot.setMaximumHeight(110)
+        self.health_plot.setMinimumHeight(164)
+        self.health_plot.setMaximumHeight(210)
         self.health_plot.showGrid(x=True, y=True, alpha=0.12)
         self.health_plot.setLabel("left", "°C")
         self.health_plot.setMouseEnabled(x=False, y=False)
@@ -464,30 +485,43 @@ class AppMonitorWindow(MonitorWindow):
         self._temperature_curves_dirty = False
         trend_layout.addWidget(self.health_plot)
         right.addWidget(trend)
-        grid.addLayout(right, 7)
+        right.addStretch()
+        lower = QHBoxLayout()
+        lower.addWidget(hero, 2)
+        lower.addLayout(right, 5)
+        main.addLayout(lower)
+        main.addStretch()
         scroll.setWidget(page)
         return scroll
 
     def components_page(self):
-        page, layout = panel("部件温度与反馈")
-        top = QHBoxLayout()
-        battery, left = panel("电池与供电详情")
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        summaries = QHBoxLayout()
+        battery, left = panel("电池与供电")
         left.addWidget(self.battery_metrics)
         left.addWidget(self.battery_age)
-        left.addStretch()
+        summaries.addWidget(battery, 1)
+        host_summary, host_summary_layout = panel("主机与进程")
+        host_summary_layout.addWidget(self.host_usage)
+        host_summary_layout.addWidget(self.host_core_summary)
+        host_summary_layout.addStretch()
+        summaries.addWidget(host_summary, 1)
+        layout.addLayout(summaries)
+
+        self.component_tabs = QTabWidget()
+        layout.addWidget(self.component_tabs, 1)
         host, right = panel("主机热区与监测来源")
-        right.addWidget(self.host_usage)
         right.addWidget(self.host_core_note)
         right.addWidget(self.host_core_table)
         self.host_sensors.setMaximumHeight(130)
         right.addWidget(self.host_sensors)
         right.addWidget(self.health_sources_label)
-        top.addWidget(battery, 1)
-        top.addWidget(host, 1)
-        layout.addLayout(top)
-        process_panel, process_layout = panel("核心进程 · 只读 / 每2秒采样")
+        right.addWidget(label("核心进程 · 只读 / 每2秒采样", "sectionTitle"))
         self.process_note = label("未配置进程名单", "cardCaption")
-        process_layout.addWidget(self.process_note)
+        right.addWidget(self.process_note)
         self.process_table = QTableWidget(0, 7)
         self.process_table.setHorizontalHeaderLabels(
             ["监测进程", "状态", "CPU / %", "RSS / MiB ≈", "线程", "观察重启", "年龄 / s"]
@@ -498,57 +532,99 @@ class AppMonitorWindow(MonitorWindow):
         self.process_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.process_table.setMinimumHeight(135)
         self.process_table.setMaximumHeight(170)
-        process_layout.addWidget(self.process_table)
-        layout.insertWidget(1, process_panel)
-        layout.addWidget(self.motor_metrics)
+        right.addWidget(self.process_table)
+        right.addStretch()
+        host_scroll = QScrollArea()
+        host_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        host_scroll.setWidgetResizable(True)
+        host_scroll.setWidget(host)
+        temperatures, temperature_layout = panel("")
+        temperature_layout.addWidget(self.motor_metrics)
+        self.motor_table.verticalHeader().hide()
         self.motor_table.setMaximumHeight(16777215)
-        layout.addWidget(self.motor_table, 1)
-        layout.addWidget(self.motor_note)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        page.setMinimumHeight(700)
-        scroll.setWidget(page)
-        return scroll
+        temperature_layout.addWidget(self.motor_table, 1)
+        temperature_layout.addWidget(self.motor_note)
+        self.component_tabs.addTab(temperatures, "电机温度与故障")
+        feedback, feedback_layout = panel("")
+        feedback_layout.addWidget(self.table, 1)
+        feedback_layout.addWidget(self.quality_label)
+        self.component_tabs.addTab(feedback, "关节反馈")
+        self.component_tabs.addTab(host_scroll, "主机热区与进程")
+        return page
+
+    def open_components(self, index):
+        self.component_tabs.setCurrentIndex(index)
+        self.navigate(1)
 
     def alert_page(self):
-        page, layout = panel("当前告警与监测提示")
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        current, current_layout = panel("当前需要关注")
         self.current_alerts = label()
-        layout.addWidget(self.current_alerts)
-        layout.addWidget(label("本次打开期间的状态记录", "sectionTitle"))
-        layout.addWidget(label("仅记录本窗口收到的状态变化，最多100条；关闭后不保存。"))
+        current_layout.addWidget(self.current_alerts)
+        layout.addWidget(current)
+        history, history_layout = panel("本次窗口状态变化")
+        history_layout.addWidget(label("最多100条。关闭窗口后不保存。"))
         self.event_list = QListWidget()
-        layout.addWidget(self.event_list, 1)
+        self.event_list.setFixedHeight(70)
+        history_layout.addWidget(self.event_list)
+        layout.addWidget(history)
+        layout.addStretch()
         return page
 
     def settings_page(self):
-        page, layout = panel("机器人连接")
-        layout.addWidget(label("通过本机后台 relay 持续接收机器人数据；连接前只读核对服务身份。"))
-        form = QFormLayout()
-        form.setSpacing(16)
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 4, 0)
+        connections, connection_layout = panel("后台机器人与本窗口预览")
+        preview = QHBoxLayout()
+        preview.addWidget(self.station_robots, 1)
+        for button in (self.station_refresh, self.disconnect_button, self.station_disconnect):
+            button.setObjectName("secondary")
+            preview.addWidget(button)
+        connection_layout.addLayout(preview)
+        connection_layout.addWidget(label("停止本窗口预览只影响此窗口。断开后台机器人会停止接收该机器人的数据。"))
+        layout.addWidget(connections)
+
+        connection, fields_layout = panel("添加连接")
+        field_box = QWidget()
+        field_box.setMaximumWidth(760)
+        form = QFormLayout(field_box)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(8)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         for title, widget in (
             ("连接方式", self.connection_mode),
             ("上位机服务", self.url),
-            ("后台机器人 / 本窗口预览", self.station_robots),
-            ("只读刷新", self.station_refresh),
-            ("后台连接操作", self.station_disconnect),
             ("SSH目标", self.ssh_target),
             ("SSH密码", self.ssh_password),
             ("主机指纹", self.ssh_fingerprint),
+            ("", self.ssh_fingerprint_help),
             ("身份确认", self.ssh_trust),
             ("SSH密钥", self.ssh_key),
             ("机器人采集端口", self.ssh_port),
         ):
             form.addRow(title, widget)
-        layout.addLayout(form)
         self.connection_form = form
-        layout.addWidget(self.connection_help)
+        fields_layout.addWidget(field_box)
+        fields_layout.addWidget(self.connection_help)
         buttons = QHBoxLayout()
         buttons.addWidget(self.connect_button)
-        buttons.addWidget(self.disconnect_button)
         buttons.addStretch()
-        layout.addLayout(buttons)
-        web = QPushButton("打开监控数据网页")
+        fields_layout.addLayout(buttons)
+        layout.addWidget(connection)
+
+        management = QHBoxLayout()
+        storage, storage_layout = panel("长期历史库")
+        storage_layout.addWidget(self.recordings_panel.database_status)
+        self.recordings_panel.configure_database.setObjectName("secondary")
+        storage_layout.addWidget(self.recordings_panel.configure_database, alignment=Qt.AlignmentFlag.AlignLeft)
+        storage_layout.addStretch()
+        management.addWidget(storage, 1)
+        tools, tools_layout = panel("监控网页与采集端维护")
+        web = QPushButton("打开监控网页")
+        web.setObjectName("secondary")
         self.quick_web_button = web
         def open_web():
             from PySide6.QtCore import QUrl
@@ -557,17 +633,22 @@ class AppMonitorWindow(MonitorWindow):
             if self.station_url:
                 QDesktopServices.openUrl(QUrl(self.station_url + "/recordings"))
         web.clicked.connect(open_web)
-        layout.addWidget(web)
         self.connection_summary = label(
             "上位机服务填写 relay 的根地址，不是中央网页地址。缺失、过期数据保持未知。"
         )
-        layout.addWidget(self.connection_summary)
+        tools_layout.addWidget(self.connection_summary)
         self.collector_manager_button = QPushButton("机器人采集端管理…")
+        self.collector_manager_button.setObjectName("secondary")
         self.collector_manager_button.setAccessibleName("机器人采集端安装更新启动停止卸载")
-        self.collector_manager_button.setMinimumHeight(44)
         self.collector_manager_button.clicked.connect(self.open_collector_manager)
-        layout.addWidget(self.collector_manager_button)
-        layout.addWidget(label("采集端尚未启动时，也可通过 SSH 安装、更新和启动；卸载会清除机器人上的本工具及其测试数据。"))
+        maintenance = QHBoxLayout()
+        maintenance.addWidget(web)
+        maintenance.addWidget(self.collector_manager_button)
+        maintenance.addStretch()
+        tools_layout.addLayout(maintenance)
+        tools_layout.addWidget(label("卸载采集端会清除机器人上的采集工具及其测试数据。", "cardCaption"))
+        management.addWidget(tools, 2)
+        layout.addLayout(management)
         layout.addStretch()
         self.update_connection_mode()
         scroll = QScrollArea()
@@ -579,22 +660,106 @@ class AppMonitorWindow(MonitorWindow):
     def navigate(self, index):
         if index == 7:
             self.recordings_panel.refresh_context()
+        if self.pages.currentIndex() == MOTOR_MAINTENANCE_PAGE and index != MOTOR_MAINTENANCE_PAGE:
+            self.clear_motor_maintenance_session()
         self.pages.setCurrentIndex(index)
-        self.centralWidget().setProperty("plainBackground", index == 9)
-        self.centralWidget().update()
         self.nav.button(index).setChecked(True)
-        self.app_title.setText("RP1 " + self.nav.button(index).text())
+        self.app_title.setText(self.nav.button(index).text())
+        if index == MOTOR_MAINTENANCE_PAGE:
+            self.refresh_motor_maintenance()
         self.update_factory_guidance()
+
+    def clear_motor_maintenance_session(self):
+        self._motor_maintenance_binding = None
+        self.motor_maintenance_panel.clear_credentials()
+
+    def refresh_motor_maintenance(self, *_args):
+        if not self.shell_ready or self.pages.currentIndex() != MOTOR_MAINTENANCE_PAGE:
+            return
+        panel = self.motor_maintenance_panel
+        if panel.busy:
+            return
+        factory = self.factory_panel
+        if not hasattr(factory, "motor_maintenance_context"):
+            panel.configure({}, "", None, None, error="工厂本地目录暂不可用。")
+            return
+        context = factory.motor_maintenance_context()
+        sn, dof = factory.sn, factory.model.currentData()
+        frame = factory.live_frame or {}
+        profile = deepcopy(factory.board_profile_values)
+        session_key = (frame.get("stream_id"), profile)
+        binding = (sn, dof, context, frame.get("robot_id"), frame.get("source_kind"), session_key,
+                   frame.get("upload", {}).get("collector_connected"))
+        if self._motor_maintenance_binding == binding:
+            return
+        self._motor_maintenance_binding = binding
+        panel.clear_credentials()
+        try:
+            factory.validate_motor_maintenance_context(context)
+        except ValueError as error:
+            panel.configure({}, sn, dof, None, error=str(error))
+            return
+        def save_parameters(bound_sn, request, result):
+            factory.save_motor_parameter_report(bound_sn, request, result, board_test_profile=profile)
+
+        def save_firmware(bound_sn, request, result):
+            factory.save_motor_firmware_report(bound_sn, request, result, board_test_profile=profile)
+
+        panel.configure(context, sn, dof, save_parameters, save_firmware_report=save_firmware, session_key=session_key)
+
+    def open_motor_maintenance_report(self, sn, section):
+        factory = self.factory_panel
+        if sn and hasattr(factory, "show_motor_parameter_report") and sn == factory.sn:
+            self.navigate(9)
+            factory.show_motor_parameter_report(sn, section)
 
     def open_factory_tool(self, target, item):
         if target == "hardware_notes":
             self.open_factory_hardware_notes()
             return
+        if target in ("motor_firmware", "motor_parameters"):
+            section = "firmware" if target == "motor_firmware" else "parameters"
+            self.factory_guidance = {
+                "sn": self.factory_panel.sn, "item": item,
+                "case_code": "SYS-003" if section == "firmware" else "SYS-004",
+                "hint": "使用当前SN对应的连接，维护记录保存在本机。",
+            }
+            self.navigate(MOTOR_MAINTENANCE_PAGE)
+            self.motor_maintenance_panel.show_section(section)
+            return
+        if target == "zero_reference_check":
+            factory = self.factory_panel
+            sn = factory.sn
+            if not sn:
+                factory.notice.setText("请先选择当前样品SN，再打开标零位复查。")
+                return
+            panel = self.joint_inspection_panel
+            context = panel.calibration_context()
+            if context.get("can_preflight") is not True:
+                reason = "；".join(context.get("issues") or [])
+                factory.notice.setText("请先在设备设置连接本SN对应的机器人，再打开标零位复查。"
+                                       + (f" {reason}。" if reason else ""))
+                return
+            robot, stream = context.get("robot_id"), context.get("stream_id")
+
+            def save_report(report):
+                if (not robot or not stream or report.get("robot_id") != robot
+                        or report.get("stream_id") != stream):
+                    raise ValueError("标零位复查记录与打开时的机器人或采集会话不一致")
+                return factory.save_zero_reference_check(sn, report, robot)
+
+            self.factory_guidance = {
+                "sn": sn, "item": item, "case_code": "SYS-006",
+                "hint": "标零位复查读取编码器角度，报告保存在本轮SN。对侧行程检查使用独立入口。",
+            }
+            self.navigate(8)
+            panel.open_zero_reference_check(sn, save_report)
+            return
         routes = {
             "board": (6, self.operations_panel.board_panel.refresh, "新运行的单项自检将自动保存到发起时选定的SN；已经做完的自检可点击“将当前自检结果保存到此SN”，无需重测。"),
-            "calibration": (8, self.joint_inspection_panel.calibrate, "点击“标定”，按原流程操作；结束后返回SYS-005确认流程状态。"),
-            "calibration_check": (8, self.joint_inspection_panel.motor_control, "点击“标定检查”；腰部插销确认后、左右髋 pitch 在零位±2°内保持5秒，其他关节按URDF引导摆向限位。"),
-            "postzero": (8, self.joint_inspection_panel.postzero, "角度监控已合并到当前页。选择数据来源即可查看或采样；读数不代替标定检查结果。"),
+            "calibration": (8, self.joint_inspection_panel.calibrate, "点击“标定（写入零位）”，按原流程操作；结束后返回SYS-005确认流程状态。"),
+            "calibration_check": (8, self.joint_inspection_panel.motor_control, "打开“标定检查”，在原窗口逐项检查对侧行程。"),
+            "postzero": (8, self.joint_inspection_panel.monitor_source, "选择角度数据来源即可查看或采样；读数不代替标定检查结果。"),
         }
         if target not in routes:
             return
@@ -603,6 +768,7 @@ class AppMonitorWindow(MonitorWindow):
         self.factory_guidance = {"sn": self.factory_panel.sn, "item": item, "case_code": code, "hint": hint}
         self.navigate(index)
         if index == 8:
+            self.joint_inspection_panel.maintenance_toggle.setChecked(target != "postzero")
             scroll = self.joint_inspection_panel.findChild(QScrollArea)
             QTimer.singleShot(0, control, lambda: scroll.ensureWidgetVisible(control, 20, 30))
         control.setFocus()
@@ -633,17 +799,32 @@ class AppMonitorWindow(MonitorWindow):
         board.factory_save_note.setText(f"当前SN：{sn}。新发起的检查完成后自动保存；现有历史快照需点击上方按钮关联。")
         if self.factory_guidance and not self.factory_guidance["sn"]:
             self.factory_guidance["sn"] = sn
+        self.refresh_motor_maintenance()
         self.update_factory_guidance()
 
     def connect_factory_manual_dialog(self, dialog):
         target = {"sn": None, "robot_id": None}
+        guidance = self.factory_guidance or {}
+        if guidance.get("item") == 3 and guidance.get("sn") and guidance["sn"] == self.factory_panel.sn:
+            dialog.angle_sn = guidance["sn"]
         def started(context):
             guidance = self.factory_guidance or {}
             sn = guidance.get("sn") if guidance.get("item") == 3 else None
             target.update(sn=sn if sn and sn == self.factory_panel.sn and context.get("source_kind") == "ros2" else None,
                           robot_id=context.get("robot_id"))
+            if context.get("kind") == "angle_observations":
+                dialog.angle_sn = target["sn"] or ""
         def saved(result):
             sn = target["sn"]
+            if result.get("kind") == "angle_observations":
+                def finished(_ok, message):
+                    if isValid(dialog):
+                        dialog.angle_report_finished(result["run_id"], message)
+                if not sn or result["sn"] != sn or result["robot_id"] != target["robot_id"]:
+                    finished(False, "本轮角度检查的 SN 或机器人绑定未确认。可导出本机 JSON。")
+                    return
+                self.factory_panel.sync_angle_calibration_check(sn, result, target["robot_id"], finished)
+                return
             if not sn or result.get("robot_id") != target["robot_id"]:
                 dialog.save_status.setText(f"本轮已保存在电脑：{result['path']}。未关联SN；请在工厂第3项选择SN后导入此JSON。")
                 return
@@ -783,6 +964,22 @@ class AppMonitorWindow(MonitorWindow):
         super().clear_preview()
         if self.shell_ready:
             self.update_factory_guidance()
+            self.refresh_motor_maintenance()
+
+    def check_stale(self):
+        super().check_stale()
+        self.refresh_motor_maintenance()
+
+    def defer_motor_maintenance_close(self, event):
+        if not self.motor_maintenance_panel.busy:
+            return False
+        self.connection_label.setText("正在完成电机维护，请等待结果后关闭。")
+        event.ignore()
+        return True
+
+    def closeEvent(self, event):
+        if not self.defer_motor_maintenance_close(event):
+            super().closeEvent(event)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -816,6 +1013,7 @@ class AppMonitorWindow(MonitorWindow):
         if self.last_frame and self.last_frame["stream_id"] != frame["stream_id"]:
             self.temp_buffers = [deque(maxlen=600), deque(maxlen=600)]
         super().on_frame(frame)
+        self.refresh_motor_maintenance()
         if self.factory_guidance:
             self.update_factory_guidance()
 
@@ -1093,6 +1291,7 @@ class AppMonitorWindow(MonitorWindow):
             )
             self.event_list.clear()
             self.event_list.addItems(list(self.session_events))
+            self.event_list.setFixedHeight(min(240, max(70, 10 + len(self.session_events) * 30)))
             self.last_event = signature
         if not frame:
             self.temp_buffers = [deque(maxlen=600), deque(maxlen=600)]

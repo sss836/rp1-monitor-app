@@ -1,7 +1,7 @@
 """Version-bound candidate mapping and RP1 ankle mathematics, without hardware I/O.
 
-Inputs/outputs use the video plan's named joint order. SDK positions already
-include their configured software offsets: this module never applies them twice.
+Vector inputs/outputs use the video plan's named joint order. SDK positions
+already include the software offsets. Raw E0 01 encoder samples require them.
 This module does not authorize motion, confirm wiring, or identify physical stops.
 """
 
@@ -36,6 +36,12 @@ _UNVERIFIED_POLICY_CONFIG_SHA256 = {
     24: "a61ba9f01dbfbc088f451dd05e0a8ab3330ebf730351c76b9d0295af0acf523b",
     28: "3f5afbd5dd4f242616dffbd2b5c55098a7cadb1cc288f24e084da3e014f5dee3",
 }
+# b3eaa0b RobotInterface::read_joints: only the coordinate conversion was
+# reviewed for encoder observation. This digest does not qualify motor control.
+_ENCODER_ROBOT_INTERFACE_SHA256 = (
+    "a825435bec5b66e3fdf4da60f551e05cddab907fdd7de377df1ace8a04a12f67"
+)
+_ENCODER_OBSERVATION_SOURCE = "version_bound_encoder_observation"
 _LEG = ("hip_pitch", "hip_roll", "hip_yaw", "knee", "ankle_pitch", "ankle_roll")
 _ARM = ("shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow", "wrist_roll",
         "wrist_yaw", "wrist_pitch")
@@ -177,10 +183,57 @@ def version_bound_mapping(dof, motors=None, *, root=None):
                 binding_note="版本绑定候选；具名关节与实物接线、参考姿态需现场确认")
 
 
-def _validated(mapping):
+def _encoder_observation_binding(bound, *, policy_gains):
+    if policy_gains:
+        dof = bound["dof"]
+        profile = _profile(dof)
+        sources = bound["source_sha256"]
+        sources[profile["robot_config_path"]] = _UNVERIFIED_POLICY_CONFIG_SHA256[dof]
+        sources["src/inference/src/robot_interface.cpp"] = _ENCODER_ROBOT_INTERFACE_SHA256
+        del sources[profile["zero_config_path"]]
+    bound["source_kind"] = _ENCODER_OBSERVATION_SOURCE
+    bound["binding_note"] = "编码器角度只读换算；具名关节与实物接线仍需现场核对"
+    return bound
+
+
+def _encoder_source_digest(base, relative):
+    source = (base / relative).resolve(strict=True)
+    if not source.is_relative_to(base) or not source.is_file():
+        raise ValueError("编码器映射源码/配置路径不合法：" + relative)
+    return hashlib.sha256(source.read_bytes()).hexdigest()
+
+
+def encoder_observation_mapping(dof, motors, root):
+    """Verify a read-only encoder conversion against the robot's deploy files.
+
+    The newer policy-gain deploy has a separately reviewed coordinate path.
+    A matching source does not establish the wiring or authorize motor control.
+    """
+    profile = _profile(dof)
+    if motors is None or root is None:
+        raise ValueError("编码器映射核对需要机器人deploy目录与当前电机列表")
+    try:
+        base = Path(root).resolve(strict=True)
+        relative = profile["robot_config_path"]
+        if _encoder_source_digest(base, relative) != _UNVERIFIED_POLICY_CONFIG_SHA256[dof]:
+            return _encoder_observation_binding(
+                version_bound_mapping(dof, motors, root=base), policy_gains=False)
+        bound = _encoder_observation_binding(
+            version_bound_mapping(dof, motors), policy_gains=True)
+        for relative, expected in bound["source_sha256"].items():
+            if _encoder_source_digest(base, relative) != expected:
+                raise ValueError("编码器映射源码/配置SHA256不符：" + relative)
+    except (OSError, RuntimeError, TypeError) as error:
+        raise ValueError("编码器映射源码/配置缺失或无法只读核对") from error
+    bound["source_verified"] = True
+    return bound
+
+
+def _validated(mapping, *, expected=None):
     if not isinstance(mapping, dict):
         raise ValueError("需要版本绑定标定映射")
-    expected = version_bound_mapping(mapping.get("dof"))
+    if expected is None:
+        expected = version_bound_mapping(mapping.get("dof"))
     for key in ("schema_version", "source_kind", "candidate", "hardware_verified", "dof",
                 "joint_names", "deploy_joint_names", "motors", "rows", "closed_chain_pairs",
                 "joint_motor_indices", "motor_sign", "urdf2motor", "close_chain_motor_idx",
@@ -332,6 +385,40 @@ def _sdk_positions(values, mapping, description):
            for value, motor in zip(values, mapping["motors"])):
         raise ValueError(description + "越出SDK原始编码范围")
     return values
+
+
+def encoder_joint_angle(mapping, joint, samples, previous=None):
+    """Convert raw E0 01 motor angles in degrees to one logical angle in radians.
+
+    ``joint`` is a named joint and ``samples`` maps motor index to raw degrees.
+    For an ankle the caller supplies both fresh samples and may pass the last
+    valid (pitch, roll) pair in radians to enforce branch continuity.
+    """
+    if (not isinstance(mapping, dict) or mapping.get("source_verified") is not True
+            or not isinstance(mapping.get("source_sha256"), dict)):
+        raise ValueError("需要已核对的只读编码器映射")
+    dof = mapping.get("dof")
+    relative = _profile(dof)["robot_config_path"]
+    expected = _encoder_observation_binding(
+        version_bound_mapping(dof),
+        policy_gains=mapping["source_sha256"].get(relative) == _UNVERIFIED_POLICY_CONFIG_SHA256[dof])
+    _validated(mapping, expected=expected)
+    row = next((row for row in mapping["rows"] if row["name"] == joint), None)
+    if row is None:
+        raise ValueError("编码器映射没有请求的关节")
+    if (not isinstance(samples, dict) or any(type(index) is not int for index in samples)
+            or not all(index in samples for index in row["motor_indices"])):
+        raise ValueError("当前关节缺少所需电机的编码器样本")
+    angles = []
+    for index, sign, offset in zip(row["motor_indices"], row["signs"], row["software_offsets_rad"]):
+        raw_rad = math.radians(_number(samples[index], "电机编码器角度"))
+        angle = math.remainder(sign * (raw_rad + offset), _TWO_PI)
+        angles.append(angle - _TWO_PI if angle >= math.pi else angle)
+    if row["coupled_side"] is None:
+        return angles[0]
+    last = None if previous is None else _vector(previous, 2, "上一踝部逻辑角度")
+    (pitch, roll), _ = _fk(angles, row["coupled_side"], last)
+    return pitch if joint.endswith("_ankle_pitch_joint") else roll
 
 
 def logical_to_motor(q, mapping, previous=None):
